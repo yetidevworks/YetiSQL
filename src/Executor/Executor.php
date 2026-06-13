@@ -379,7 +379,7 @@ final class Executor
             // The plan fully implements the WHERE iff there is a single sargable
             // conjunct and we found a path for it: the scan then yields exactly
             // the matching rows, so no per-row re-check is needed.
-            $eval->whereCovered = $plan !== null && \count($this->splitAnd($select->where)) === 1;
+            $eval->whereCovered = $plan !== null && ($plan['coveredAll'] ?? false);
 
             // Inline the scan here (rather than delegating to scanByPlan) to keep
             // the hot single-table path to a single generator frame per row.
@@ -882,12 +882,8 @@ final class Executor
             return [[$tree->countRange()]];
         }
 
-        if (\count($this->splitAnd($select->where)) !== 1) {
-            return null;
-        }
-
         $plan = $this->bestPlan($select->where, $alias, $info, $eval);
-        if ($plan === null || !\in_array($plan['kind'], ['index_eq', 'index_range', 'rowid_eq', 'rowid_range'], true)) {
+        if ($plan === null || !($plan['coveredAll'] ?? false) || !\in_array($plan['kind'], ['index_eq', 'index_range', 'rowid_eq', 'rowid_range'], true)) {
             return null;
         }
 
@@ -1440,20 +1436,24 @@ final class Executor
 
     /**
      * Pick the best single-table access path from top-level AND conjuncts of
-     * the WHERE clause. Equality (rowid then index) beats ranges.
+     * the WHERE clause. Same-column range conjuncts are intersected into one
+     * tighter seek; otherwise equality (rowid then index) beats ranges.
      *
      * @return array<string,mixed>|null
      */
     private function bestPlan(Expr $where, ?string $alias, TableInfo $info, Evaluator $eval): ?array
     {
         $indexes = $this->db->schema()->resolvedIndexes($info->name);
+        $conjuncts = $this->splitAnd($where);
+        $plans = [];
         $best = null;
         $bestRank = 0;
-        foreach ($this->splitAnd($where) as $conj) {
+        foreach ($conjuncts as $conj) {
             $plan = $this->predicatePlan($conj, $alias, $info, $indexes, $eval);
             if ($plan === null) {
                 continue;
             }
+            $plans[] = $plan;
             $rank = match ($plan['kind']) {
                 'rowid_eq' => 5,
                 'index_eq' => 4,
@@ -1466,7 +1466,89 @@ final class Executor
                 $bestRank = $rank;
             }
         }
+        $combined = $this->combinedRangePlan($plans, \count($conjuncts));
+        if ($combined !== null) {
+            return $combined;
+        }
+        if ($best !== null && \count($conjuncts) === 1) {
+            $best['coveredAll'] = true;
+        }
         return $best;
+    }
+
+    /**
+     * @param list<array<string,mixed>> $plans
+     * @return array<string,mixed>|null
+     */
+    private function combinedRangePlan(array $plans, int $conjunctCount): ?array
+    {
+        if (\count($plans) < 2 || \count($plans) !== $conjunctCount) {
+            return null;
+        }
+
+        $first = $plans[0];
+        if (!\in_array($first['kind'], ['rowid_range', 'index_range'], true)) {
+            return null;
+        }
+        $kind = $first['kind'];
+        $pos = $first['pos'] ?? null;
+        $index = $first['index'] ?? null;
+        $low = null;
+        $lowInc = false;
+        $high = null;
+        $highInc = false;
+        $coll = $index instanceof \YetiDevWorks\YetiSQL\Engine\IndexInfo ? ($index->collations[0] ?? 'BINARY') : 'BINARY';
+
+        foreach ($plans as $plan) {
+            if (($plan['kind'] ?? null) !== $kind || ($plan['pos'] ?? null) !== $pos || (($plan['index'] ?? null) !== $index)) {
+                return null;
+            }
+            if ($plan['low'] !== null) {
+                if ($low === null) {
+                    $low = $plan['low'];
+                    $lowInc = $plan['lowInc'];
+                } else {
+                    $cmp = Value::compare($plan['low'], $low, $coll);
+                    if ($cmp > 0 || ($cmp === 0 && !$plan['lowInc'] && $lowInc)) {
+                        $low = $plan['low'];
+                        $lowInc = $plan['lowInc'];
+                    }
+                }
+            }
+            if ($plan['high'] !== null) {
+                if ($high === null) {
+                    $high = $plan['high'];
+                    $highInc = $plan['highInc'];
+                } else {
+                    $cmp = Value::compare($plan['high'], $high, $coll);
+                    if ($cmp < 0 || ($cmp === 0 && !$plan['highInc'] && $highInc)) {
+                        $high = $plan['high'];
+                        $highInc = $plan['highInc'];
+                    }
+                }
+            }
+        }
+
+        if ($low !== null && $high !== null) {
+            $cmp = Value::compare($low, $high, $coll);
+            if ($cmp > 0 || ($cmp === 0 && (!$lowInc || !$highInc))) {
+                return null;
+            }
+        }
+
+        $combined = [
+            'kind' => $kind,
+            'pos' => $pos,
+            'low' => $low,
+            'lowInc' => $lowInc,
+            'high' => $high,
+            'highInc' => $highInc,
+            'coveredAll' => true,
+        ];
+        if ($kind === 'index_range') {
+            $combined['index'] = $index;
+        }
+        return $combined;
     }
 
     /** @return list<Expr> */
@@ -1541,11 +1623,11 @@ final class Executor
                 return null; // nothing can match; fall back to scan + filter
             }
             if ($pos === $info->rowidAlias) {
-                return ['kind' => 'rowid_eq', 'values' => $values];
+                return ['kind' => 'rowid_eq', 'pos' => $pos, 'values' => $values];
             }
             $index = $this->indexLeading($indexes, $pos);
             if ($index !== null) {
-                return ['kind' => 'index_eq', 'index' => $index, 'values' => $values];
+                return ['kind' => 'index_eq', 'pos' => $pos, 'index' => $index, 'values' => $values];
             }
         }
 
@@ -1567,10 +1649,10 @@ final class Executor
                 if (!\is_int($value) && !(\is_float($value) && (float) (int) $value === $value)) {
                     return null;
                 }
-                return ['kind' => 'rowid_eq', 'values' => [$value]];
+                return ['kind' => 'rowid_eq', 'pos' => $pos, 'values' => [$value]];
             }
             $index = $this->indexLeading($indexes, $pos);
-            return $index !== null ? ['kind' => 'index_eq', 'index' => $index, 'values' => [$value]] : null;
+            return $index !== null ? ['kind' => 'index_eq', 'pos' => $pos, 'index' => $index, 'values' => [$value]] : null;
         }
         // range
         $low = null;
@@ -1591,13 +1673,13 @@ final class Executor
     private function makeRangePlan(int $pos, mixed $low, bool $lowInc, mixed $high, bool $highInc, TableInfo $info, array $indexes): ?array
     {
         if ($pos === $info->rowidAlias) {
-            return ['kind' => 'rowid_range', 'low' => $low, 'lowInc' => $lowInc, 'high' => $high, 'highInc' => $highInc];
+            return ['kind' => 'rowid_range', 'pos' => $pos, 'low' => $low, 'lowInc' => $lowInc, 'high' => $high, 'highInc' => $highInc];
         }
         $index = $this->indexLeading($indexes, $pos);
         if ($index === null) {
             return null;
         }
-        return ['kind' => 'index_range', 'index' => $index, 'low' => $low, 'lowInc' => $lowInc, 'high' => $high, 'highInc' => $highInc];
+        return ['kind' => 'index_range', 'pos' => $pos, 'index' => $index, 'low' => $low, 'lowInc' => $lowInc, 'high' => $high, 'highInc' => $highInc];
     }
 
     /**
