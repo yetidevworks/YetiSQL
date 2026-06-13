@@ -857,7 +857,7 @@ final class Executor
      */
     private function tryCoveredCount(SelectStatement $select, array $outputCols, array $aggregateNodes, Evaluator $eval): ?array
     {
-        if ($select->where === null || $select->having !== null || \count($outputCols) !== 1 || \count($aggregateNodes) !== 1) {
+        if ($select->having !== null || \count($outputCols) !== 1 || \count($aggregateNodes) !== 1) {
             return null;
         }
 
@@ -872,11 +872,20 @@ final class Executor
         }
 
         $single = $this->singleTableForCompile($select);
-        if ($single === null || \count($this->splitAnd($select->where)) !== 1) {
+        if ($single === null) {
             return null;
         }
 
         [$info, $alias] = $single;
+        $tree = new TableBTree($this->db->pager(), $info->rootPage);
+        if ($select->where === null) {
+            return [[$tree->countRange()]];
+        }
+
+        if (\count($this->splitAnd($select->where)) !== 1) {
+            return null;
+        }
+
         $plan = $this->bestPlan($select->where, $alias, $info, $eval);
         if ($plan === null || !\in_array($plan['kind'], ['index_eq', 'index_range', 'rowid_eq', 'rowid_range'], true)) {
             return null;
@@ -888,13 +897,7 @@ final class Executor
             $index = $plan['index'];
             $idx = new \YetiDevWorks\YetiSQL\Engine\IndexBTree($this->db->pager(), $index->rootPage, $index->collations);
             $coll = $index->collations[0] ?? 'BINARY';
-            $seen = [];
-            foreach ($plan['values'] as $probe) {
-                $key = $this->valueKey($probe);
-                if (isset($seen[$key])) {
-                    continue;
-                }
-                $seen[$key] = true;
+            foreach ($this->uniqueValues($plan['values'], $coll) as $probe) {
                 $count += $idx->countLeadingRange($probe, true, $probe, true, $coll);
             }
             return [[$count]];
@@ -907,11 +910,15 @@ final class Executor
             return [[$idx->countLeadingRange($plan['low'], $plan['lowInc'], $plan['high'], $plan['highInc'], $coll)]];
         }
 
-        $tree = new TableBTree($this->db->pager(), $info->rootPage);
         if ($plan['kind'] === 'rowid_eq') {
+            $seen = [];
             foreach ($plan['values'] as $v) {
                 $rid = (int) Value::toNumber($v);
-                if ($tree->get($rid) !== null) {
+                if (isset($seen[$rid])) {
+                    continue;
+                }
+                $seen[$rid] = true;
+                if ($tree->countRange($rid, true, $rid, true) !== 0) {
                     $count++;
                 }
             }
@@ -922,16 +929,25 @@ final class Executor
         $high = $plan['high'] !== null ? (int) Value::toNumber($plan['high']) : null;
         $lowInc = $plan['lowInc'];
         $highInc = $plan['highInc'];
-        foreach ($tree->scan($low) as [$rid]) {
-            if ($low !== null && !$lowInc && $rid <= $low) {
-                continue;
+        return [[$tree->countRange($low, $lowInc, $high, $highInc)]];
+    }
+
+    /**
+     * @param list<null|int|float|string|Blob> $values
+     * @return list<null|int|float|string|Blob>
+     */
+    private function uniqueValues(array $values, string $collation): array
+    {
+        $unique = [];
+        foreach ($values as $value) {
+            foreach ($unique as $seen) {
+                if (Value::compare($value, $seen, $collation) === 0) {
+                    continue 2;
+                }
             }
-            if ($high !== null && ($rid > $high || (!$highInc && $rid === $high))) {
-                break;
-            }
-            $count++;
+            $unique[] = $value;
         }
-        return [[$count]];
+        return $unique;
     }
 
     private function aggregateProject(SelectStatement $select, array $outputCols, array $aggregateNodes, array $envs, Evaluator $eval, array $orderPlan): array
@@ -1265,8 +1281,13 @@ final class Executor
 
         switch ($plan['kind']) {
             case 'rowid_eq':
+                $seen = [];
                 foreach ($plan['values'] as $v) {
                     $rid = (int) Value::toNumber($v);
+                    if (isset($seen[$rid])) {
+                        continue;
+                    }
+                    $seen[$rid] = true;
                     $payload = $tree->get($rid);
                     if ($payload !== null) {
                         yield [$rid, $payload];
@@ -1311,8 +1332,13 @@ final class Executor
 
         switch ($plan['kind']) {
             case 'rowid_eq':
+                $seen = [];
                 foreach ($plan['values'] as $v) {
                     $rid = (int) Value::toNumber($v);
+                    if (isset($seen[$rid])) {
+                        continue;
+                    }
+                    $seen[$rid] = true;
                     $payload = $tree->get($rid);
                     if ($payload !== null) {
                         yield [$rid, $payload];
@@ -1379,7 +1405,8 @@ final class Executor
         );
         $coll = $index->collations[0] ?? 'BINARY';
 
-        $probes = $plan['kind'] === 'index_eq' ? $plan['values'] : [$plan['low']];
+        $probes = $plan['kind'] === 'index_eq' ? $this->uniqueValues($plan['values'], $coll) : [$plan['low']];
+        $seenRowids = [];
         foreach ($probes as $probe) {
             $low = $plan['kind'] === 'index_eq' ? [$probe] : ($plan['low'] !== null ? [$plan['low']] : null);
             foreach ($idx->scanFrom($low) as $key) {
@@ -1399,7 +1426,14 @@ final class Executor
                         continue;
                     }
                 }
-                yield (int) $key[\count($key) - 1];
+                $rowid = (int) $key[\count($key) - 1];
+                if ($plan['kind'] === 'index_eq') {
+                    if (isset($seenRowids[$rowid])) {
+                        continue;
+                    }
+                    $seenRowids[$rowid] = true;
+                }
+                yield $rowid;
             }
         }
     }
@@ -1479,11 +1513,27 @@ final class Executor
                 return null;
             }
             $values = [];
+            $seen = [];
             foreach ($e->list as $item) {
                 if (!$this->isConstExpr($item)) {
                     return null;
                 }
-                $values[] = $this->affine($info, $pos, $this->constValue($item, $eval));
+                $v = $this->affine($info, $pos, $this->constValue($item, $eval));
+                // A NULL in the list never matches via `=`, and duplicates would
+                // be double-counted on the eq seek; drop both so the plan yields
+                // each matching row exactly once.
+                if ($v === null) {
+                    continue;
+                }
+                $k = $this->valueKey($v);
+                if (isset($seen[$k])) {
+                    continue;
+                }
+                $seen[$k] = true;
+                $values[] = $v;
+            }
+            if ($values === []) {
+                return null; // nothing can match; fall back to scan + filter
             }
             if ($pos === $info->rowidAlias) {
                 return ['kind' => 'rowid_eq', 'values' => $values];
@@ -1501,6 +1551,12 @@ final class Executor
     private function makeComparisonPlan(int $pos, string $op, mixed $value, TableInfo $info, array $indexes): ?array
     {
         $value = $this->affine($info, $pos, $value);
+        // Any comparison against NULL (`= < <= > >=`) is never true, so produce
+        // no plan: the scan + WHERE filter then correctly yields zero rows rather
+        // than the index seek treating a NULL bound as unbounded.
+        if ($value === null) {
+            return null;
+        }
         if ($op === '=') {
             if ($pos === $info->rowidAlias) {
                 if (!\is_int($value) && !(\is_float($value) && (float) (int) $value === $value)) {

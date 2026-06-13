@@ -48,6 +48,8 @@ final class DifferentialTest extends TestCase
             "SELECT id FROM t WHERE name GLOB '*a*' ORDER BY id",
             'SELECT id FROM t WHERE age BETWEEN 26 AND 36 ORDER BY id',
             'SELECT id FROM t WHERE city IN (\'NYC\',\'SF\') ORDER BY id',
+            'SELECT id FROM t WHERE id IN (1,1,2) ORDER BY id',
+            'SELECT COUNT(*) FROM t WHERE id IN (1,1,2)',
             'SELECT id FROM t WHERE age > 30 OR score < 6 ORDER BY id',
             'SELECT id FROM t WHERE NOT (city = \'NYC\') ORDER BY id',
             // ordering / limit

@@ -121,6 +121,11 @@ final class TableBTree
         yield from $this->scanPage($this->rootPage, $from);
     }
 
+    public function countRange(?int $low = null, bool $lowInc = true, ?int $high = null, bool $highInc = true): int
+    {
+        return $this->countPage($this->rootPage, $low, $lowInc, $high, $highInc);
+    }
+
     // --- internals --------------------------------------------------------
 
     /** @return Generator<int,array{0:int,1:string}> */
@@ -144,6 +149,67 @@ final class TableBTree
             }
         }
         yield from $this->scanPage($page->rightChild, $from);
+    }
+
+    private function countPage(?int $pageNo, ?int $low, bool $lowInc, ?int $high, bool $highInc): int
+    {
+        if ($pageNo === null || $pageNo === 0) {
+            return 0;
+        }
+
+        $page = $this->pager->readPage($pageNo);
+        if ($page->isLeaf()) {
+            $cells = $page->cells;
+            $n = \count($cells);
+            if ($n === 0) {
+                return 0;
+            }
+
+            $first = $this->parseLeafCell($cells[0])[0];
+            $last = $this->parseLeafCell($cells[$n - 1])[0];
+            if ($this->rowidInLowerBound($first, $low, $lowInc) && $this->rowidInUpperBound($last, $high, $highInc)) {
+                return $n;
+            }
+            if (!$this->rowidInUpperBound($first, $high, $highInc) || !$this->rowidInLowerBound($last, $low, $lowInc)) {
+                return 0;
+            }
+
+            $count = 0;
+            foreach ($cells as $cell) {
+                $rid = $this->parseLeafCell($cell)[0];
+                if (!$this->rowidInLowerBound($rid, $low, $lowInc)) {
+                    continue;
+                }
+                if (!$this->rowidInUpperBound($rid, $high, $highInc)) {
+                    break;
+                }
+                $count++;
+            }
+            return $count;
+        }
+
+        $count = 0;
+        foreach ($page->cells as $cell) {
+            [$child, $sep] = $this->parseInteriorCell($cell);
+            if (!$this->rowidInLowerBound($sep, $low, $lowInc)) {
+                continue;
+            }
+            $count += $this->countPage($child, $low, $lowInc, $high, $highInc);
+            if ($high !== null && $sep >= $high) {
+                return $count;
+            }
+        }
+        return $count + $this->countPage($page->rightChild, $low, $lowInc, $high, $highInc);
+    }
+
+    private function rowidInLowerBound(int $rowid, ?int $low, bool $lowInc): bool
+    {
+        return $low === null || $rowid > $low || ($lowInc && $rowid === $low);
+    }
+
+    private function rowidInUpperBound(int $rowid, ?int $high, bool $highInc): bool
+    {
+        return $high === null || $rowid < $high || ($highInc && $rowid === $high);
     }
 
     private function findLeaf(int $rowid): int

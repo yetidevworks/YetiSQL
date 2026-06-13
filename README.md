@@ -139,9 +139,9 @@ php benchmarks/bench.php [rows]    # default 5000
 Takeaways:
 - **Index planning works.** Point lookups by primary key and by indexed column
   use rowid/index seeks; the `YetiSQL+idx` column beats `YetiSQL scan` on
-  selective and range queries. Covered `COUNT(*)` over rowid/leading-column
-  index predicates counts index entries directly without fetching table rows,
-  and `UPDATE` only re-indexes columns that change.
+  selective and range queries. Covered `COUNT(*)` over full tables, rowid
+  ranges, and leading-column index predicates counts b-tree cells directly
+  without fetching table rows, and `UPDATE` only re-indexes columns that change.
 - **Expect tens to low hundreds x** for point operations, inserts, indexed
   counts, and aggregates — the cost of a tree-walking interpreter and per-row
   work in pure PHP.
@@ -151,7 +151,7 @@ Takeaways:
 
 Hot-path optimisations already in place: an LRU page cache, a parsed-page cache
 (so repeated reads skip re-decoding), single-pass page encoding, binary-search
-rowid lookups, lazy/early-stop index scans, covered index counts, and a
+rowid lookups, lazy/early-stop index scans, covered table/index counts, and a
 compiled-statement path.
 
 ## Architecture
