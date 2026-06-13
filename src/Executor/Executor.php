@@ -1503,6 +1503,11 @@ final class Executor
             }
             $low = $this->affine($info, $pos, $this->constValue($e->low, $eval));
             $high = $this->affine($info, $pos, $this->constValue($e->high, $eval));
+            // A NULL bound makes `BETWEEN` never true; emit no plan (a null bound
+            // would otherwise read as "unbounded" on the index seek).
+            if ($low === null || $high === null) {
+                return null;
+            }
             return $this->makeRangePlan($pos, $low, true, $high, true, $info, $indexes);
         }
 
