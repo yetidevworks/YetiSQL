@@ -162,31 +162,16 @@ final class Executor
             return [$colNames, ...$this->aggregateUngrouped($select, $outputCols, $aggregateNodes, $eval, $orderPlan)];
         }
 
-        // Source rows (post-join, post-WHERE). The scan path may report that the
-        // access plan already enforces the whole WHERE (eval->whereCovered), in
-        // which case the per-row re-check is skipped entirely.
-        $cWhere = $eval->compiledWhere;
-        $envs = [];
-        foreach ($this->iterateJoined($select, $eval) as $env) {
-            if ($select->where !== null && !$eval->whereCovered) {
-                $v = $cWhere !== null ? $cWhere($env, $eval) : $eval->evaluate($select->where, $env);
-                if ($v === null || !Value::isTrue($v)) {
-                    continue;
-                }
-            }
-            $envs[] = $env;
-        }
-
-        // Expose SELECT-list aliases to HAVING/ORDER BY (not to WHERE, above).
-        foreach ($select->columns as $rc) {
-            if ($rc->alias !== null && $rc->expr !== null) {
-                $eval->aliasExprs[\strtolower($rc->alias)] = $rc->expr;
-            }
-        }
-
         if ($isAggregate) {
-            [$rows, $keys] = $this->aggregateProject($select, $outputCols, $aggregateNodes, $envs, $eval, $orderPlan);
+            [$rows, $keys] = $this->aggregateProject($select, $outputCols, $aggregateNodes, $this->filteredJoined($select, $eval), $eval, $orderPlan);
         } else {
+            $envs = [];
+            foreach ($this->filteredJoined($select, $eval) as $env) {
+                $envs[] = $env;
+            }
+            // Expose SELECT-list aliases to ORDER BY (not to WHERE, above).
+            $this->exposeSelectAliases($select, $eval);
+
             $rows = [];
             foreach ($envs as $env) {
                 $row = $this->projectRow($outputCols, $env, $eval);
@@ -202,6 +187,31 @@ final class Executor
         }
 
         return [$colNames, $rows, $keys];
+    }
+
+    /** @return \Generator<RowEnv> */
+    private function filteredJoined(SelectStatement $select, Evaluator $eval): \Generator
+    {
+        $cWhere = $eval->compiledWhere;
+        foreach ($this->iterateJoined($select, $eval) as $env) {
+            if ($select->where !== null && !$eval->whereCovered) {
+                $v = $cWhere !== null ? $cWhere($env, $eval) : $eval->evaluate($select->where, $env);
+                if ($v === null || !Value::isTrue($v)) {
+                    continue;
+                }
+            }
+            yield $env;
+            $eval->aliasExprs = [];
+        }
+    }
+
+    private function exposeSelectAliases(SelectStatement $select, Evaluator $eval): void
+    {
+        foreach ($select->columns as $rc) {
+            if ($rc->alias !== null && $rc->expr !== null) {
+                $eval->aliasExprs[\strtolower($rc->alias)] = $rc->expr;
+            }
+        }
     }
 
     /**
@@ -946,7 +956,7 @@ final class Executor
         return $unique;
     }
 
-    private function aggregateProject(SelectStatement $select, array $outputCols, array $aggregateNodes, array $envs, Evaluator $eval, array $orderPlan): array
+    private function aggregateProject(SelectStatement $select, array $outputCols, array $aggregateNodes, iterable $envs, Evaluator $eval, array $orderPlan): array
     {
         // Single pass: hash each row into its group and step that group's
         // accumulators immediately, keeping only one representative env per group
@@ -962,6 +972,7 @@ final class Executor
         $cArgs = $eval->compiledAggArgs;
 
         foreach ($envs as $env) {
+            $this->exposeSelectAliases($select, $eval);
             $keyParts = [];
             if ($cGroup !== null) {
                 foreach ($cGroup as $gc) {
@@ -996,6 +1007,9 @@ final class Executor
                 Aggregates::step($accsByGroup[$key][$id], $args, $node->star);
             }
         }
+
+        // Aliases become visible only after WHERE has been fully applied.
+        $this->exposeSelectAliases($select, $eval);
 
         $rows = [];
         $keys = [];
