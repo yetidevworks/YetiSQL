@@ -91,6 +91,11 @@ final class Executor
     /** @param array<string,null|int|float|string|Blob> $params */
     private function execSelect(SelectStatement $select, array $params): Result
     {
+        $streamed = $this->tryStreamSelect($select, $params);
+        if ($streamed !== null) {
+            return $streamed;
+        }
+
         $eval = new Evaluator($this, $params);
         [$columns, $rows, $keys] = $this->runSelect($select, $eval);
 
@@ -109,6 +114,38 @@ final class Executor
         $this->applyLimit($select, $rows, $params);
 
         return new Result(columns: $columns, rows: \array_values($rows), rowCount: \count($rows));
+    }
+
+    /** @param array<string,null|int|float|string|Blob> $params */
+    private function tryStreamSelect(SelectStatement $select, array $params): ?Result
+    {
+        if ($select->compound !== null
+            || $select->orderBy !== []
+            || $select->distinct
+            || $select->limit !== null
+            || $select->offset !== null
+            || $select->valuesRows !== []) {
+            return null;
+        }
+
+        $eval = new Evaluator($this, $params);
+        $meta = $this->compileSelect($select, $eval);
+        if ($meta['isAgg']) {
+            return null;
+        }
+
+        $eval->compiledWhere = $meta['cWhere'];
+        $eval->compiledProject = $meta['cProject'];
+        $eval->compiledGroupBy = $meta['cGroupBy'];
+        $eval->compiledAggArgs = $meta['cAggArgs'];
+
+        $rows = function () use ($select, $meta, $eval): \Generator {
+            foreach ($this->filteredJoined($select, $eval) as $env) {
+                yield $this->projectRow($meta['cols'], $env, $eval);
+            }
+        };
+
+        return Result::cursor($meta['names'], $rows());
     }
 
     /**

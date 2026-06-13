@@ -25,7 +25,7 @@ final class Result implements ResultInterface
     public function __construct(?EngineResult $result)
     {
         $this->columns = $result?->columns ?? [];
-        $this->rows = $result?->rows ?? [];
+        $this->rows = $result?->materializeRows() ?? [];
         $this->affected = $result?->rowCount ?? 0;
     }
 

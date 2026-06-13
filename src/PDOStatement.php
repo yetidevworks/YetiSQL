@@ -94,10 +94,11 @@ class PDOStatement implements IteratorAggregate
         if ($this->result === null || !$this->result->isQuery()) {
             return false;
         }
-        if ($this->cursor >= \count($this->result->rows)) {
+        $row = $this->result->fetchRow($this->cursor);
+        if ($row === null) {
             return false;
         }
-        $row = $this->result->rows[$this->cursor++];
+        $this->cursor++;
         return $this->shape($row, $mode);
     }
 
@@ -109,21 +110,22 @@ class PDOStatement implements IteratorAggregate
             return [];
         }
         $out = [];
+        $rows = $this->result->materializeRows();
         if ($mode === PDO::FETCH_COLUMN) {
             $col = (int) ($args[0] ?? 0);
-            foreach ($this->result->rows as $row) {
+            foreach ($rows as $row) {
                 $out[] = $this->normalizeOut($row[$col] ?? null);
             }
             return $out;
         }
         if ($mode === PDO::FETCH_KEY_PAIR) {
             $pairs = [];
-            foreach ($this->result->rows as $row) {
+            foreach ($rows as $row) {
                 $pairs[$this->normalizeOut($row[0] ?? null)] = $this->normalizeOut($row[1] ?? null);
             }
             return $pairs;
         }
-        foreach ($this->result->rows as $row) {
+        foreach ($rows as $row) {
             $out[] = $this->shape($row, $mode);
         }
         return $out;
@@ -134,10 +136,11 @@ class PDOStatement implements IteratorAggregate
         if ($this->result === null || !$this->result->isQuery()) {
             return false;
         }
-        if ($this->cursor >= \count($this->result->rows)) {
+        $row = $this->result->fetchRow($this->cursor);
+        if ($row === null) {
             return false;
         }
-        $row = $this->result->rows[$this->cursor++];
+        $this->cursor++;
         return $this->normalizeOut($row[$column] ?? null);
     }
 
