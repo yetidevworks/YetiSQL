@@ -1,0 +1,138 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * yetisql — a tiny sqlite3-shell-style REPL for YetiSQL databases.
+ *
+ * Usage:
+ *   yetisql [path.ysql]          open (or create) a database and start a REPL
+ *   yetisql path.ysql "SQL..."   run one statement and print the result
+ *
+ * Dot-commands: .tables  .schema [table]  .quit  .help
+ */
+
+$autoloads = [
+    __DIR__ . '/../vendor/autoload.php',     // running from the repo
+    __DIR__ . '/../../../autoload.php',       // installed as a dependency
+];
+foreach ($autoloads as $f) {
+    if (\is_file($f)) {
+        require $f;
+        break;
+    }
+}
+
+use YetiDevWorks\YetiSQL\PDO;
+use YetiDevWorks\YetiSQL\PDOException;
+
+$path = $argv[1] ?? ':memory:';
+$oneShot = $argv[2] ?? null;
+
+$dsn = 'yetisql:' . ($path === ':memory:' ? ':memory:' : $path);
+$db = new PDO($dsn);
+$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+function render(PDO $db, string $sql): void
+{
+    $sql = \trim($sql);
+    if ($sql === '') {
+        return;
+    }
+    try {
+        $stmt = $db->query($sql);
+        if ($stmt === false) {
+            return;
+        }
+        if ($stmt->columnCount() === 0) {
+            \fwrite(STDOUT, "OK ({$stmt->rowCount()} rows affected)\n");
+            return;
+        }
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        if ($rows === []) {
+            \fwrite(STDOUT, "(0 rows)\n");
+            return;
+        }
+        $cols = \array_keys($rows[0]);
+        $widths = [];
+        foreach ($cols as $c) {
+            $widths[$c] = \strlen((string) $c);
+        }
+        foreach ($rows as $r) {
+            foreach ($cols as $c) {
+                $widths[$c] = \max($widths[$c], \strlen($r[$c] === null ? 'NULL' : (string) $r[$c]));
+            }
+        }
+        $line = static function (array $vals) use ($cols, $widths): string {
+            $parts = [];
+            foreach ($cols as $c) {
+                $v = $vals[$c] ?? $c;
+                $v = $v === null ? 'NULL' : (string) $v;
+                $parts[] = \str_pad($v, $widths[$c]);
+            }
+            return ' ' . \implode(' | ', $parts) . ' ';
+        };
+        $header = \array_combine($cols, $cols);
+        \fwrite(STDOUT, $line($header) . "\n");
+        \fwrite(STDOUT, \str_repeat('-', \strlen($line($header))) . "\n");
+        foreach ($rows as $r) {
+            \fwrite(STDOUT, $line($r) . "\n");
+        }
+        \fwrite(STDOUT, '(' . \count($rows) . " rows)\n");
+    } catch (PDOException $e) {
+        \fwrite(STDERR, 'Error: ' . $e->getMessage() . "\n");
+    }
+}
+
+function dot(PDO $db, string $cmd): bool
+{
+    $parts = \preg_split('/\s+/', \trim($cmd));
+    switch ($parts[0]) {
+        case '.quit':
+        case '.exit':
+            return false;
+        case '.help':
+            \fwrite(STDOUT, ".tables  .schema [t]  .quit  .help\n");
+            break;
+        case '.tables':
+            render($db, "PRAGMA table_list");
+            break;
+        case '.schema':
+            $t = $parts[1] ?? null;
+            $sql = $t !== null
+                ? "PRAGMA table_info(" . $t . ")"
+                : "PRAGMA table_list";
+            render($db, $sql);
+            break;
+        default:
+            \fwrite(STDERR, "unknown command: {$parts[0]}\n");
+    }
+    return true;
+}
+
+if ($oneShot !== null) {
+    render($db, $oneShot);
+    exit(0);
+}
+
+\fwrite(STDOUT, "YetiSQL shell — pure-PHP SQLite-compatible engine\nType .help for commands, .quit to exit.\n");
+while (true) {
+    \fwrite(STDOUT, 'yetisql> ');
+    $line = \fgets(STDIN);
+    if ($line === false) {
+        break;
+    }
+    $line = \trim($line);
+    if ($line === '') {
+        continue;
+    }
+    if ($line[0] === '.') {
+        if (!dot($db, $line)) {
+            break;
+        }
+        continue;
+    }
+    render($db, $line);
+}
+\fwrite(STDOUT, "\n");

@@ -1,0 +1,593 @@
+<?php
+
+declare(strict_types=1);
+
+namespace YetiDevWorks\YetiSQL\Executor;
+
+use YetiDevWorks\YetiSQL\Engine\Blob;
+use YetiDevWorks\YetiSQL\Exception\SqlException;
+use YetiDevWorks\YetiSQL\Functions\Aggregates;
+use YetiDevWorks\YetiSQL\Functions\ScalarFunctions;
+use YetiDevWorks\YetiSQL\Sql\Ast\Expr;
+use YetiDevWorks\YetiSQL\Sql\Ast\SelectStatement;
+use YetiDevWorks\YetiSQL\Types\Affinity;
+use YetiDevWorks\YetiSQL\Types\Collation;
+use YetiDevWorks\YetiSQL\Types\Value;
+
+/**
+ * Tree-walking expression evaluator. Implements SQLite's arithmetic, three-
+ * valued logic, affinity-aware comparison, LIKE/GLOB, CAST and subquery
+ * semantics. Aggregate function nodes resolve to values precomputed by the
+ * executor and stashed in $aggregateValues (keyed by node object id).
+ */
+final class Evaluator
+{
+    /** @var array<int,null|int|float|string|Blob> aggregate results by spl_object_id(Expr) */
+    public array $aggregateValues = [];
+
+    /**
+     * SELECT-list aliases visible to HAVING/ORDER BY (lower-cased name => the
+     * aliased expression). Consulted only when a real column does not resolve.
+     *
+     * @var array<string,Expr>
+     */
+    public array $aliasExprs = [];
+
+    /**
+     * Set by the single-table scan path when the chosen access plan already
+     * guarantees the entire WHERE clause, so the executor can skip re-checking
+     * it per row. (A covered COUNT then never reads a single column.)
+     */
+    public bool $whereCovered = false;
+
+    /**
+     * Per-query memoization keyed by spl_object_id of the expression node. A
+     * query's frame layout, and a column's declared affinity/collation, are
+     * constant across every row scanned, so these are resolved once and reused.
+     * The evaluator is created fresh per query, so the caches never outlive the
+     * frame layout they describe.
+     *
+     * @var array<int,array{0:int,1:int}> resolved [frameIndex,pos] per COL node
+     */
+    private array $colSlot = [];
+    /** @var array<int,array{0:?Affinity,1:?Affinity}> comparison affinities per node */
+    private array $cmpAff = [];
+    /** @var array<int,string> comparison collation per node */
+    private array $cmpColl = [];
+
+    /** @param array<string,null|int|float|string|Blob> $params bound parameters */
+    public function __construct(
+        private readonly Executor $executor,
+        private array $params = [],
+    ) {
+    }
+
+    /** @param array<string,null|int|float|string|Blob> $params */
+    public function setParams(array $params): void
+    {
+        $this->params = $params;
+    }
+
+    /** @return array<string,null|int|float|string|Blob> */
+    public function params(): array
+    {
+        return $this->params;
+    }
+
+    public function evaluate(Expr $e, ?RowEnv $env = null): null|int|float|string|Blob
+    {
+        switch ($e->kind) {
+            case Expr::LIT:
+                return $e->value;
+
+            case Expr::COL:
+                if ($env !== null) {
+                    // Fast path: a memoized concrete slot, resolved once per query.
+                    $id = \spl_object_id($e);
+                    $slot = $this->colSlot[$id] ?? null;
+                    if ($slot !== null) {
+                        return $env->valueAt($slot[0], $slot[1]);
+                    }
+                    $slot = $env->resolveSlot($e->table, (string) $e->name);
+                    if ($slot !== null) {
+                        $this->colSlot[$id] = $slot;
+                        return $env->valueAt($slot[0], $slot[1]);
+                    }
+                    if ($env->hasColumn($e->table, (string) $e->name)) {
+                        return $env->resolveColumn($e->table, (string) $e->name);
+                    }
+                }
+                // Fall back to a SELECT-list alias (legal in HAVING/ORDER BY).
+                if ($e->table === null && isset($this->aliasExprs[\strtolower((string) $e->name)])) {
+                    return $this->evaluate($this->aliasExprs[\strtolower((string) $e->name)], $env);
+                }
+                if ($env === null) {
+                    throw new SqlException("no such column: {$e->name}");
+                }
+                return $env->resolveColumn($e->table, (string) $e->name);
+
+            case Expr::PARAM:
+                return $this->resolveParam((string) $e->name);
+
+            case Expr::UNARY:
+                return $this->unary($e, $env);
+
+            case Expr::BIN:
+                return $this->binary($e, $env);
+
+            case Expr::FUNC:
+                return $this->func($e, $env);
+
+            case Expr::CAST:
+                return $this->cast($this->evaluate($e->operand, $env), (string) $e->typeName);
+
+            case Expr::CASE_:
+                return $this->caseExpr($e, $env);
+
+            case Expr::COLLATE:
+                return $this->evaluate($e->operand, $env);
+
+            case Expr::ISNULL:
+                $v = $this->evaluate($e->operand, $env);
+                return ($v === null) === !$e->not ? 1 : 0;
+
+            case Expr::BETWEEN:
+                return $this->between($e, $env);
+
+            case Expr::IN:
+                return $this->inExpr($e, $env);
+
+            case Expr::LIKE:
+                return $this->likeExpr($e, $env);
+
+            case Expr::SUBQUERY:
+                return $this->scalarSubquery($e->select);
+
+            case Expr::EXISTS:
+                $rows = $this->executor->runSubquerySelect($e->select, $this->params);
+                return $rows === [] ? 0 : 1;
+
+            default:
+                throw new SqlException("cannot evaluate expression kind: {$e->kind}");
+        }
+    }
+
+    private function resolveParam(string $marker): null|int|float|string|Blob
+    {
+        // Positional params arrive pre-numbered as "?N" from the parser, so
+        // resolution is order-independent (binding key is the 1-based ordinal).
+        if ($marker[0] === '?') {
+            return $this->params[\substr($marker, 1)] ?? null;
+        }
+        // Named: accept the binding with or without the leading sigil.
+        return $this->params[$marker]
+            ?? $this->params[\substr($marker, 1)]
+            ?? null;
+    }
+
+    private function unary(Expr $e, ?RowEnv $env): null|int|float|string|Blob
+    {
+        if ($e->op === 'NOT') {
+            $v = $this->evaluate($e->operand, $env);
+            if ($v === null) {
+                return null;
+            }
+            return Value::isTrue($v) ? 0 : 1;
+        }
+        $v = $this->evaluate($e->operand, $env);
+        if ($v === null) {
+            return null;
+        }
+        return match ($e->op) {
+            '-' => self::negate(Value::toNumber($v)),
+            '+' => Value::toNumber($v),
+            '~' => ~((int) Value::toNumber($v)),
+            default => throw new SqlException("bad unary op {$e->op}"),
+        };
+    }
+
+    private static function negate(int|float $n): int|float
+    {
+        return $n === 0 ? 0 : -$n;
+    }
+
+    private function binary(Expr $e, ?RowEnv $env): null|int|float|string|Blob
+    {
+        $op = (string) $e->op;
+
+        // Logical operators implement three-valued logic and short-circuit.
+        if ($op === 'AND') {
+            $l = $this->evaluate($e->left, $env);
+            if ($l !== null && !Value::isTrue($l)) {
+                return 0;
+            }
+            $r = $this->evaluate($e->right, $env);
+            if ($r !== null && !Value::isTrue($r)) {
+                return 0;
+            }
+            return ($l === null || $r === null) ? null : 1;
+        }
+        if ($op === 'OR') {
+            $l = $this->evaluate($e->left, $env);
+            if ($l !== null && Value::isTrue($l)) {
+                return 1;
+            }
+            $r = $this->evaluate($e->right, $env);
+            if ($r !== null && Value::isTrue($r)) {
+                return 1;
+            }
+            return ($l === null || $r === null) ? null : 0;
+        }
+
+        if ($op === 'IS' || $op === 'IS NOT') {
+            $l = $this->evaluate($e->left, $env);
+            $r = $this->evaluate($e->right, $env);
+            $eq = ($l === null && $r === null) || ($l !== null && $r !== null && Value::compare($l, $r) === 0);
+            return ($eq === ($op === 'IS')) ? 1 : 0;
+        }
+
+        $l = $this->evaluate($e->left, $env);
+        $r = $this->evaluate($e->right, $env);
+
+        // Comparisons and arithmetic propagate NULL.
+        if (\in_array($op, ['=', '<>', '<', '<=', '>', '>='], true)) {
+            if ($l === null || $r === null) {
+                return null;
+            }
+            return $this->compareOp($op, $l, $r, $e, $env) ? 1 : 0;
+        }
+
+        if ($op === '||') {
+            if ($l === null || $r === null) {
+                return null;
+            }
+            return (string) Value::toText($l) . (string) Value::toText($r);
+        }
+
+        if ($l === null || $r === null) {
+            return null;
+        }
+
+        return match ($op) {
+            '+' => $this->arith($l, $r, static fn ($a, $b) => $a + $b),
+            '-' => $this->arith($l, $r, static fn ($a, $b) => $a - $b),
+            '*' => $this->arith($l, $r, static fn ($a, $b) => $a * $b),
+            '/' => $this->divide($l, $r),
+            '%' => $this->modulo($l, $r),
+            '&' => (int) Value::toNumber($l) & (int) Value::toNumber($r),
+            '|' => (int) Value::toNumber($l) | (int) Value::toNumber($r),
+            '<<' => (int) Value::toNumber($l) << (int) Value::toNumber($r),
+            '>>' => (int) Value::toNumber($l) >> (int) Value::toNumber($r),
+            default => throw new SqlException("bad operator $op"),
+        };
+    }
+
+    private function arith(mixed $l, mixed $r, callable $fn): int|float
+    {
+        return $fn(Value::toNumber($l), Value::toNumber($r));
+    }
+
+    private function divide(mixed $l, mixed $r): null|int|float
+    {
+        $a = Value::toNumber($l);
+        $b = Value::toNumber($r);
+        if ($b == 0) {
+            return null; // SQLite: division by zero yields NULL
+        }
+        if (\is_int($a) && \is_int($b)) {
+            return \intdiv($a, $b); // integer division truncates toward zero
+        }
+        return $a / $b;
+    }
+
+    private function modulo(mixed $l, mixed $r): null|int|float
+    {
+        $a = (int) Value::toNumber($l);
+        $b = (int) Value::toNumber($r);
+        if ($b === 0) {
+            return null;
+        }
+        return $a % $b;
+    }
+
+    private function compareOp(string $op, mixed $l, mixed $r, Expr $e, ?RowEnv $env): bool
+    {
+        [$l, $r] = $this->applyComparisonAffinity($l, $r, $e, $env);
+        $collation = $this->comparisonCollation($e, $env);
+        $cmp = Value::compare($l, $r, $collation);
+        return match ($op) {
+            '=' => $cmp === 0,
+            '<>' => $cmp !== 0,
+            '<' => $cmp < 0,
+            '<=' => $cmp <= 0,
+            '>' => $cmp > 0,
+            '>=' => $cmp >= 0,
+            default => false,
+        };
+    }
+
+    /**
+     * SQLite comparison affinity: numeric affinity on one side coerces the
+     * other; TEXT affinity coerces a no-affinity operand to text.
+     *
+     * @return array{0:null|int|float|string|Blob,1:null|int|float|string|Blob}
+     */
+    private function applyComparisonAffinity(mixed $l, mixed $r, Expr $e, ?RowEnv $env): array
+    {
+        $id = \spl_object_id($e);
+        if (isset($this->cmpAff[$id])) {
+            [$la, $ra] = $this->cmpAff[$id];
+        } else {
+            $la = $this->exprAffinity($e->left, $env);
+            $ra = $this->exprAffinity($e->right, $env);
+            if ($env !== null) {
+                $this->cmpAff[$id] = [$la, $ra];
+            }
+        }
+        $numeric = static fn (?Affinity $a): bool =>
+            $a === Affinity::INTEGER || $a === Affinity::REAL || $a === Affinity::NUMERIC;
+
+        if ($numeric($la) && !$numeric($ra)) {
+            $r = Affinity::NUMERIC->apply($r);
+        } elseif ($numeric($ra) && !$numeric($la)) {
+            $l = Affinity::NUMERIC->apply($l);
+        } elseif ($la === Affinity::TEXT && $ra === null) {
+            $r = Affinity::TEXT->apply($r);
+        } elseif ($ra === Affinity::TEXT && $la === null) {
+            $l = Affinity::TEXT->apply($l);
+        }
+        return [$l, $r];
+    }
+
+    private function exprAffinity(?Expr $e, ?RowEnv $env): ?Affinity
+    {
+        if ($e === null || $env === null) {
+            return null;
+        }
+        return match ($e->kind) {
+            Expr::COL => $env->columnAffinity($e->table, (string) $e->name),
+            Expr::CAST => Affinity::fromDeclaredType($e->typeName),
+            Expr::COLLATE => $this->exprAffinity($e->operand, $env),
+            default => null,
+        };
+    }
+
+    private function comparisonCollation(Expr $e, ?RowEnv $env): string
+    {
+        $id = \spl_object_id($e);
+        if (isset($this->cmpColl[$id])) {
+            return $this->cmpColl[$id];
+        }
+        // Explicit COLLATE on either side wins; else the left column's collation.
+        $c = $this->explicitCollation($e->left) ?? $this->explicitCollation($e->right);
+        if ($c === null) {
+            if ($env !== null && $e->left?->kind === Expr::COL) {
+                $c = $env->columnCollation($e->left->table, (string) $e->left->name) ?? Collation::BINARY;
+            } elseif ($env !== null && $e->right?->kind === Expr::COL) {
+                $c = $env->columnCollation($e->right->table, (string) $e->right->name) ?? Collation::BINARY;
+            } else {
+                $c = Collation::BINARY;
+            }
+        }
+        if ($env !== null) {
+            $this->cmpColl[$id] = $c;
+        }
+        return $c;
+    }
+
+    private function explicitCollation(?Expr $e): ?string
+    {
+        return $e !== null && $e->kind === Expr::COLLATE ? $e->collation : null;
+    }
+
+    private function func(Expr $e, ?RowEnv $env): null|int|float|string|Blob
+    {
+        $name = \strtolower((string) $e->name);
+
+        if (Aggregates::isAggregate($name)) {
+            return $this->aggregateValues[\spl_object_id($e)] ?? null;
+        }
+
+        return match ($name) {
+            'current_date' => \gmdate('Y-m-d'),
+            'current_time' => \gmdate('H:i:s'),
+            'current_timestamp' => \gmdate('Y-m-d H:i:s'),
+            'last_insert_rowid' => $this->executor->lastInsertId(),
+            'changes' => $this->executor->changes(),
+            'glob' => $this->globMatch(
+                (string) Value::toText($this->evaluate($e->args[1], $env)),
+                $this->evaluate($e->args[0], $env),
+            ) ? 1 : 0,
+            'like' => $this->likeMatch(
+                (string) Value::toText($this->evaluate($e->args[0], $env)),
+                $this->evaluate($e->args[1], $env),
+                isset($e->args[2]) ? (string) Value::toText($this->evaluate($e->args[2], $env)) : null,
+            ) ? 1 : 0,
+            default => ScalarFunctions::call($name, $this->evalArgs($e->args, $env)),
+        };
+    }
+
+    /** @return list<null|int|float|string|Blob> */
+    private function evalArgs(array $args, ?RowEnv $env): array
+    {
+        $out = [];
+        foreach ($args as $a) {
+            $out[] = $this->evaluate($a, $env);
+        }
+        return $out;
+    }
+
+    private function cast(null|int|float|string|Blob $v, string $type): null|int|float|string|Blob
+    {
+        $aff = Affinity::fromDeclaredType($type);
+        if ($v === null) {
+            return null;
+        }
+        return match ($aff) {
+            Affinity::INTEGER => (int) Value::toNumber($v),
+            Affinity::REAL => (float) Value::toNumber($v),
+            Affinity::NUMERIC => self::castNumeric($v),
+            Affinity::TEXT => $v instanceof Blob ? $v->bytes : (string) Value::toText($v),
+            Affinity::BLOB => $v instanceof Blob ? $v : new Blob((string) Value::toText($v)),
+        };
+    }
+
+    private static function castNumeric(null|int|float|string|Blob $v): int|float
+    {
+        $n = Value::toNumber($v);
+        if (\is_float($n) && \is_finite($n) && (float) (int) $n === $n) {
+            return (int) $n;
+        }
+        return $n;
+    }
+
+    private function caseExpr(Expr $e, ?RowEnv $env): null|int|float|string|Blob
+    {
+        $subject = $e->subject !== null ? $this->evaluate($e->subject, $env) : null;
+        foreach ($e->whens as [$when, $then]) {
+            if ($e->subject !== null) {
+                $w = $this->evaluate($when, $env);
+                if ($subject !== null && $w !== null && Value::compare($subject, $w) === 0) {
+                    return $this->evaluate($then, $env);
+                }
+            } else {
+                $cond = $this->evaluate($when, $env);
+                if ($cond !== null && Value::isTrue($cond)) {
+                    return $this->evaluate($then, $env);
+                }
+            }
+        }
+        return $e->elseExpr !== null ? $this->evaluate($e->elseExpr, $env) : null;
+    }
+
+    private function between(Expr $e, ?RowEnv $env): null|int|float|string|Blob
+    {
+        $v = $this->evaluate($e->operand, $env);
+        $lo = $this->evaluate($e->low, $env);
+        $hi = $this->evaluate($e->high, $env);
+        if ($v === null || $lo === null || $hi === null) {
+            return null;
+        }
+        $in = Value::compare($v, $lo) >= 0 && Value::compare($v, $hi) <= 0;
+        return ($in !== $e->not) ? 1 : 0;
+    }
+
+    private function inExpr(Expr $e, ?RowEnv $env): null|int|float|string|Blob
+    {
+        $v = $this->evaluate($e->operand, $env);
+
+        $candidates = [];
+        if ($e->select !== null) {
+            foreach ($this->executor->runSubquerySelect($e->select, $this->params) as $row) {
+                $candidates[] = $row[0] ?? null;
+            }
+        } else {
+            foreach ($e->list as $item) {
+                $candidates[] = $this->evaluate($item, $env);
+            }
+        }
+
+        if ($v === null) {
+            return null;
+        }
+        $sawNull = false;
+        foreach ($candidates as $c) {
+            if ($c === null) {
+                $sawNull = true;
+                continue;
+            }
+            if (Value::compare($v, $c) === 0) {
+                return $e->not ? 0 : 1;
+            }
+        }
+        // No match: NULL if any candidate was NULL, else definite.
+        if ($sawNull) {
+            return null;
+        }
+        return $e->not ? 1 : 0;
+    }
+
+    private function likeExpr(Expr $e, ?RowEnv $env): null|int|float|string|Blob
+    {
+        $subject = $this->evaluate($e->left, $env);
+        $pattern = $this->evaluate($e->right, $env);
+        if ($subject === null || $pattern === null) {
+            return null;
+        }
+        $escape = $e->escape !== null ? (string) Value::toText($this->evaluate($e->escape, $env)) : null;
+
+        $matched = match ($e->op) {
+            'GLOB' => $this->globMatch((string) Value::toText($pattern), $subject),
+            'REGEXP' => @\preg_match('/' . \str_replace('/', '\/', (string) Value::toText($pattern)) . '/u', (string) Value::toText($subject)) === 1,
+            default => $this->likeMatch((string) Value::toText($subject), $pattern, $escape),
+        };
+        return ($matched !== $e->not) ? 1 : 0;
+    }
+
+    private function likeMatch(string $subject, null|int|float|string|Blob $pattern, ?string $escape): bool
+    {
+        $regex = self::likeToRegex((string) Value::toText($pattern), $escape);
+        // SQLite LIKE is case-insensitive for ASCII by default.
+        return \preg_match($regex . 'iu', $subject) === 1;
+    }
+
+    private static function likeToRegex(string $pattern, ?string $escape): string
+    {
+        $re = '/^';
+        $len = \strlen($pattern);
+        for ($i = 0; $i < $len; $i++) {
+            $ch = $pattern[$i];
+            if ($escape !== null && $escape !== '' && $ch === $escape[0] && $i + 1 < $len) {
+                $re .= \preg_quote($pattern[++$i], '/');
+                continue;
+            }
+            $re .= match ($ch) {
+                '%' => '.*',
+                '_' => '.',
+                default => \preg_quote($ch, '/'),
+            };
+        }
+        return $re . '$/';
+    }
+
+    private function globMatch(string $pattern, null|int|float|string|Blob $subject): bool
+    {
+        $re = '/^';
+        $len = \strlen($pattern);
+        for ($i = 0; $i < $len; $i++) {
+            $ch = $pattern[$i];
+            $re .= match ($ch) {
+                '*' => '.*',
+                '?' => '.',
+                '[' => self::globClass($pattern, $i),
+                default => \preg_quote($ch, '/'),
+            };
+        }
+        return \preg_match($re . '$/su', (string) Value::toText($subject)) === 1;
+    }
+
+    private static function globClass(string $pattern, int &$i): string
+    {
+        $len = \strlen($pattern);
+        $class = '[';
+        $i++;
+        if ($i < $len && $pattern[$i] === '^') {
+            $class .= '^';
+            $i++;
+        }
+        while ($i < $len && $pattern[$i] !== ']') {
+            $class .= \preg_quote($pattern[$i], '/');
+            $i++;
+        }
+        return $class . ']';
+    }
+
+    private function scalarSubquery(SelectStatement $select): null|int|float|string|Blob
+    {
+        $rows = $this->executor->runSubquerySelect($select, $this->params);
+        if ($rows === []) {
+            return null;
+        }
+        return $rows[0][0] ?? null;
+    }
+}

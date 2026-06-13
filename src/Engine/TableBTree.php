@@ -1,0 +1,506 @@
+<?php
+
+declare(strict_types=1);
+
+namespace YetiDevWorks\YetiSQL\Engine;
+
+use Generator;
+
+/**
+ * A rowid-keyed table b-tree (a "table b-tree" in SQLite terms).
+ *
+ * Cells live in leaf pages keyed by an integer rowid; interior pages route
+ * searches. Payloads larger than the inline limit spill onto a chain of
+ * overflow pages. Deletes remove the cell without rebalancing (space is
+ * reclaimed lazily) — correctness holds, full compaction is a later concern.
+ *
+ * Leaf cell:     varint(payloadLen) varint(rowid) localPayload [overflowPage:4]
+ * Interior cell: child:4 varint(rowidSeparator)   (child holds rowids <= sep)
+ */
+final class TableBTree
+{
+    public function __construct(
+        private readonly Pager $pager,
+        private int $rootPage,
+    ) {
+    }
+
+    public function rootPage(): int
+    {
+        return $this->rootPage;
+    }
+
+    /** Allocate and initialise a brand-new empty table b-tree; return its root page. */
+    public static function create(Pager $pager): int
+    {
+        $root = $pager->allocatePage();
+        $pager->write($root, BTreePage::newLeaf($pager->pageSize(), isTable: true));
+        return $root;
+    }
+
+    /** Fetch the full payload for a rowid, or null if absent. */
+    public function get(int $rowid): ?string
+    {
+        $pageNo = $this->findLeaf($rowid);
+        $page = $this->pager->readPage($pageNo);
+        // Leaf cells are sorted by rowid, so binary-search rather than scan.
+        $lo = 0;
+        $hi = \count($page->cells) - 1;
+        while ($lo <= $hi) {
+            $mid = ($lo + $hi) >> 1;
+            [$rid, , $plen, $n1, $n2] = $this->parseLeafCell($page->cells[$mid]);
+            if ($rid === $rowid) {
+                return $this->readPayload($page->cells[$mid], $plen, $n1 + $n2);
+            }
+            if ($rid < $rowid) {
+                $lo = $mid + 1;
+            } else {
+                $hi = $mid - 1;
+            }
+        }
+        return null;
+    }
+
+    public function exists(int $rowid): bool
+    {
+        return $this->get($rowid) !== null;
+    }
+
+    /** The largest rowid currently stored, or 0 if empty. */
+    public function maxRowid(): int
+    {
+        $pageNo = $this->rootPage;
+        while (true) {
+            $page = $this->pager->readPage($pageNo);
+            if ($page->isLeaf()) {
+                if ($page->cells === []) {
+                    return 0;
+                }
+                $last = $page->cells[\count($page->cells) - 1];
+                return $this->parseLeafCell($last)[0];
+            }
+            $pageNo = $page->rightChild;
+        }
+    }
+
+    /** Insert or replace the row for $rowid with the given record payload. */
+    public function put(int $rowid, string $payload): void
+    {
+        $split = $this->insertInto($this->rootPage, $rowid, $payload);
+        if ($split !== null) {
+            $this->growRoot($split[0], $split[1]);
+        }
+    }
+
+    /** Remove the row for $rowid. Returns true if a row was deleted. */
+    public function delete(int $rowid): bool
+    {
+        $pageNo = $this->findLeaf($rowid);
+        $page = $this->pager->readPage($pageNo);
+        foreach ($page->cells as $i => $cell) {
+            [$rid, , $plen, $n1, $n2] = $this->parseLeafCell($cell);
+            if ($rid === $rowid) {
+                if ($plen > BTreePage::maxLocal($this->pager->pageSize())) {
+                    $this->freeOverflow($cell, $n1 + $n2);
+                }
+                \array_splice($page->cells, $i, 1);
+                $this->pager->writePage($pageNo, $page);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * In-order scan yielding [rowid, payload]. Optionally start at >= $from.
+     *
+     * @return Generator<int,array{0:int,1:string}>
+     */
+    public function scan(?int $from = null): Generator
+    {
+        yield from $this->scanPage($this->rootPage, $from);
+    }
+
+    // --- internals --------------------------------------------------------
+
+    /** @return Generator<int,array{0:int,1:string}> */
+    private function scanPage(int $pageNo, ?int $from): Generator
+    {
+        $page = $this->pager->readPage($pageNo);
+        if ($page->isLeaf()) {
+            foreach ($page->cells as $cell) {
+                [$rid, , $plen, $n1, $n2] = $this->parseLeafCell($cell);
+                if ($from !== null && $rid < $from) {
+                    continue;
+                }
+                yield [$rid, $this->readPayload($cell, $plen, $n1 + $n2)];
+            }
+            return;
+        }
+        foreach ($page->cells as $cell) {
+            [$child, $sep] = $this->parseInteriorCell($cell);
+            if ($from === null || $from <= $sep) {
+                yield from $this->scanPage($child, $from);
+            }
+        }
+        yield from $this->scanPage($page->rightChild, $from);
+    }
+
+    private function findLeaf(int $rowid): int
+    {
+        $pageNo = $this->rootPage;
+        while (true) {
+            $page = $this->pager->readPage($pageNo);
+            if ($page->isLeaf()) {
+                return $pageNo;
+            }
+            $pageNo = $this->childFor($page, $rowid);
+        }
+    }
+
+    private function childFor(BTreePage $page, int $rowid): int
+    {
+        // Interior cells are ordered by separator key; binary-search the first
+        // whose separator is >= the target rowid.
+        $cells = $page->cells;
+        $lo = 0;
+        $hi = \count($cells) - 1;
+        $found = -1;
+        while ($lo <= $hi) {
+            $mid = ($lo + $hi) >> 1;
+            if ($rowid <= $this->parseInteriorCell($cells[$mid])[1]) {
+                $found = $mid;
+                $hi = $mid - 1;
+            } else {
+                $lo = $mid + 1;
+            }
+        }
+        return $found === -1 ? $page->rightChild : $this->parseInteriorCell($cells[$found])[0];
+    }
+
+    /**
+     * Recursive insert. Returns null, or [separatorRowid, newRightPage] if the
+     * page at $pageNo split and the caller must absorb the new sibling.
+     *
+     * @return array{0:int,1:int}|null
+     */
+    private function insertInto(int $pageNo, int $rowid, string $payload): ?array
+    {
+        $page = $this->pager->readPage($pageNo);
+
+        if ($page->isLeaf()) {
+            $cell = $this->makeLeafCell($rowid, $payload);
+            $this->insertLeafCell($page, $rowid, $cell);
+            if ($page->fits($this->pager->pageSize())) {
+                $this->pager->writePage($pageNo, $page);
+                return null;
+            }
+            return $this->splitLeaf($pageNo, $page);
+        }
+
+        // Interior: find which child to descend into.
+        $childIndex = $this->childIndexFor($page, $rowid);
+        $childPage = $childIndex === -1 ? $page->rightChild : $this->parseInteriorCell($page->cells[$childIndex])[0];
+
+        $split = $this->insertInto($childPage, $rowid, $payload);
+        if ($split === null) {
+            return null;
+        }
+
+        [$sepKey, $newRight] = $split;
+        // The descended child now holds the lower half; $newRight the upper.
+        $newCell = $this->makeInteriorCell($childPage, $sepKey);
+        if ($childIndex === -1) {
+            $page->cells[] = $newCell;
+            $page->rightChild = $newRight;
+        } else {
+            \array_splice($page->cells, $childIndex, 0, [$newCell]);
+            $page->cells[$childIndex + 1] = $this->makeInteriorCell($newRight, $this->parseInteriorCell($page->cells[$childIndex + 1])[1]);
+        }
+
+        if ($page->fits($this->pager->pageSize())) {
+            $this->pager->writePage($pageNo, $page);
+            return null;
+        }
+        return $this->splitInterior($pageNo, $page);
+    }
+
+    /** @return array{0:int,1:int} [separatorRowid, newRightPage] */
+    private function splitLeaf(int $pageNo, BTreePage $page): array
+    {
+        $mid = $this->leafSplitPoint($page->cells);
+        $leftCells = \array_slice($page->cells, 0, $mid);
+        $rightCells = \array_slice($page->cells, $mid);
+
+        $left = new BTreePage(BTreePage::TABLE_LEAF);
+        $left->cells = $leftCells;
+        $right = new BTreePage(BTreePage::TABLE_LEAF);
+        $right->cells = $rightCells;
+
+        $newRight = $this->pager->allocatePage();
+        $this->pager->write($pageNo, $left->encode($this->pager->pageSize()));
+        $this->pager->write($newRight, $right->encode($this->pager->pageSize()));
+
+        $sepKey = $this->parseLeafCell($leftCells[\count($leftCells) - 1])[0];
+        return [$sepKey, $newRight];
+    }
+
+    /** @return array{0:int,1:int} [separatorRowid, newRightPage] */
+    private function splitInterior(int $pageNo, BTreePage $page): array
+    {
+        $mid = $this->interiorSplitPoint($page->cells);
+        // The middle cell's key is promoted; its child becomes the new page's
+        // right-most child.
+        $midCell = $page->cells[$mid];
+        [$midChild, $sepKey] = $this->parseInteriorCell($midCell);
+
+        $leftCells = \array_slice($page->cells, 0, $mid);
+        $rightCells = \array_slice($page->cells, $mid + 1);
+
+        $left = new BTreePage(BTreePage::TABLE_INTERIOR);
+        $left->cells = $leftCells;
+        $left->rightChild = $midChild;
+
+        $right = new BTreePage(BTreePage::TABLE_INTERIOR);
+        $right->cells = $rightCells;
+        $right->rightChild = $page->rightChild;
+
+        $newRight = $this->pager->allocatePage();
+        $this->pager->write($pageNo, $left->encode($this->pager->pageSize()));
+        $this->pager->write($newRight, $right->encode($this->pager->pageSize()));
+
+        return [$sepKey, $newRight];
+    }
+
+    private function growRoot(int $sepKey, int $newRight): void
+    {
+        // Move current root content to a fresh page, then rewrite the root as a
+        // two-child interior so the table's root page number stays stable.
+        $leftNew = $this->pager->allocatePage();
+        $this->pager->write($leftNew, $this->pager->read($this->rootPage));
+
+        $root = new BTreePage(BTreePage::TABLE_INTERIOR);
+        $root->cells = [$this->makeInteriorCell($leftNew, $sepKey)];
+        $root->rightChild = $newRight;
+        $this->pager->write($this->rootPage, $root->encode($this->pager->pageSize()));
+    }
+
+    /**
+     * Pick the most balanced leaf split index where both halves fit a page.
+     * A single insert keeps the page below 2x usable, so a feasible point
+     * always exists.
+     *
+     * @param list<string> $cells
+     */
+    private function leafSplitPoint(array $cells): int
+    {
+        $usable = BTreePage::usable($this->pager->pageSize());
+        $costs = \array_map(static fn (string $c): int => \strlen($c) + 2, $cells);
+        $total = \array_sum($costs);
+        $n = \count($cells);
+
+        $best = -1;
+        $bestDiff = PHP_INT_MAX;
+        $left = 0;
+        for ($k = 1; $k < $n; $k++) {
+            $left += $costs[$k - 1];
+            $right = $total - $left;
+            if ($left <= $usable && $right <= $usable) {
+                $diff = \abs($left - $right);
+                if ($diff < $bestDiff) {
+                    $bestDiff = $diff;
+                    $best = $k;
+                }
+            }
+        }
+        return $best === -1 ? \intdiv($n, 2) : $best;
+    }
+
+    /**
+     * Pick the interior split index to promote (cells[k]); halves exclude it.
+     *
+     * @param list<string> $cells
+     */
+    private function interiorSplitPoint(array $cells): int
+    {
+        $usable = BTreePage::usable($this->pager->pageSize());
+        $costs = \array_map(static fn (string $c): int => \strlen($c) + 2, $cells);
+        $total = \array_sum($costs);
+        $n = \count($cells);
+
+        $best = -1;
+        $bestDiff = PHP_INT_MAX;
+        $leftPrefix = 0; // cost of cells[0..k-1]
+        for ($k = 1; $k < $n - 1; $k++) {
+            $leftPrefix += $costs[$k - 1];
+            $right = $total - $leftPrefix - $costs[$k];
+            if ($leftPrefix <= $usable && $right <= $usable) {
+                $diff = \abs($leftPrefix - $right);
+                if ($diff < $bestDiff) {
+                    $bestDiff = $diff;
+                    $best = $k;
+                }
+            }
+        }
+        return $best === -1 ? \intdiv($n, 2) : $best;
+    }
+
+    private function childIndexFor(BTreePage $page, int $rowid): int
+    {
+        // First interior cell whose separator is >= rowid (binary search), or -1
+        // for the right-most child.
+        $cells = $page->cells;
+        $lo = 0;
+        $hi = \count($cells) - 1;
+        $found = -1;
+        while ($lo <= $hi) {
+            $mid = ($lo + $hi) >> 1;
+            if ($rowid <= $this->parseInteriorCell($cells[$mid])[1]) {
+                $found = $mid;
+                $hi = $mid - 1;
+            } else {
+                $lo = $mid + 1;
+            }
+        }
+        return $found;
+    }
+
+    private function insertLeafCell(BTreePage $page, int $rowid, string $cell): void
+    {
+        $n = \count($page->cells);
+        if ($n === 0) {
+            $page->cells[] = $cell;
+            return;
+        }
+
+        // Cells are kept sorted by rowid. Bulk loads insert in ascending order,
+        // so check the tail first: an append is the overwhelmingly common case
+        // and avoids scanning the whole page (which made bulk insert O(n^2)).
+        $lastRid = $this->parseLeafCell($page->cells[$n - 1])[0];
+        if ($rowid > $lastRid) {
+            $page->cells[] = $cell;
+            return;
+        }
+        if ($rowid === $lastRid) {
+            $page->cells[$n - 1] = $cell;
+            return;
+        }
+
+        // Otherwise binary-search the insertion point (O(log n) cell parses).
+        $lo = 0;
+        $hi = $n - 1;
+        while ($lo < $hi) {
+            $mid = ($lo + $hi) >> 1;
+            $rid = $this->parseLeafCell($page->cells[$mid])[0];
+            if ($rid === $rowid) {
+                $page->cells[$mid] = $cell; // replace
+                return;
+            }
+            if ($rid < $rowid) {
+                $lo = $mid + 1;
+            } else {
+                $hi = $mid;
+            }
+        }
+        // $lo is the first cell with rowid >= $rowid (and != since tail handled).
+        \array_splice($page->cells, $lo, 0, [$cell]);
+    }
+
+    // --- cell encoding/decoding ------------------------------------------
+
+    private function makeLeafCell(int $rowid, string $payload): string
+    {
+        $plen = \strlen($payload);
+        $maxLocal = BTreePage::maxLocal($this->pager->pageSize());
+        if ($plen <= $maxLocal) {
+            return Varint::encode($plen) . Varint::encode($rowid) . $payload;
+        }
+        $local = \substr($payload, 0, $maxLocal);
+        $overflow = \substr($payload, $maxLocal);
+        $firstOverflow = $this->writeOverflow($overflow);
+        return Varint::encode($plen) . Varint::encode($rowid) . $local . \pack('N', $firstOverflow);
+    }
+
+    private function makeInteriorCell(int $child, int $sepKey): string
+    {
+        return \pack('N', $child) . Varint::encode($sepKey);
+    }
+
+    /** @return array{0:int,1:int,2:int,3:int,4:int} [rowid, headerEnd, plen, n1, n2] */
+    private function parseLeafCell(string $cell): array
+    {
+        [$plen, $n1] = Varint::decode($cell, 0);
+        [$rowid, $n2] = Varint::decode($cell, $n1);
+        return [$rowid, $n1 + $n2, $plen, $n1, $n2];
+    }
+
+    /** @return array{0:int,1:int} [childPage, separatorRowid] */
+    private function parseInteriorCell(string $cell): array
+    {
+        /** @var array{1:int} $c */
+        $c = \unpack('N', \substr($cell, 0, 4));
+        [$sep] = Varint::decode($cell, 4);
+        return [$c[1], $sep];
+    }
+
+    private function readPayload(string $cell, int $plen, int $headerLen): string
+    {
+        $maxLocal = BTreePage::maxLocal($this->pager->pageSize());
+        if ($plen <= $maxLocal) {
+            return \substr($cell, $headerLen, $plen);
+        }
+        $local = \substr($cell, $headerLen, $maxLocal);
+        /** @var array{1:int} $ov */
+        $ov = \unpack('N', \substr($cell, $headerLen + $maxLocal, 4));
+        return $local . $this->readOverflow($ov[1], $plen - $maxLocal);
+    }
+
+    private function writeOverflow(string $data): int
+    {
+        $pageSize = $this->pager->pageSize();
+        $perPage = $pageSize - 4;
+        $chunks = \str_split($data, $perPage);
+        $pageNos = [];
+        for ($i = 0, $c = \count($chunks); $i < $c; $i++) {
+            $pageNos[] = $this->pager->allocatePage();
+        }
+        foreach ($chunks as $i => $chunk) {
+            $next = $pageNos[$i + 1] ?? 0;
+            $body = \pack('N', $next) . $chunk;
+            $body .= \str_repeat("\x00", $pageSize - \strlen($body));
+            $this->pager->write($pageNos[$i], $body);
+        }
+        return $pageNos[0];
+    }
+
+    private function readOverflow(int $pageNo, int $remaining): string
+    {
+        $pageSize = $this->pager->pageSize();
+        $out = '';
+        while ($pageNo !== 0 && $remaining > 0) {
+            $page = $this->pager->read($pageNo);
+            /** @var array{1:int} $n */
+            $n = \unpack('N', \substr($page, 0, 4));
+            $take = \min($remaining, $pageSize - 4);
+            $out .= \substr($page, 4, $take);
+            $remaining -= $take;
+            $pageNo = $n[1];
+        }
+        return $out;
+    }
+
+    private function freeOverflow(string $cell, int $headerLen): void
+    {
+        $maxLocal = BTreePage::maxLocal($this->pager->pageSize());
+        /** @var array{1:int} $ov */
+        $ov = \unpack('N', \substr($cell, $headerLen + $maxLocal, 4));
+        $pageNo = $ov[1];
+        while ($pageNo !== 0) {
+            $page = $this->pager->read($pageNo);
+            /** @var array{1:int} $n */
+            $n = \unpack('N', \substr($page, 0, 4));
+            $this->pager->freePage($pageNo);
+            $pageNo = $n[1];
+        }
+    }
+}
