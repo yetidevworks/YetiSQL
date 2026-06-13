@@ -203,6 +203,10 @@ final class Executor
         }
 
         if ($isAggregate) {
+            $fastGrouped = $this->tryFastGroupedAggregate($select, $outputCols, $aggregateNodes, $orderPlan);
+            if ($fastGrouped !== null) {
+                return [$colNames, $fastGrouped[0], $fastGrouped[1]];
+            }
             [$rows, $keys] = $this->aggregateProject($select, $outputCols, $aggregateNodes, $this->filteredJoined($select, $eval), $eval, $orderPlan);
         } else {
             // Expose SELECT-list aliases to ORDER BY (not to WHERE, above).
@@ -815,6 +819,218 @@ final class Executor
             $this->collectAggregates($w, $nodes);
             $this->collectAggregates($t, $nodes);
         }
+    }
+
+    /**
+     * Direct path for simple single-table grouped aggregates. It decodes only
+     * the group/aggregate columns and avoids building a RowEnv per input row.
+     *
+     * @param list<array{name:string,expr:?Expr,star:bool,tableStar:?string}> $outputCols
+     * @param array<int,Expr> $aggregateNodes
+     * @param list<array{kind:string,index:?int,expr:Expr,desc:bool}> $orderPlan
+     * @return array{0:list<list<null|int|float|string|Blob>>,1:list<list<null|int|float|string|Blob>>}|null
+     */
+    private function tryFastGroupedAggregate(SelectStatement $select, array $outputCols, array $aggregateNodes, array $orderPlan): ?array
+    {
+        if ($select->where !== null
+            || $select->having !== null
+            || $select->groupBy === []
+            || \count($select->groupBy) !== 1
+            || $select->distinct
+            || $orderPlan !== []) {
+            return null;
+        }
+
+        $single = $this->singleTableForCompile($select);
+        if ($single === null) {
+            return null;
+        }
+        [$info, $alias] = $single;
+
+        $groupExpr = $select->groupBy[0];
+        $groupPos = $this->simpleColumnPos($groupExpr, $info, $alias);
+        if ($groupPos === null) {
+            return null;
+        }
+
+        $outPlan = [];
+        $aggSpecs = [];
+        foreach ($outputCols as $c) {
+            $expr = $c['expr'];
+            if (!$expr instanceof Expr) {
+                return null;
+            }
+            if ($expr->kind === Expr::COL) {
+                $pos = $this->simpleColumnPos($expr, $info, $alias);
+                if ($pos !== $groupPos) {
+                    return null;
+                }
+                $outPlan[] = ['kind' => 'group'];
+                continue;
+            }
+            if ($expr->kind !== Expr::FUNC || !Aggregates::isAggregate((string) $expr->name) || $expr->distinct) {
+                return null;
+            }
+
+            $name = \strtolower((string) $expr->name);
+            if (!\in_array($name, ['count', 'sum', 'total', 'avg', 'min', 'max'], true)) {
+                return null;
+            }
+            if ($expr->star) {
+                if ($name !== 'count') {
+                    return null;
+                }
+                $argPos = null;
+            } else {
+                if (\count($expr->args) !== 1) {
+                    return null;
+                }
+                $argPos = $this->simpleColumnPos($expr->args[0], $info, $alias);
+                if ($argPos === null) {
+                    return null;
+                }
+            }
+
+            $id = \spl_object_id($expr);
+            if (!isset($aggregateNodes[$id])) {
+                return null;
+            }
+            $outPlan[] = ['kind' => 'agg', 'id' => $id];
+            $aggSpecs[$id] ??= ['name' => $name, 'pos' => $argPos, 'star' => $expr->star];
+        }
+
+        if ($aggSpecs === []) {
+            return null;
+        }
+
+        $tree = new TableBTree($this->db->pager(), $info->rootPage);
+        $groups = [];
+        $order = [];
+        foreach ($tree->scan() as [$rowid, $payload]) {
+            $offsets = RecordCodec::columnOffsets($payload);
+            $decoded = [];
+            $groupValue = $this->readColumnFromPayload($info, $payload, $offsets, $decoded, $rowid, $groupPos);
+            $key = $this->valueKey($groupValue);
+            if (!isset($groups[$key])) {
+                $groups[$key] = ['group' => $groupValue, 'aggs' => []];
+                foreach ($aggSpecs as $id => $spec) {
+                    $groups[$key]['aggs'][$id] = [
+                        'name' => $spec['name'],
+                        'count' => 0,
+                        'sum' => 0,
+                        'sawFloat' => false,
+                        'any' => false,
+                        'extreme' => null,
+                        'haveExtreme' => false,
+                    ];
+                }
+                $order[] = $key;
+            }
+
+            foreach ($aggSpecs as $id => $spec) {
+                $agg = &$groups[$key]['aggs'][$id];
+                $name = $spec['name'];
+                if ($name === 'count' && $spec['star']) {
+                    $agg['count']++;
+                    unset($agg);
+                    continue;
+                }
+
+                $value = $this->readColumnFromPayload($info, $payload, $offsets, $decoded, $rowid, $spec['pos']);
+                if ($name === 'count') {
+                    if ($value !== null) {
+                        $agg['count']++;
+                    }
+                    unset($agg);
+                    continue;
+                }
+                if ($value === null) {
+                    unset($agg);
+                    continue;
+                }
+                if ($name === 'sum' || $name === 'total' || $name === 'avg') {
+                    $num = Value::toNumber($value);
+                    if (\is_float($num)) {
+                        $agg['sawFloat'] = true;
+                    }
+                    $agg['sum'] += $num;
+                    $agg['count']++;
+                    $agg['any'] = true;
+                    unset($agg);
+                    continue;
+                }
+                if (!$agg['haveExtreme']) {
+                    $agg['extreme'] = $value;
+                    $agg['haveExtreme'] = true;
+                } else {
+                    $cmp = Value::compare($value, $agg['extreme']);
+                    if (($name === 'max' && $cmp > 0) || ($name === 'min' && $cmp < 0)) {
+                        $agg['extreme'] = $value;
+                    }
+                }
+                unset($agg);
+            }
+        }
+
+        $rows = [];
+        foreach ($order as $key) {
+            $group = $groups[$key];
+            $row = [];
+            foreach ($outPlan as $out) {
+                if ($out['kind'] === 'group') {
+                    $row[] = $group['group'];
+                    continue;
+                }
+                $agg = $group['aggs'][$out['id']];
+                $row[] = match ($agg['name']) {
+                    'count' => $agg['count'],
+                    'sum' => $agg['any'] ? ($agg['sawFloat'] ? (float) $agg['sum'] : $agg['sum']) : null,
+                    'total' => (float) $agg['sum'],
+                    'avg' => $agg['count'] > 0 ? (float) $agg['sum'] / $agg['count'] : null,
+                    'min', 'max' => $agg['haveExtreme'] ? $agg['extreme'] : null,
+                    default => null,
+                };
+            }
+            $rows[] = $row;
+        }
+
+        return [$rows, []];
+    }
+
+    private function simpleColumnPos(Expr $expr, TableInfo $info, string $alias): ?int
+    {
+        if ($expr->kind !== Expr::COL) {
+            return null;
+        }
+        if ($expr->table !== null) {
+            $table = \strtolower($expr->table);
+            if ($table !== \strtolower($alias) && $table !== \strtolower($info->name)) {
+                return null;
+            }
+        }
+        return $info->columnPos((string) $expr->name);
+    }
+
+    /**
+     * @param array<int,array{0:int,1:int}> $offsets
+     * @param array<int,null|int|float|string|Blob> $decoded
+     */
+    private function readColumnFromPayload(TableInfo $info, string $payload, array $offsets, array &$decoded, int $rowid, ?int $pos): null|int|float|string|Blob
+    {
+        if ($pos === null) {
+            return null;
+        }
+        if (isset($decoded[$pos]) || \array_key_exists($pos, $decoded)) {
+            return $decoded[$pos];
+        }
+        if ($pos === $info->rowidAlias) {
+            return $decoded[$pos] = $rowid;
+        }
+        if (!isset($offsets[$pos])) {
+            return $decoded[$pos] = null;
+        }
+        [$type, $bodyOff] = $offsets[$pos];
+        return $decoded[$pos] = RecordCodec::decodeAt($payload, $type, $bodyOff);
     }
 
     /**
