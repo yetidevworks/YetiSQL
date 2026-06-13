@@ -1476,8 +1476,45 @@ final class Executor
      */
     private function indexRowids(array $plan): \Generator
     {
-        foreach ($this->indexEntries($plan) as [$rowid]) {
-            yield $rowid;
+        /** @var \YetiDevWorks\YetiSQL\Engine\IndexInfo $index */
+        $index = $plan['index'];
+        $idx = new \YetiDevWorks\YetiSQL\Engine\IndexBTree(
+            $this->db->pager(),
+            $index->rootPage,
+            $index->collations,
+        );
+        $coll = $index->collations[0] ?? 'BINARY';
+
+        $probes = $plan['kind'] === 'index_eq' ? $this->uniqueValues($plan['values'], $coll) : [$plan['low']];
+        $seenRowids = [];
+        foreach ($probes as $probe) {
+            $low = $plan['kind'] === 'index_eq' ? [$probe] : ($plan['low'] !== null ? [$plan['low']] : null);
+            foreach ($idx->scanFrom($low) as $key) {
+                $leading = $key[0];
+                if ($plan['kind'] === 'index_eq') {
+                    if (Value::compare($leading, $probe, $coll) !== 0) {
+                        break;
+                    }
+                } else {
+                    if ($plan['high'] !== null) {
+                        $cmp = Value::compare($leading, $plan['high'], $coll);
+                        if ($cmp > 0 || ($cmp === 0 && !$plan['highInc'])) {
+                            break;
+                        }
+                    }
+                    if ($plan['low'] !== null && !$plan['lowInc'] && Value::compare($leading, $plan['low'], $coll) === 0) {
+                        continue;
+                    }
+                }
+                $rowid = (int) $key[\count($key) - 1];
+                if ($plan['kind'] === 'index_eq') {
+                    if (isset($seenRowids[$rowid])) {
+                        continue;
+                    }
+                    $seenRowids[$rowid] = true;
+                }
+                yield $rowid;
+            }
         }
     }
 
