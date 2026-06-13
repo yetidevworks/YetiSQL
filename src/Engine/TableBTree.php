@@ -86,10 +86,31 @@ final class TableBTree
     /** Insert or replace the row for $rowid with the given record payload. */
     public function put(int $rowid, string $payload): void
     {
-        $split = $this->insertInto($this->rootPage, $rowid, $payload);
+        $existed = false;
+        $split = $this->insertInto($this->rootPage, $rowid, $payload, false, $existed);
         if ($split !== null) {
             $this->growRoot($split[0], $split[1]);
         }
+    }
+
+    /**
+     * Insert the row only if $rowid is not already present, in a single tree
+     * descent. Returns true if inserted, false if the rowid already existed (the
+     * tree is left unchanged). This lets a plain INSERT enforce the rowid-unique
+     * constraint without a separate exists() probe (which is a second full
+     * descent plus a payload read).
+     */
+    public function putIfAbsent(int $rowid, string $payload): bool
+    {
+        $existed = false;
+        $split = $this->insertInto($this->rootPage, $rowid, $payload, true, $existed);
+        if ($existed) {
+            return false;
+        }
+        if ($split !== null) {
+            $this->growRoot($split[0], $split[1]);
+        }
+        return true;
     }
 
     /** Remove the row for $rowid. Returns true if a row was deleted. */
@@ -246,15 +267,24 @@ final class TableBTree
 
     /**
      * Recursive insert. Returns null, or [separatorRowid, newRightPage] if the
-     * page at $pageNo split and the caller must absorb the new sibling.
+     * page at $pageNo split and the caller must absorb the new sibling. When
+     * $onlyIfAbsent is set and $rowid is already present, sets $existed and makes
+     * no modification.
      *
      * @return array{0:int,1:int}|null
      */
-    private function insertInto(int $pageNo, int $rowid, string $payload): ?array
+    private function insertInto(int $pageNo, int $rowid, string $payload, bool $onlyIfAbsent, bool &$existed): ?array
     {
         $page = $this->pager->readPage($pageNo);
 
         if ($page->isLeaf()) {
+            // Check presence within the (already-loaded) leaf before allocating a
+            // cell, so an insert-if-absent costs no extra page reads or overflow
+            // pages when the key collides.
+            if ($onlyIfAbsent && $this->leafHas($page, $rowid)) {
+                $existed = true;
+                return null;
+            }
             $cell = $this->makeLeafCell($rowid, $payload);
             $this->insertLeafCell($page, $rowid, $cell);
             if ($page->fits($this->pager->pageSize())) {
@@ -268,8 +298,8 @@ final class TableBTree
         $childIndex = $this->childIndexFor($page, $rowid);
         $childPage = $childIndex === -1 ? $page->rightChild : $this->parseInteriorCell($page->cells[$childIndex])[0];
 
-        $split = $this->insertInto($childPage, $rowid, $payload);
-        if ($split === null) {
+        $split = $this->insertInto($childPage, $rowid, $payload, $onlyIfAbsent, $existed);
+        if ($existed || $split === null) {
             return null;
         }
 
@@ -429,6 +459,27 @@ final class TableBTree
             }
         }
         return $found;
+    }
+
+    /** Whether $rowid is present in this leaf (binary search, no payload read). */
+    private function leafHas(BTreePage $page, int $rowid): bool
+    {
+        $cells = $page->cells;
+        $lo = 0;
+        $hi = \count($cells) - 1;
+        while ($lo <= $hi) {
+            $mid = ($lo + $hi) >> 1;
+            $rid = $this->parseLeafCell($cells[$mid])[0];
+            if ($rid === $rowid) {
+                return true;
+            }
+            if ($rid < $rowid) {
+                $lo = $mid + 1;
+            } else {
+                $hi = $mid - 1;
+            }
+        }
+        return false;
     }
 
     private function insertLeafCell(BTreePage $page, int $rowid, string $cell): void

@@ -995,6 +995,16 @@ final class Executor
 
     private function rememberCoveredCount(string $key, int $count): void
     {
+        // Never cache a count computed inside an open transaction. The cache key
+        // includes totalChanges(), which advances for writes in the transaction
+        // but is NOT rewound on ROLLBACK, so a value cached mid-transaction would
+        // be re-served under the same key after the rollback — returning a stale
+        // count for the reverted data. In-transaction counts therefore always
+        // recompute (correctly seeing uncommitted state); committed counts cache
+        // normally in autocommit mode.
+        if ($this->db->inTransaction()) {
+            return;
+        }
         if (\count($this->coveredCountCache) >= self::COVERED_COUNT_CACHE_MAX) {
             $this->coveredCountCache = [];
         }
@@ -2061,18 +2071,23 @@ final class Executor
             $record[$pos] = $value;
         }
 
-        if (($stmt->orReplace) && $tree->exists($rowid)) {
-            $old = $this->decodeRow($info, $rowid, (string) $tree->get($rowid));
-            $this->deleteIndexEntries($info, $rowid, $old);
-            $tree->delete($rowid);
-        } elseif ($tree->exists($rowid)) {
+        $payload = RecordCodec::encode(\array_values($record));
+
+        if ($stmt->orReplace) {
+            if ($tree->exists($rowid)) {
+                $old = $this->decodeRow($info, $rowid, (string) $tree->get($rowid));
+                $this->deleteIndexEntries($info, $rowid, $old);
+                $tree->delete($rowid);
+            }
+            $tree->put($rowid, $payload);
+        } elseif (!$tree->putIfAbsent($rowid, $payload)) {
+            // Rowid already present: a single insert descent enforces uniqueness
+            // (no separate exists() probe).
             if ($stmt->orIgnore) {
                 return $this->db->lastInsertId();
             }
             throw SqlException::constraint("UNIQUE constraint failed: {$info->name} rowid $rowid");
         }
-
-        $tree->put($rowid, RecordCodec::encode(\array_values($record)));
 
         $logical = $record;
         if ($info->hasRowidAlias()) {
