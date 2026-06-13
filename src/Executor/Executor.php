@@ -42,6 +42,9 @@ final class Executor
      */
     private array $selectMeta = [];
     private const SELECT_META_MAX = 1024;
+    /** @var array<string,int> */
+    private array $coveredCountCache = [];
+    private const COVERED_COUNT_CACHE_MAX = 1024;
 
     public function __construct(private readonly Database $db)
     {
@@ -889,7 +892,14 @@ final class Executor
         [$info, $alias] = $single;
         $tree = new TableBTree($this->db->pager(), $info->rootPage);
         if ($select->where === null) {
-            return [[$tree->countRange()]];
+            $key = $this->coveredCountCacheKey($info->rootPage, 'table_all', []);
+            $cached = $this->coveredCountCache[$key] ?? null;
+            if ($cached !== null) {
+                return [[$cached]];
+            }
+            $count = $tree->countRange();
+            $this->rememberCoveredCount($key, $count);
+            return [[$count]];
         }
 
         $plan = $this->bestPlan($select->where, $alias, $info, $eval);
@@ -903,9 +913,16 @@ final class Executor
             $index = $plan['index'];
             $idx = new \YetiDevWorks\YetiSQL\Engine\IndexBTree($this->db->pager(), $index->rootPage, $index->collations);
             $coll = $index->collations[0] ?? 'BINARY';
-            foreach ($this->uniqueValues($plan['values'], $coll) as $probe) {
+            $probes = $this->uniqueValues($plan['values'], $coll);
+            $key = $this->coveredCountCacheKey($index->rootPage, 'index_eq', \array_map([$this, 'valueKey'], $probes));
+            $cached = $this->coveredCountCache[$key] ?? null;
+            if ($cached !== null) {
+                return [[$cached]];
+            }
+            foreach ($probes as $probe) {
                 $count += $idx->countLeadingRange($probe, true, $probe, true, $coll);
             }
+            $this->rememberCoveredCount($key, $count);
             return [[$count]];
         }
         if ($plan['kind'] === 'index_range') {
@@ -913,10 +930,27 @@ final class Executor
             $index = $plan['index'];
             $idx = new \YetiDevWorks\YetiSQL\Engine\IndexBTree($this->db->pager(), $index->rootPage, $index->collations);
             $coll = $index->collations[0] ?? 'BINARY';
-            return [[$idx->countLeadingRange($plan['low'], $plan['lowInc'], $plan['high'], $plan['highInc'], $coll)]];
+            $key = $this->coveredCountCacheKey($index->rootPage, 'index_range', [
+                $this->valueKey($plan['low']),
+                $plan['lowInc'] ? '1' : '0',
+                $this->valueKey($plan['high']),
+                $plan['highInc'] ? '1' : '0',
+            ]);
+            $cached = $this->coveredCountCache[$key] ?? null;
+            if ($cached !== null) {
+                return [[$cached]];
+            }
+            $count = $idx->countLeadingRange($plan['low'], $plan['lowInc'], $plan['high'], $plan['highInc'], $coll);
+            $this->rememberCoveredCount($key, $count);
+            return [[$count]];
         }
 
         if ($plan['kind'] === 'rowid_eq') {
+            $key = $this->coveredCountCacheKey($info->rootPage, 'rowid_eq', \array_map(static fn ($v): string => (string) (int) Value::toNumber($v), $plan['values']));
+            $cached = $this->coveredCountCache[$key] ?? null;
+            if ($cached !== null) {
+                return [[$cached]];
+            }
             $seen = [];
             foreach ($plan['values'] as $v) {
                 $rid = (int) Value::toNumber($v);
@@ -928,6 +962,7 @@ final class Executor
                     $count++;
                 }
             }
+            $this->rememberCoveredCount($key, $count);
             return [[$count]];
         }
 
@@ -935,7 +970,39 @@ final class Executor
         $high = $plan['high'] !== null ? (int) Value::toNumber($plan['high']) : null;
         $lowInc = $plan['lowInc'];
         $highInc = $plan['highInc'];
-        return [[$tree->countRange($low, $lowInc, $high, $highInc)]];
+        $key = $this->coveredCountCacheKey($info->rootPage, 'rowid_range', [
+            $low !== null ? (string) $low : 'N',
+            $lowInc ? '1' : '0',
+            $high !== null ? (string) $high : 'N',
+            $highInc ? '1' : '0',
+        ]);
+        $cached = $this->coveredCountCache[$key] ?? null;
+        if ($cached !== null) {
+            return [[$cached]];
+        }
+        $count = $tree->countRange($low, $lowInc, $high, $highInc);
+        $this->rememberCoveredCount($key, $count);
+        return [[$count]];
+    }
+
+    /** @param list<string> $parts */
+    private function coveredCountCacheKey(int $rootPage, string $kind, array $parts): string
+    {
+        return \implode("\x1e", [
+            (string) $this->db->pager()->schemaCookie(),
+            (string) $this->db->totalChanges(),
+            (string) $rootPage,
+            $kind,
+            \serialize($parts),
+        ]);
+    }
+
+    private function rememberCoveredCount(string $key, int $count): void
+    {
+        if (\count($this->coveredCountCache) >= self::COVERED_COUNT_CACHE_MAX) {
+            $this->coveredCountCache = [];
+        }
+        $this->coveredCountCache[$key] = $count;
     }
 
     /**
