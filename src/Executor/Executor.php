@@ -1605,10 +1605,10 @@ final class Executor
      *
      * @return \Generator<int,array{0:int,1:string}>
      */
-    private function scanRowids(TableInfo $info, ?string $alias, ?Expr $where, Evaluator $eval): \Generator
+    private function scanRowids(TableInfo $info, ?string $alias, ?Expr $where, Evaluator $eval, ?array $plan = null): \Generator
     {
         $tree = new TableBTree($this->db->pager(), $info->rootPage);
-        $plan = $where === null ? null : $this->bestPlan($where, $alias, $info, $eval);
+        $plan ??= $where === null ? null : $this->bestPlan($where, $alias, $info, $eval);
 
         if ($plan === null) {
             yield from $tree->scan();
@@ -2361,13 +2361,18 @@ final class Executor
 
         // Collect matching rowids first to avoid mutating during iteration.
         $targets = [];
-        foreach ($this->scanRowids($info, $info->name, $stmt->where, $eval) as [$rowid, $payload]) {
+        $plan = $stmt->where !== null ? $this->bestPlan($stmt->where, $info->name, $info, $eval) : null;
+        $whereCovered = $plan !== null && ($plan['coveredAll'] ?? false);
+        foreach ($this->scanRowids($info, $info->name, $stmt->where, $eval, $plan) as [$rowid, $payload]) {
             $values = $this->decodeRow($info, $rowid, $payload);
-            $env = new RowEnv();
-            $env->addFrame($info->name, $info, $values, $rowid);
-            if ($stmt->where === null || Value::isTrue((int) ($eval->evaluate($stmt->where, $env) ?? 0))) {
-                $targets[] = [$rowid, $values];
+            if ($stmt->where !== null && !$whereCovered) {
+                $env = new RowEnv();
+                $env->addFrame($info->name, $info, $values, $rowid);
+                if (!Value::isTrue((int) ($eval->evaluate($stmt->where, $env) ?? 0))) {
+                    continue;
+                }
             }
+            $targets[] = [$rowid, $values];
         }
 
         $count = 0;
@@ -2418,9 +2423,11 @@ final class Executor
         $eval = new Evaluator($this, $params);
 
         $targets = [];
-        foreach ($this->scanRowids($info, $info->name, $stmt->where, $eval) as [$rowid, $payload]) {
+        $plan = $stmt->where !== null ? $this->bestPlan($stmt->where, $info->name, $info, $eval) : null;
+        $whereCovered = $plan !== null && ($plan['coveredAll'] ?? false);
+        foreach ($this->scanRowids($info, $info->name, $stmt->where, $eval, $plan) as [$rowid, $payload]) {
             $values = $this->decodeRow($info, $rowid, $payload);
-            if ($stmt->where !== null) {
+            if ($stmt->where !== null && !$whereCovered) {
                 $env = new RowEnv();
                 $env->addFrame($info->name, $info, $values, $rowid);
                 if (!Value::isTrue((int) ($eval->evaluate($stmt->where, $env) ?? 0))) {
