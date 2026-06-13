@@ -15,13 +15,14 @@ use YetiDevWorks\YetiSQL\Exception\YetiSQLException;
  * fragmentation bookkeeping — simpler and less bug-prone than in-place edits,
  * and the page cache keeps it off the disk hot path.
  *
- * Header (12 bytes):
+ * Header (16 bytes):
  *   [0]      page type (TABLE_LEAF=13, TABLE_INTERIOR=5, INDEX_LEAF=10, INDEX_INTERIOR=2)
  *   [1..2]   cell count            (uint16)
  *   [3..4]   cell content start    (uint16)
  *   [5..8]   right-most child page (uint32, interior only)
- *   [9..11]  reserved
- * Followed by the cell-pointer array (uint16 each) at offset 12.
+ *   [9..12]  subtree row count     (uint32, table b-trees only)
+ *   [13..15] reserved
+ * Followed by the cell-pointer array (uint16 each) at offset 16.
  */
 final class BTreePage
 {
@@ -30,10 +31,11 @@ final class BTreePage
     public const INDEX_LEAF = 10;
     public const INDEX_INTERIOR = 2;
 
-    public const HEADER = 12;
+    public const HEADER = 16;
 
     public int $type;
     public int $rightChild = 0;
+    public int $subtreeCount = 0;
     /** @var list<string> raw cell byte-strings, in key order */
     public array $cells = [];
 
@@ -61,10 +63,11 @@ final class BTreePage
     public static function decode(string $buf): self
     {
         $type = \ord($buf[0]);
-        /** @var array{count:int,content:int,right:int} $h */
-        $h = \unpack('ncount/ncontent/Nright', \substr($buf, 1, 8));
+        /** @var array{count:int,content:int,right:int,subtree:int} $h */
+        $h = \unpack('ncount/ncontent/Nright/Nsubtree', \substr($buf, 1, 12));
         $page = new self($type);
         $page->rightChild = $h['right'];
+        $page->subtreeCount = $h['subtree'];
 
         $count = $h['count'];
         $pageSize = \strlen($buf);
@@ -134,6 +137,9 @@ final class BTreePage
     public function encode(int $pageSize): string
     {
         $count = \count($this->cells);
+        if ($this->isLeaf() && $this->isTable()) {
+            $this->subtreeCount = $count;
+        }
 
         // Place cells from the end of the page downward (cell 0 at the highest
         // offset), recording each cell's start offset for the pointer array.
@@ -161,6 +167,7 @@ final class BTreePage
             . \pack('n', $count)
             . \pack('n', $contentStart)
             . \pack('N', $this->rightChild)
+            . \pack('N', $this->subtreeCount)
             . "\x00\x00\x00";
 
         $prefix = $header . $pointers;

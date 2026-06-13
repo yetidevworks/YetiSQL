@@ -167,7 +167,7 @@ final class Pager
             . \pack('N', $this->freelistHead)
             . \pack('N', $this->freelistCount)
             . \pack('N', $this->schemaCookie)
-            . \pack('N', 4) // schema format
+            . \pack('N', 5) // schema format
             . \pack('N', $this->changeCounter)
             . \pack('N', self::MASTER_ROOT)
             . \pack('N', 1) // text encoding: UTF-8
