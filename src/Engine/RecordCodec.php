@@ -136,6 +136,46 @@ final class RecordCodec
         return $offsets;
     }
 
+    /**
+     * Decode a sparse set of column positions in one header pass.
+     *
+     * @param list<int> $positions
+     * @return array<int,null|int|float|string|Blob>
+     */
+    public static function decodeColumns(string $record, array $positions): array
+    {
+        if ($positions === []) {
+            return [];
+        }
+        $want = [];
+        $max = -1;
+        foreach ($positions as $pos) {
+            $want[$pos] = true;
+            if ($pos > $max) {
+                $max = $pos;
+            }
+        }
+
+        [$headerLen, $p] = Varint::decode($record, 0);
+        $body = $headerLen;
+        $i = 0;
+        $values = [];
+        while ($p < $headerLen && $i <= $max) {
+            [$type, $n] = Varint::decode($record, $p);
+            $p += $n;
+            $len = self::bodyLength($type);
+            if (isset($want[$i])) {
+                $values[$i] = self::decodeValue($type, $record, $body)[0];
+            }
+            $body += $len;
+            $i++;
+        }
+        foreach ($want as $pos => $_) {
+            $values[$pos] ??= null;
+        }
+        return $values;
+    }
+
     /** Decode a single value given its serial type and body offset. */
     public static function decodeAt(string $record, int $type, int $bodyOff): null|int|float|string|Blob
     {

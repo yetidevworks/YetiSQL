@@ -903,13 +903,26 @@ final class Executor
             return null;
         }
 
+        $decodePositions = [];
+        if ($groupPos !== $info->rowidAlias) {
+            $decodePositions[] = $groupPos;
+        }
+        foreach ($aggSpecs as $spec) {
+            if ($spec['pos'] !== null && $spec['pos'] !== $info->rowidAlias && !\in_array($spec['pos'], $decodePositions, true)) {
+                $decodePositions[] = $spec['pos'];
+            }
+        }
+        \sort($decodePositions);
+
         $tree = new TableBTree($this->db->pager(), $info->rootPage);
         $groups = [];
         $order = [];
         foreach ($tree->scan() as [$rowid, $payload]) {
-            $offsets = RecordCodec::columnOffsets($payload);
-            $decoded = [];
-            $groupValue = $this->readColumnFromPayload($info, $payload, $offsets, $decoded, $rowid, $groupPos);
+            $decoded = RecordCodec::decodeColumns($payload, $decodePositions);
+            if ($info->rowidAlias >= 0) {
+                $decoded[$info->rowidAlias] = $rowid;
+            }
+            $groupValue = $decoded[$groupPos] ?? null;
             $key = $this->valueKey($groupValue);
             if (!isset($groups[$key])) {
                 $groups[$key] = ['group' => $groupValue, 'aggs' => []];
@@ -936,7 +949,7 @@ final class Executor
                     continue;
                 }
 
-                $value = $this->readColumnFromPayload($info, $payload, $offsets, $decoded, $rowid, $spec['pos']);
+                $value = $spec['pos'] !== null ? ($decoded[$spec['pos']] ?? null) : null;
                 if ($name === 'count') {
                     if ($value !== null) {
                         $agg['count']++;
@@ -949,7 +962,7 @@ final class Executor
                     continue;
                 }
                 if ($name === 'sum' || $name === 'total' || $name === 'avg') {
-                    $num = Value::toNumber($value);
+                    $num = \is_int($value) || \is_float($value) ? $value : Value::toNumber($value);
                     if (\is_float($num)) {
                         $agg['sawFloat'] = true;
                     }
@@ -1009,28 +1022,6 @@ final class Executor
             }
         }
         return $info->columnPos((string) $expr->name);
-    }
-
-    /**
-     * @param array<int,array{0:int,1:int}> $offsets
-     * @param array<int,null|int|float|string|Blob> $decoded
-     */
-    private function readColumnFromPayload(TableInfo $info, string $payload, array $offsets, array &$decoded, int $rowid, ?int $pos): null|int|float|string|Blob
-    {
-        if ($pos === null) {
-            return null;
-        }
-        if (isset($decoded[$pos]) || \array_key_exists($pos, $decoded)) {
-            return $decoded[$pos];
-        }
-        if ($pos === $info->rowidAlias) {
-            return $decoded[$pos] = $rowid;
-        }
-        if (!isset($offsets[$pos])) {
-            return $decoded[$pos] = null;
-        }
-        [$type, $bodyOff] = $offsets[$pos];
-        return $decoded[$pos] = RecordCodec::decodeAt($payload, $type, $bodyOff);
     }
 
     /**
