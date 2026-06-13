@@ -33,6 +33,17 @@ final class Pager
     /** @var array<int,BTreePage> parsed b-tree pages, a hot-path read cache */
     private array $decoded = [];
     private int $decodedCap = 8192;
+    /**
+     * Page numbers whose authoritative state lives only in $decoded and has not
+     * yet been serialized into $cache. writePage() defers the encode() so that
+     * filling a single leaf with N rows costs O(N) re-encodes at flush time
+     * instead of O(N) re-encodes per insert (O(N^2) total). Any path that needs
+     * the raw page bytes (read(), flushDirty(), decoded-cache eviction) must
+     * materialize the page first.
+     *
+     * @var array<int,true>
+     */
+    private array $pendingEncode = [];
     /** @var array<int,true> dirty page numbers awaiting flush */
     private array $dirty = [];
     /** @var array<int,?string> undo images captured this txn; null = page newly allocated */
@@ -199,14 +210,39 @@ final class Pager
             return $this->decoded[$pageNo];
         }
         if (\count($this->decoded) >= $this->decodedCap) {
+            $this->materializeAll();
             $this->decoded = [];
         }
         return $this->decoded[$pageNo] = BTreePage::decode($this->read($pageNo));
     }
 
+    /**
+     * Serialize a page whose mutated state is still only held as a decoded
+     * object, refreshing its $cache entry. No-op if the page is not pending.
+     */
+    private function materialize(int $pageNo): void
+    {
+        if (isset($this->pendingEncode[$pageNo])) {
+            $this->cache[$pageNo] = $this->decoded[$pageNo]->encode($this->pageSize);
+            unset($this->pendingEncode[$pageNo]);
+        }
+    }
+
+    /** Materialize every deferred page (before a flush or a decoded-cache wipe). */
+    private function materializeAll(): void
+    {
+        foreach (\array_keys($this->pendingEncode) as $pageNo) {
+            $this->cache[$pageNo] = $this->decoded[$pageNo]->encode($this->pageSize);
+        }
+        $this->pendingEncode = [];
+    }
+
     /** Read a decoded page buffer (from cache or disk). */
     public function read(int $pageNo): string
     {
+        if (isset($this->pendingEncode[$pageNo])) {
+            $this->materialize($pageNo);
+        }
         if (isset($this->cache[$pageNo])) {
             return $this->cache[$pageNo];
         }
@@ -232,7 +268,7 @@ final class Pager
         }
         $this->cache[$pageNo] = $data;
         $this->dirty[$pageNo] = true;
-        unset($this->decoded[$pageNo]);
+        unset($this->decoded[$pageNo], $this->pendingEncode[$pageNo]);
     }
 
     /**
@@ -244,18 +280,22 @@ final class Pager
      */
     public function writePage(int $pageNo, BTreePage $page): void
     {
-        $data = $page->encode($this->pageSize);
+        // Capture the undo pre-image from the committed bytes BEFORE marking the
+        // page pending — read() here returns the still-clean $cache entry.
         if ($this->inTxn && !\array_key_exists($pageNo, $this->undo)) {
             $this->undo[$pageNo] = ($pageNo <= $this->committedPageCount())
                 ? $this->read($pageNo)
                 : null;
         }
-        $this->cache[$pageNo] = $data;
         $this->dirty[$pageNo] = true;
         if (!isset($this->decoded[$pageNo]) && \count($this->decoded) >= $this->decodedCap) {
+            $this->materializeAll();
             $this->decoded = [];
         }
         $this->decoded[$pageNo] = $page;
+        // Defer encode(): the bytes are reproduced from $page on demand (read or
+        // flush). The stale $cache entry, if any, is now superseded by $decoded.
+        $this->pendingEncode[$pageNo] = true;
     }
 
     private int $committedPageCount = -1;
@@ -324,6 +364,9 @@ final class Pager
             $this->deleteJournal();
             $this->unlock();
         } else {
+            // Refresh $cache to the committed image so the next transaction's
+            // undo capture reads committed bytes, not a later in-place mutation.
+            $this->materializeAll();
             $this->dirty = [];
         }
 
@@ -345,7 +388,7 @@ final class Pager
             } else {
                 $this->cache[$pageNo] = $original;
             }
-            unset($this->dirty[$pageNo], $this->decoded[$pageNo]);
+            unset($this->dirty[$pageNo], $this->decoded[$pageNo], $this->pendingEncode[$pageNo]);
         }
         // Header fields revert from the restored page-1 image (works for both
         // file- and memory-backed pagers; the main file was never touched).
@@ -393,6 +436,7 @@ final class Pager
 
     private function flushDirty(): void
     {
+        $this->materializeAll();
         \ksort($this->dirty);
         foreach (\array_keys($this->dirty) as $pageNo) {
             $data = $this->cache[$pageNo];

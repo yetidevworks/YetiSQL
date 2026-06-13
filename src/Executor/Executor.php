@@ -2071,18 +2071,23 @@ final class Executor
             $record[$pos] = $value;
         }
 
-        if (($stmt->orReplace) && $tree->exists($rowid)) {
-            $old = $this->decodeRow($info, $rowid, (string) $tree->get($rowid));
-            $this->deleteIndexEntries($info, $rowid, $old);
-            $tree->delete($rowid);
-        } elseif ($tree->exists($rowid)) {
+        $payload = RecordCodec::encode(\array_values($record));
+
+        if ($stmt->orReplace) {
+            if ($tree->exists($rowid)) {
+                $old = $this->decodeRow($info, $rowid, (string) $tree->get($rowid));
+                $this->deleteIndexEntries($info, $rowid, $old);
+                $tree->delete($rowid);
+            }
+            $tree->put($rowid, $payload);
+        } elseif (!$tree->putIfAbsent($rowid, $payload)) {
+            // Rowid already present: a single insert descent enforces uniqueness
+            // (no separate exists() probe).
             if ($stmt->orIgnore) {
                 return $this->db->lastInsertId();
             }
             throw SqlException::constraint("UNIQUE constraint failed: {$info->name} rowid $rowid");
         }
-
-        $tree->put($rowid, RecordCodec::encode(\array_values($record)));
 
         $logical = $record;
         if ($info->hasRowidAlias()) {
