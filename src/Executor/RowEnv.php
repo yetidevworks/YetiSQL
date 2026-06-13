@@ -54,15 +54,16 @@ final class RowEnv
 
     /**
      * Add a frame for a row located by an index scan: the row's payload is not
-     * fetched until a column is actually read. A covered COUNT/EXISTS over an
-     * index never touches the table b-tree at all.
+     * fetched until a column not already covered by the index is read.
+     *
+     * @param array<int,null|int|float|string|Blob> $values known column values from the index key
      */
-    public function addDeferredFrame(string $alias, TableInfo $info, TableBTree $tree, int $rowid): void
+    public function addDeferredFrame(string $alias, TableInfo $info, TableBTree $tree, int $rowid, array $values = []): void
     {
         $this->frames[] = [
             'alias' => \strtolower($alias),
             'info' => $info,
-            'values' => [],
+            'values' => $values,
             'rowid' => $rowid,
             'payload' => null,
             'offsets' => null,

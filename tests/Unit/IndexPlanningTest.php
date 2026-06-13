@@ -61,6 +61,7 @@ final class IndexPlanningTest extends TestCase
             'SELECT id FROM t WHERE age > 20 AND age <= 22 ORDER BY id',
             "SELECT COUNT(*) FROM t WHERE city = 'SF'",
             "SELECT COUNT(*) FROM t WHERE city IN ('SF','SF','BOS')",
+            "SELECT city FROM t WHERE city = 'SF' ORDER BY id",
             "SELECT id FROM t WHERE city = 'NYC' ORDER BY id",
             "SELECT id FROM t WHERE city IN ('SF','SF','BOS') ORDER BY id",
             "SELECT id FROM t WHERE city IN ('SF','BOS') ORDER BY id",

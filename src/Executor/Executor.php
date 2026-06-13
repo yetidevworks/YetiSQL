@@ -391,11 +391,11 @@ final class Executor
                 }
                 return;
             }
-            foreach ($this->scanByPlan($tree, $plan) as [$rowid, $payload]) {
+            foreach ($this->scanByPlan($tree, $plan) as [$rowid, $payload, $covered]) {
                 $env = new RowEnv();
                 if ($payload === null) {
                     // Index-located row: defer the table fetch until a column is read.
-                    $env->addDeferredFrame($alias, $info, $tree, $rowid);
+                    $env->addDeferredFrame($alias, $info, $tree, $rowid, $covered);
                 } else {
                     $env->addLazyFrame($alias, $info, $payload, $rowid);
                 }
@@ -1317,12 +1317,14 @@ final class Executor
      * fetch. A precomputed plan is passed in to avoid re-planning.
      *
      * @param array<string,mixed>|null $plan
-     * @return \Generator<int,array{0:int,1:?string}>
+     * @return \Generator<int,array{0:int,1:?string,2?:array<int,null|int|float|string|Blob>}>
      */
     private function scanByPlan(TableBTree $tree, ?array $plan): \Generator
     {
         if ($plan === null) {
-            yield from $tree->scan();
+            foreach ($tree->scan() as [$rid, $payload]) {
+                yield [$rid, $payload, []];
+            }
             return;
         }
 
@@ -1337,7 +1339,7 @@ final class Executor
                     $seen[$rid] = true;
                     $payload = $tree->get($rid);
                     if ($payload !== null) {
-                        yield [$rid, $payload];
+                        yield [$rid, $payload, []];
                     }
                 }
                 return;
@@ -1356,20 +1358,21 @@ final class Executor
                     if ($high !== null && ($rid > $high || (!$highInc && $rid === $high))) {
                         break;
                     }
-                    yield [$rid, $payload];
+                    yield [$rid, $payload, []];
                 }
                 return;
 
             case 'index_eq':
             case 'index_range':
-                // Yield rowids only; the row payload is fetched lazily on access.
-                foreach ($this->indexRowids($plan) as $rid) {
-                    yield [$rid, null];
+                foreach ($this->indexEntries($plan) as [$rid, $covered]) {
+                    yield [$rid, null, $covered];
                 }
                 return;
         }
 
-        yield from $tree->scan();
+        foreach ($tree->scan() as [$rid, $payload]) {
+            yield [$rid, $payload, []];
+        }
     }
 
     /** @return \Generator<int,array{0:int,1:string}> */
@@ -1391,6 +1394,17 @@ final class Executor
      * @return \Generator<int,int>
      */
     private function indexRowids(array $plan): \Generator
+    {
+        foreach ($this->indexEntries($plan) as [$rowid]) {
+            yield $rowid;
+        }
+    }
+
+    /**
+     * @param array<string,mixed> $plan
+     * @return \Generator<int,array{0:int,1:array<int,null|int|float|string|Blob>}>
+     */
+    private function indexEntries(array $plan): \Generator
     {
         /** @var \YetiDevWorks\YetiSQL\Engine\IndexInfo $index */
         $index = $plan['index'];
@@ -1429,7 +1443,11 @@ final class Executor
                     }
                     $seenRowids[$rowid] = true;
                 }
-                yield $rowid;
+                $covered = [];
+                foreach ($index->columnPositions as $i => $pos) {
+                    $covered[$pos] = $key[$i] ?? null;
+                }
+                yield [$rowid, $covered];
             }
         }
     }
