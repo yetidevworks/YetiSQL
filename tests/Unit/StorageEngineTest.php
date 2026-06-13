@@ -89,6 +89,8 @@ final class StorageEngineTest extends TestCase
             $count++;
         }
         self::assertSame(3001, $count);
+        self::assertSame(3001, $tree->countRange());
+        self::assertSame(1001, $tree->countRange(1000, true, 2000, true));
         self::assertSame(20000, \strlen(RecordCodec::decode($tree->get(99999))[1]));
         self::assertNull($tree->get(123456));
         $pager->close();

@@ -87,7 +87,8 @@ final class TableBTree
     public function put(int $rowid, string $payload): void
     {
         $existed = false;
-        $split = $this->insertInto($this->rootPage, $rowid, $payload, false, $existed);
+        $delta = 0;
+        $split = $this->insertInto($this->rootPage, $rowid, $payload, false, $existed, $delta);
         if ($split !== null) {
             $this->growRoot($split[0], $split[1]);
         }
@@ -103,7 +104,8 @@ final class TableBTree
     public function putIfAbsent(int $rowid, string $payload): bool
     {
         $existed = false;
-        $split = $this->insertInto($this->rootPage, $rowid, $payload, true, $existed);
+        $delta = 0;
+        $split = $this->insertInto($this->rootPage, $rowid, $payload, true, $existed, $delta);
         if ($existed) {
             return false;
         }
@@ -116,20 +118,7 @@ final class TableBTree
     /** Remove the row for $rowid. Returns true if a row was deleted. */
     public function delete(int $rowid): bool
     {
-        $pageNo = $this->findLeaf($rowid);
-        $page = $this->pager->readPage($pageNo);
-        foreach ($page->cells as $i => $cell) {
-            [$rid, , $plen, $n1, $n2] = $this->parseLeafCell($cell);
-            if ($rid === $rowid) {
-                if ($plen > BTreePage::maxLocal($this->pager->pageSize())) {
-                    $this->freeOverflow($cell, $n1 + $n2);
-                }
-                \array_splice($page->cells, $i, 1);
-                $this->pager->writePage($pageNo, $page);
-                return true;
-            }
-        }
-        return false;
+        return $this->deleteFrom($this->rootPage, $rowid);
     }
 
     /**
@@ -215,12 +204,46 @@ final class TableBTree
             if (!$this->rowidInLowerBound($sep, $low, $lowInc)) {
                 continue;
             }
-            $count += $this->countPage($child, $low, $lowInc, $high, $highInc);
+            $count += $this->childFullyInRange($child, $low, $lowInc, $high, $highInc)
+                ? $this->pager->readPage($child)->subtreeCount
+                : $this->countPage($child, $low, $lowInc, $high, $highInc);
             if ($high !== null && $sep >= $high) {
                 return $count;
             }
         }
-        return $count + $this->countPage($page->rightChild, $low, $lowInc, $high, $highInc);
+        return $count + ($this->childFullyInRange($page->rightChild, $low, $lowInc, $high, $highInc)
+            ? $this->pager->readPage($page->rightChild)->subtreeCount
+            : $this->countPage($page->rightChild, $low, $lowInc, $high, $highInc));
+    }
+
+    private function childFullyInRange(int $pageNo, ?int $low, bool $lowInc, ?int $high, bool $highInc): bool
+    {
+        $page = $this->pager->readPage($pageNo);
+        [$first, $last] = $this->pageRowidBounds($page);
+        return $first !== null
+            && $last !== null
+            && $this->rowidInLowerBound($first, $low, $lowInc)
+            && $this->rowidInUpperBound($last, $high, $highInc);
+    }
+
+    /** @return array{0:?int,1:?int} */
+    private function pageRowidBounds(BTreePage $page): array
+    {
+        if ($page->cells === []) {
+            return [null, null];
+        }
+        if ($page->isLeaf()) {
+            return [
+                $this->parseLeafCell($page->cells[0])[0],
+                $this->parseLeafCell($page->cells[\count($page->cells) - 1])[0],
+            ];
+        }
+
+        $firstChild = $this->parseInteriorCell($page->cells[0])[0];
+        return [
+            $this->pageRowidBounds($this->pager->readPage($firstChild))[0],
+            $this->pageRowidBounds($this->pager->readPage($page->rightChild))[1],
+        ];
     }
 
     private function rowidInLowerBound(int $rowid, ?int $low, bool $lowInc): bool
@@ -273,7 +296,7 @@ final class TableBTree
      *
      * @return array{0:int,1:int}|null
      */
-    private function insertInto(int $pageNo, int $rowid, string $payload, bool $onlyIfAbsent, bool &$existed): ?array
+    private function insertInto(int $pageNo, int $rowid, string $payload, bool $onlyIfAbsent, bool &$existed, int &$delta): ?array
     {
         $page = $this->pager->readPage($pageNo);
 
@@ -286,7 +309,9 @@ final class TableBTree
                 return null;
             }
             $cell = $this->makeLeafCell($rowid, $payload);
-            $this->insertLeafCell($page, $rowid, $cell);
+            $inserted = $this->insertLeafCell($page, $rowid, $cell);
+            $delta = $inserted ? 1 : 0;
+            $page->subtreeCount += $delta;
             if ($page->fits($this->pager->pageSize())) {
                 $this->pager->writePage($pageNo, $page);
                 return null;
@@ -298,8 +323,15 @@ final class TableBTree
         $childIndex = $this->childIndexFor($page, $rowid);
         $childPage = $childIndex === -1 ? $page->rightChild : $this->parseInteriorCell($page->cells[$childIndex])[0];
 
-        $split = $this->insertInto($childPage, $rowid, $payload, $onlyIfAbsent, $existed);
-        if ($existed || $split === null) {
+        $split = $this->insertInto($childPage, $rowid, $payload, $onlyIfAbsent, $existed, $delta);
+        if ($existed) {
+            return null;
+        }
+        if ($split === null) {
+            if ($delta !== 0) {
+                $page->subtreeCount += $delta;
+                $this->pager->writePage($pageNo, $page);
+            }
             return null;
         }
 
@@ -315,6 +347,7 @@ final class TableBTree
         }
 
         if ($page->fits($this->pager->pageSize())) {
+            $this->refreshSubtreeCount($page);
             $this->pager->writePage($pageNo, $page);
             return null;
         }
@@ -330,8 +363,10 @@ final class TableBTree
 
         $left = new BTreePage(BTreePage::TABLE_LEAF);
         $left->cells = $leftCells;
+        $this->refreshSubtreeCount($left);
         $right = new BTreePage(BTreePage::TABLE_LEAF);
         $right->cells = $rightCells;
+        $this->refreshSubtreeCount($right);
 
         $newRight = $this->pager->allocatePage();
         $this->pager->write($pageNo, $left->encode($this->pager->pageSize()));
@@ -356,10 +391,12 @@ final class TableBTree
         $left = new BTreePage(BTreePage::TABLE_INTERIOR);
         $left->cells = $leftCells;
         $left->rightChild = $midChild;
+        $this->refreshSubtreeCount($left);
 
         $right = new BTreePage(BTreePage::TABLE_INTERIOR);
         $right->cells = $rightCells;
         $right->rightChild = $page->rightChild;
+        $this->refreshSubtreeCount($right);
 
         $newRight = $this->pager->allocatePage();
         $this->pager->write($pageNo, $left->encode($this->pager->pageSize()));
@@ -378,7 +415,54 @@ final class TableBTree
         $root = new BTreePage(BTreePage::TABLE_INTERIOR);
         $root->cells = [$this->makeInteriorCell($leftNew, $sepKey)];
         $root->rightChild = $newRight;
+        $this->refreshSubtreeCount($root);
         $this->pager->write($this->rootPage, $root->encode($this->pager->pageSize()));
+    }
+
+    private function deleteFrom(int $pageNo, int $rowid): bool
+    {
+        $page = $this->pager->readPage($pageNo);
+        if ($page->isLeaf()) {
+            foreach ($page->cells as $i => $cell) {
+                [$rid, , $plen, $n1, $n2] = $this->parseLeafCell($cell);
+                if ($rid === $rowid) {
+                    if ($plen > BTreePage::maxLocal($this->pager->pageSize())) {
+                        $this->freeOverflow($cell, $n1 + $n2);
+                    }
+                    \array_splice($page->cells, $i, 1);
+                    $this->refreshSubtreeCount($page);
+                    $this->pager->writePage($pageNo, $page);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        $child = $this->childFor($page, $rowid);
+        if (!$this->deleteFrom($child, $rowid)) {
+            return false;
+        }
+        $page->subtreeCount--;
+        $this->pager->writePage($pageNo, $page);
+        return true;
+    }
+
+    private function refreshSubtreeCount(BTreePage $page): void
+    {
+        if (!$page->isTable()) {
+            return;
+        }
+        if ($page->isLeaf()) {
+            $page->subtreeCount = \count($page->cells);
+            return;
+        }
+
+        $count = 0;
+        foreach ($page->cells as $cell) {
+            $count += $this->pager->readPage($this->parseInteriorCell($cell)[0])->subtreeCount;
+        }
+        $count += $this->pager->readPage($page->rightChild)->subtreeCount;
+        $page->subtreeCount = $count;
     }
 
     /**
@@ -482,12 +566,12 @@ final class TableBTree
         return false;
     }
 
-    private function insertLeafCell(BTreePage $page, int $rowid, string $cell): void
+    private function insertLeafCell(BTreePage $page, int $rowid, string $cell): bool
     {
         $n = \count($page->cells);
         if ($n === 0) {
             $page->cells[] = $cell;
-            return;
+            return true;
         }
 
         // Cells are kept sorted by rowid. Bulk loads insert in ascending order,
@@ -496,11 +580,11 @@ final class TableBTree
         $lastRid = $this->parseLeafCell($page->cells[$n - 1])[0];
         if ($rowid > $lastRid) {
             $page->cells[] = $cell;
-            return;
+            return true;
         }
         if ($rowid === $lastRid) {
             $page->cells[$n - 1] = $cell;
-            return;
+            return false;
         }
 
         // Otherwise binary-search the insertion point (O(log n) cell parses).
@@ -511,7 +595,7 @@ final class TableBTree
             $rid = $this->parseLeafCell($page->cells[$mid])[0];
             if ($rid === $rowid) {
                 $page->cells[$mid] = $cell; // replace
-                return;
+                return false;
             }
             if ($rid < $rowid) {
                 $lo = $mid + 1;
@@ -521,6 +605,7 @@ final class TableBTree
         }
         // $lo is the first cell with rowid >= $rowid (and != since tail handled).
         \array_splice($page->cells, $lo, 0, [$cell]);
+        return true;
     }
 
     // --- cell encoding/decoding ------------------------------------------
