@@ -168,15 +168,11 @@ final class Executor
         if ($isAggregate) {
             [$rows, $keys] = $this->aggregateProject($select, $outputCols, $aggregateNodes, $this->filteredJoined($select, $eval), $eval, $orderPlan);
         } else {
-            $envs = [];
-            foreach ($this->filteredJoined($select, $eval) as $env) {
-                $envs[] = $env;
-            }
             // Expose SELECT-list aliases to ORDER BY (not to WHERE, above).
             $this->exposeSelectAliases($select, $eval);
 
             $rows = [];
-            foreach ($envs as $env) {
+            foreach ($this->filteredJoined($select, $eval) as $env) {
                 $row = $this->projectRow($outputCols, $env, $eval);
                 $rows[] = $row;
                 if ($orderPlan !== []) {
