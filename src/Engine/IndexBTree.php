@@ -73,6 +73,16 @@ final class IndexBTree
         yield from $this->scanPageFrom($this->rootPage, $lowKey);
     }
 
+    public function countLeadingRange(
+        null|int|float|string|Blob $low,
+        bool $lowInc,
+        null|int|float|string|Blob $high,
+        bool $highInc,
+        string $collation,
+    ): int {
+        return $this->countLeadingPage($this->rootPage, $low, $lowInc, $high, $highInc, $collation);
+    }
+
     // --- internals --------------------------------------------------------
 
     /** @return Generator<int,array<int,null|int|float|string|Blob>> */
@@ -100,6 +110,100 @@ final class IndexBTree
             $lowKey = null; // everything after the first qualifying subtree is in range
         }
         yield from $this->scanPageFrom($page->rightChild, $lowKey);
+    }
+
+    private function countLeadingPage(
+        int $pageNo,
+        null|int|float|string|Blob $low,
+        bool $lowInc,
+        null|int|float|string|Blob $high,
+        bool $highInc,
+        string $collation,
+    ): int {
+        $page = $this->pager->readPage($pageNo);
+        $count = 0;
+
+        if ($page->isLeaf()) {
+            $cells = $page->cells;
+            $n = \count($cells);
+            if ($n === 0) {
+                return 0;
+            }
+
+            $first = $this->cellLeading($cells[0], 0);
+            $last = $this->cellLeading($cells[$n - 1], 0);
+            if ($this->leadingInLowerBound($first, $low, $lowInc, $collation)
+                && $this->leadingInUpperBound($last, $high, $highInc, $collation)) {
+                return $n;
+            }
+            if (!$this->leadingInUpperBound($first, $high, $highInc, $collation)
+                || !$this->leadingInLowerBound($last, $low, $lowInc, $collation)) {
+                return 0;
+            }
+
+            foreach ($page->cells as $cell) {
+                $leading = $this->cellLeading($cell, 0);
+                if ($low !== null) {
+                    $cmp = Value::compare($leading, $low, $collation);
+                    if ($cmp < 0 || ($cmp === 0 && !$lowInc)) {
+                        continue;
+                    }
+                }
+                if ($high !== null) {
+                    $cmp = Value::compare($leading, $high, $collation);
+                    if ($cmp > 0 || ($cmp === 0 && !$highInc)) {
+                        break;
+                    }
+                }
+                $count++;
+            }
+            return $count;
+        }
+
+        foreach ($page->cells as $cell) {
+            [$child, $sep] = $this->parseInteriorCellLeading($cell);
+            if ($low !== null) {
+                $cmp = Value::compare($sep, $low, $collation);
+                if ($cmp < 0 || ($cmp === 0 && !$lowInc)) {
+                    continue;
+                }
+            }
+            $count += $this->countLeadingPage($child, $low, $lowInc, $high, $highInc, $collation);
+            if ($high !== null) {
+                $cmp = Value::compare($sep, $high, $collation);
+                if ($cmp > 0 || ($cmp === 0 && !$highInc)) {
+                    return $count;
+                }
+            }
+        }
+
+        return $count + $this->countLeadingPage($page->rightChild, $low, $lowInc, $high, $highInc, $collation);
+    }
+
+    private function leadingInLowerBound(
+        null|int|float|string|Blob $value,
+        null|int|float|string|Blob $low,
+        bool $lowInc,
+        string $collation,
+    ): bool {
+        if ($low === null) {
+            return true;
+        }
+        $cmp = Value::compare($value, $low, $collation);
+        return $cmp > 0 || ($cmp === 0 && $lowInc);
+    }
+
+    private function leadingInUpperBound(
+        null|int|float|string|Blob $value,
+        null|int|float|string|Blob $high,
+        bool $highInc,
+        string $collation,
+    ): bool {
+        if ($high === null) {
+            return true;
+        }
+        $cmp = Value::compare($value, $high, $collation);
+        return $cmp < 0 || ($cmp === 0 && $highInc);
     }
 
     private function findLeaf(array $key): int
@@ -362,6 +466,19 @@ final class IndexBTree
         /** @var array{1:int} $c */
         $c = \unpack('N', \substr($cell, 0, 4));
         return [$c[1], RecordCodec::decode($this->readPayload($cell, 4))];
+    }
+
+    /** @return array{0:int,1:null|int|float|string|Blob} */
+    private function parseInteriorCellLeading(string $cell): array
+    {
+        /** @var array{1:int} $c */
+        $c = \unpack('N', \substr($cell, 0, 4));
+        return [$c[1], $this->cellLeading($cell, 4)];
+    }
+
+    private function cellLeading(string $cell, int $offset): null|int|float|string|Blob
+    {
+        return RecordCodec::decodeColumn($this->readPayload($cell, $offset), 0);
     }
 
     private function readPayload(string $cell, int $offset): string

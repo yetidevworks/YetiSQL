@@ -124,12 +124,12 @@ planning buys. Representative run (in-memory, 5000 rows, PHP 8.3):
 ```
 workload                           SQLite  YetiSQL+idx  YetiSQL scan  vs SQLite
 ------------------------------------------------------------------------------
-bulk insert                        2.9 ms      1.05 s       1.07 s        360x
-PK lookups (×2000)                 1.3 ms     94.4 ms      96.9 ms         73x
-city COUNT (×200, ~20% rows)       2.9 ms      7.08 s       9.39 s       2408x
-range query (×200)                 1.8 ms      4.57 s       7.08 s       2482x
-group-by aggregate (×50)          32.2 ms      2.20 s       2.22 s         68x
-PK updates (×1000)                 0.6 ms    153.0 ms     148.1 ms        278x
+bulk insert                        3.0 ms    190.9 ms     189.2 ms         65x
+PK lookups (×2000)                 1.2 ms     46.0 ms      47.1 ms         37x
+city COUNT (×200, ~20% rows)       2.9 ms    163.2 ms       5.38 s         57x
+range query (×200)                 1.8 ms    239.0 ms       5.41 s        131x
+group-by aggregate (×50)          32.0 ms      1.78 s       1.78 s         56x
+PK updates (×1000)                 0.5 ms     51.1 ms      49.1 ms         99x
 ```
 
 ```bash
@@ -139,17 +139,20 @@ php benchmarks/bench.php [rows]    # default 5000
 Takeaways:
 - **Index planning works.** Point lookups by primary key and by indexed column
   use rowid/index seeks; the `YetiSQL+idx` column beats `YetiSQL scan` on
-  selective and range queries, and `UPDATE` only re-indexes columns that change.
-- **Expect ~70-360x** for point operations, inserts, and aggregates — the cost
-  of a tree-walking interpreter and per-row work in pure PHP.
-- **Large result sets are the weak spot** (the 2400x cases): a query touching
-  ~20% of rows still materialises and re-checks each one. Covering-index counts
-  (answering `COUNT(*)` from the index without fetching rows) and the planned
-  VDBE compiler are the next levers.
+  selective and range queries. Covered `COUNT(*)` over rowid/leading-column
+  index predicates counts index entries directly without fetching table rows,
+  and `UPDATE` only re-indexes columns that change.
+- **Expect tens to low hundreds x** for point operations, inserts, indexed
+  counts, and aggregates — the cost of a tree-walking interpreter and per-row
+  work in pure PHP.
+- **Large result sets are still the weak spot:** queries that must materialise
+  many rows still pay PHP object/evaluator overhead. More covering-index
+  projections and the planned VDBE compiler are the next levers.
 
 Hot-path optimisations already in place: an LRU page cache, a parsed-page cache
 (so repeated reads skip re-decoding), single-pass page encoding, binary-search
-rowid lookups, lazy/early-stop index scans, and a compiled-statement path.
+rowid lookups, lazy/early-stop index scans, covered index counts, and a
+compiled-statement path.
 
 ## Architecture
 
@@ -172,7 +175,7 @@ Working: secondary-index and rowid query planning (equality, range, `IN`, `BETWE
 with automatic index maintenance on writes.
 
 Not yet implemented (planned): multi-column index planning beyond the leading column,
-covering-index counts, index-driven joins (the inner table of a join still scans),
+covering-index projections, index-driven joins (the inner table of a join still scans),
 correlated subqueries, `WITH` (CTEs), window functions, triggers, views, `ALTER TABLE`,
 JSON1, FTS5, true WAL, and the Eloquent adapter. The execution model is a tree-walking
 interpreter; a VDBE-style bytecode compiler is the planned performance upgrade. Byte-level

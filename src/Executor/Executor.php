@@ -155,6 +155,10 @@ final class Executor
         // COUNT(*) case never even reads a column.
         $keys = [];
         if ($isAggregate && $select->groupBy === []) {
+            $coveredCount = $this->tryCoveredCount($select, $outputCols, $aggregateNodes, $eval);
+            if ($coveredCount !== null) {
+                return [$colNames, $coveredCount, []];
+            }
             return [$colNames, ...$this->aggregateUngrouped($select, $outputCols, $aggregateNodes, $eval, $orderPlan)];
         }
 
@@ -840,6 +844,94 @@ final class Executor
         $row = $this->projectRow($outputCols, $rep, $eval);
         $keys = $orderPlan !== [] ? [$this->computeOrderKeys($orderPlan, $rep, $eval, $row)] : [];
         return [[$row], $keys];
+    }
+
+    /**
+     * Fast path for COUNT(*) where a single-table rowid/index access plan fully
+     * covers the WHERE clause. This avoids building RowEnv objects and aggregate
+     * accumulators for every matching row.
+     *
+     * @param list<array{name:string,expr:?Expr,star:bool,tableStar:?string}> $outputCols
+     * @param array<int,Expr> $aggregateNodes
+     * @return list<list<int>>|null
+     */
+    private function tryCoveredCount(SelectStatement $select, array $outputCols, array $aggregateNodes, Evaluator $eval): ?array
+    {
+        if ($select->where === null || $select->having !== null || \count($outputCols) !== 1 || \count($aggregateNodes) !== 1) {
+            return null;
+        }
+
+        $expr = $outputCols[0]['expr'];
+        if ($expr === null || $expr->kind !== Expr::FUNC || \strtolower((string) $expr->name) !== 'count' || !$expr->star || $expr->distinct) {
+            return null;
+        }
+
+        $node = \reset($aggregateNodes);
+        if (!$node instanceof Expr || $node !== $expr) {
+            return null;
+        }
+
+        $single = $this->singleTableForCompile($select);
+        if ($single === null || \count($this->splitAnd($select->where)) !== 1) {
+            return null;
+        }
+
+        [$info, $alias] = $single;
+        $plan = $this->bestPlan($select->where, $alias, $info, $eval);
+        if ($plan === null || !\in_array($plan['kind'], ['index_eq', 'index_range', 'rowid_eq', 'rowid_range'], true)) {
+            return null;
+        }
+
+        $count = 0;
+        if ($plan['kind'] === 'index_eq') {
+            /** @var \YetiDevWorks\YetiSQL\Engine\IndexInfo $index */
+            $index = $plan['index'];
+            $idx = new \YetiDevWorks\YetiSQL\Engine\IndexBTree($this->db->pager(), $index->rootPage, $index->collations);
+            $coll = $index->collations[0] ?? 'BINARY';
+            $seen = [];
+            foreach ($plan['values'] as $probe) {
+                $key = $this->valueKey($probe);
+                if (isset($seen[$key])) {
+                    continue;
+                }
+                $seen[$key] = true;
+                $count += $idx->countLeadingRange($probe, true, $probe, true, $coll);
+            }
+            return [[$count]];
+        }
+        if ($plan['kind'] === 'index_range') {
+            /** @var \YetiDevWorks\YetiSQL\Engine\IndexInfo $index */
+            $index = $plan['index'];
+            $idx = new \YetiDevWorks\YetiSQL\Engine\IndexBTree($this->db->pager(), $index->rootPage, $index->collations);
+            $coll = $index->collations[0] ?? 'BINARY';
+            return [[$idx->countLeadingRange($plan['low'], $plan['lowInc'], $plan['high'], $plan['highInc'], $coll)]];
+        }
+
+        $tree = new TableBTree($this->db->pager(), $info->rootPage);
+        if ($plan['kind'] === 'rowid_eq') {
+            foreach ($plan['values'] as $v) {
+                $rid = (int) Value::toNumber($v);
+                if ($tree->get($rid) !== null) {
+                    $count++;
+                }
+            }
+            return [[$count]];
+        }
+
+        $low = $plan['low'] !== null ? (int) Value::toNumber($plan['low']) : null;
+        $high = $plan['high'] !== null ? (int) Value::toNumber($plan['high']) : null;
+        $lowInc = $plan['lowInc'];
+        $highInc = $plan['highInc'];
+        foreach ($tree->scan($low) as [$rid]) {
+            if ($low !== null && !$lowInc && $rid <= $low) {
+                continue;
+            }
+            if ($high !== null && ($rid > $high || (!$highInc && $rid === $high))) {
+                break;
+            }
+            $count++;
+        }
+        return [[$count]];
     }
 
     private function aggregateProject(SelectStatement $select, array $outputCols, array $aggregateNodes, array $envs, Evaluator $eval, array $orderPlan): array
