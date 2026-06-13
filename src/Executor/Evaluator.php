@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace YetiDevWorks\YetiSQL\Executor;
 
 use YetiDevWorks\YetiSQL\Engine\Blob;
+use YetiDevWorks\YetiSQL\Engine\TableInfo;
 use YetiDevWorks\YetiSQL\Exception\SqlException;
 use YetiDevWorks\YetiSQL\Functions\Aggregates;
 use YetiDevWorks\YetiSQL\Functions\ScalarFunctions;
@@ -41,6 +42,22 @@ final class Evaluator
     public bool $whereCovered = false;
 
     /**
+     * Compiled single-table fast paths for the current query, set by the
+     * executor when the query is over one table. Null entries mean "not
+     * compilable — use evaluate()". The closures take the evaluator as an
+     * argument, so they are parameter-independent and cached across executions.
+     *
+     * @var \Closure(RowEnv,Evaluator):(null|int|float|string|Blob)|null
+     */
+    public ?\Closure $compiledWhere = null;
+    /** @var list<\Closure(RowEnv,Evaluator):(null|int|float|string|Blob)|null>|null aligned to output columns */
+    public ?array $compiledProject = null;
+    /** @var list<\Closure(RowEnv,Evaluator):(null|int|float|string|Blob)>|null aligned to GROUP BY terms */
+    public ?array $compiledGroupBy = null;
+    /** @var array<int,list<\Closure(RowEnv,Evaluator):(null|int|float|string|Blob)>|null>|null aggregate-arg closures by node id */
+    public ?array $compiledAggArgs = null;
+
+    /**
      * Per-query memoization keyed by spl_object_id of the expression node. A
      * query's frame layout, and a column's declared affinity/collation, are
      * constant across every row scanned, so these are resolved once and reused.
@@ -72,6 +89,433 @@ final class Evaluator
     public function params(): array
     {
         return $this->params;
+    }
+
+    // === expression compiler (single-table "VDBE") =======================
+    //
+    // Lowers an expression tree to a single composed PHP closure so that the
+    // per-row hot loop runs as native PHP, with no per-node switch dispatch,
+    // re-resolution of columns, or re-derivation of affinity/collation. The
+    // closure takes the current single-frame RowEnv and returns the value.
+    //
+    // compile() returns null for any node it does not handle; callers then fall
+    // back to evaluate(), so the tree-walker remains the source of truth and the
+    // differential oracle guarantees the compiled path matches it.
+
+    /**
+     * Compile an expression against a single table (frame 0) into a closure
+     * `fn(RowEnv $env, Evaluator $ev): value`, or null for any node not handled.
+     *
+     * The closure takes the evaluator as a call argument (rather than capturing
+     * it) so the compiled program is independent of bound parameters and can be
+     * cached once per statement and reused across executions.
+     *
+     * @return \Closure(RowEnv,Evaluator):(null|int|float|string|Blob)|null
+     */
+    public function compile(Expr $e, TableInfo $info, string $alias): ?\Closure
+    {
+        switch ($e->kind) {
+            case Expr::LIT:
+                $v = $e->value;
+                return static fn (RowEnv $env, Evaluator $ev): null|int|float|string|Blob => $v;
+
+            case Expr::COL:
+                $pos = $this->compileColPos($e, $info, $alias);
+                if ($pos === null) {
+                    return null;
+                }
+                if ($pos === -1) {
+                    return static fn (RowEnv $env, Evaluator $ev): null|int|float|string|Blob => $env->frames[0]['rowid'];
+                }
+                return static fn (RowEnv $env, Evaluator $ev): null|int|float|string|Blob => $env->valueAt(0, $pos);
+
+            case Expr::PARAM:
+                $marker = (string) $e->name;
+                return static fn (RowEnv $env, Evaluator $ev): null|int|float|string|Blob => $ev->resolveParam($marker);
+
+            case Expr::UNARY:
+                return $this->compileUnary($e, $info, $alias);
+
+            case Expr::BIN:
+                return $this->compileBinary($e, $info, $alias);
+
+            case Expr::ISNULL:
+                $oc = $this->compile($e->operand, $info, $alias);
+                if ($oc === null) {
+                    return null;
+                }
+                $wantNull = !$e->not;
+                return static fn (RowEnv $env, Evaluator $ev): int => (($oc($env, $ev) === null) === $wantNull) ? 1 : 0;
+
+            case Expr::CAST:
+                $oc = $this->compile($e->operand, $info, $alias);
+                if ($oc === null) {
+                    return null;
+                }
+                $type = (string) $e->typeName;
+                return static fn (RowEnv $env, Evaluator $ev): null|int|float|string|Blob => $ev->cast($oc($env, $ev), $type);
+
+            case Expr::COLLATE:
+                // Collation only affects comparison, handled where it is consumed.
+                return $this->compile($e->operand, $info, $alias);
+
+            case Expr::FUNC:
+                return $this->compileFunc($e, $info, $alias);
+
+            case Expr::BETWEEN:
+                return $this->compileBetween($e, $info, $alias);
+
+            case Expr::CASE_:
+                return $this->compileCase($e, $info, $alias);
+
+            default:
+                return null; // IN/LIKE/SUBQUERY/EXISTS etc. -> fall back
+        }
+    }
+
+    /** Resolve a column reference to a slot position, -1 for rowid, or null. */
+    private function compileColPos(Expr $e, TableInfo $info, string $alias): ?int
+    {
+        if ($e->table !== null
+            && \strcasecmp($e->table, $alias) !== 0
+            && \strcasecmp($e->table, $info->name) !== 0) {
+            return null;
+        }
+        $pos = $info->columnPos((string) $e->name);
+        if ($pos !== null) {
+            return $pos;
+        }
+        $lname = \strtolower((string) $e->name);
+        if ($lname === 'rowid' || $lname === '_rowid_' || $lname === 'oid') {
+            return -1;
+        }
+        return null;
+    }
+
+    private function compileUnary(Expr $e, TableInfo $info, string $alias): ?\Closure
+    {
+        $oc = $this->compile($e->operand, $info, $alias);
+        if ($oc === null) {
+            return null;
+        }
+        return match ($e->op) {
+            'NOT' => static function (RowEnv $env, Evaluator $ev) use ($oc): null|int {
+                $v = $oc($env, $ev);
+                return $v === null ? null : (Value::isTrue($v) ? 0 : 1);
+            },
+            '-' => static function (RowEnv $env, Evaluator $ev) use ($oc): null|int|float {
+                $v = $oc($env, $ev);
+                if ($v === null) {
+                    return null;
+                }
+                $n = Value::toNumber($v);
+                return $n === 0 ? 0 : -$n;
+            },
+            '+' => static function (RowEnv $env, Evaluator $ev) use ($oc): null|int|float {
+                $v = $oc($env, $ev);
+                return $v === null ? null : Value::toNumber($v);
+            },
+            '~' => static function (RowEnv $env, Evaluator $ev) use ($oc): null|int {
+                $v = $oc($env, $ev);
+                return $v === null ? null : ~((int) Value::toNumber($v));
+            },
+            default => null,
+        };
+    }
+
+    private function compileBinary(Expr $e, TableInfo $info, string $alias): ?\Closure
+    {
+        $op = (string) $e->op;
+        $lc = $this->compile($e->left, $info, $alias);
+        $rc = $this->compile($e->right, $info, $alias);
+        if ($lc === null || $rc === null) {
+            return null;
+        }
+
+        if ($op === 'AND') {
+            return static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): null|int {
+                $l = $lc($env, $ev);
+                if ($l !== null && !Value::isTrue($l)) {
+                    return 0;
+                }
+                $r = $rc($env, $ev);
+                if ($r !== null && !Value::isTrue($r)) {
+                    return 0;
+                }
+                return ($l === null || $r === null) ? null : 1;
+            };
+        }
+        if ($op === 'OR') {
+            return static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): null|int {
+                $l = $lc($env, $ev);
+                if ($l !== null && Value::isTrue($l)) {
+                    return 1;
+                }
+                $r = $rc($env, $ev);
+                if ($r !== null && Value::isTrue($r)) {
+                    return 1;
+                }
+                return ($l === null || $r === null) ? null : 0;
+            };
+        }
+        if ($op === 'IS' || $op === 'IS NOT') {
+            $isOp = $op === 'IS';
+            return static function (RowEnv $env, Evaluator $ev) use ($lc, $rc, $isOp): int {
+                $l = $lc($env, $ev);
+                $r = $rc($env, $ev);
+                $eq = ($l === null && $r === null) || ($l !== null && $r !== null && Value::compare($l, $r) === 0);
+                return ($eq === $isOp) ? 1 : 0;
+            };
+        }
+
+        if (\in_array($op, ['=', '<>', '<', '<=', '>', '>='], true)) {
+            return $this->compileComparison($e, $op, $lc, $rc, $info, $alias);
+        }
+
+        if ($op === '||') {
+            return static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): ?string {
+                $l = $lc($env, $ev);
+                $r = $rc($env, $ev);
+                return ($l === null || $r === null) ? null : (string) Value::toText($l) . (string) Value::toText($r);
+            };
+        }
+
+        // Arithmetic / bitwise: NULL-propagating.
+        return match ($op) {
+            '+' => static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): null|int|float {
+                $l = $lc($env, $ev);
+                $r = $rc($env, $ev);
+                return ($l === null || $r === null) ? null : Value::toNumber($l) + Value::toNumber($r);
+            },
+            '-' => static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): null|int|float {
+                $l = $lc($env, $ev);
+                $r = $rc($env, $ev);
+                return ($l === null || $r === null) ? null : Value::toNumber($l) - Value::toNumber($r);
+            },
+            '*' => static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): null|int|float {
+                $l = $lc($env, $ev);
+                $r = $rc($env, $ev);
+                return ($l === null || $r === null) ? null : Value::toNumber($l) * Value::toNumber($r);
+            },
+            '/' => static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): null|int|float {
+                $l = $lc($env, $ev);
+                $r = $rc($env, $ev);
+                return ($l === null || $r === null) ? null : $ev->divide($l, $r);
+            },
+            '%' => static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): null|int|float {
+                $l = $lc($env, $ev);
+                $r = $rc($env, $ev);
+                return ($l === null || $r === null) ? null : $ev->modulo($l, $r);
+            },
+            '&' => static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): ?int {
+                $l = $lc($env, $ev);
+                $r = $rc($env, $ev);
+                return ($l === null || $r === null) ? null : (int) Value::toNumber($l) & (int) Value::toNumber($r);
+            },
+            '|' => static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): ?int {
+                $l = $lc($env, $ev);
+                $r = $rc($env, $ev);
+                return ($l === null || $r === null) ? null : (int) Value::toNumber($l) | (int) Value::toNumber($r);
+            },
+            '<<' => static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): ?int {
+                $l = $lc($env, $ev);
+                $r = $rc($env, $ev);
+                return ($l === null || $r === null) ? null : (int) Value::toNumber($l) << (int) Value::toNumber($r);
+            },
+            '>>' => static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): ?int {
+                $l = $lc($env, $ev);
+                $r = $rc($env, $ev);
+                return ($l === null || $r === null) ? null : (int) Value::toNumber($l) >> (int) Value::toNumber($r);
+            },
+            default => null,
+        };
+    }
+
+    /**
+     * Compile a comparison, pre-resolving affinity and collation at compile time
+     * (constant for the whole scan) so the per-row closure does only the coercion
+     * and the comparison.
+     *
+     * @param \Closure(RowEnv,Evaluator):(null|int|float|string|Blob) $lc
+     * @param \Closure(RowEnv,Evaluator):(null|int|float|string|Blob) $rc
+     */
+    private function compileComparison(Expr $e, string $op, \Closure $lc, \Closure $rc, TableInfo $info, string $alias): \Closure
+    {
+        $la = $this->compileAffinity($e->left, $info, $alias);
+        $ra = $this->compileAffinity($e->right, $info, $alias);
+        $numeric = static fn (?Affinity $a): bool =>
+            $a === Affinity::INTEGER || $a === Affinity::REAL || $a === Affinity::NUMERIC;
+
+        $coerceR = false;
+        $coerceL = false;
+        $coerceRText = false;
+        $coerceLText = false;
+        if ($numeric($la) && !$numeric($ra)) {
+            $coerceR = true;
+        } elseif ($numeric($ra) && !$numeric($la)) {
+            $coerceL = true;
+        } elseif ($la === Affinity::TEXT && $ra === null) {
+            $coerceRText = true;
+        } elseif ($ra === Affinity::TEXT && $la === null) {
+            $coerceLText = true;
+        }
+
+        $coll = $this->compileCollation($e, $info, $alias);
+
+        return static function (RowEnv $env, Evaluator $ev) use ($lc, $rc, $op, $coll, $coerceL, $coerceR, $coerceLText, $coerceRText): ?int {
+            $l = $lc($env, $ev);
+            $r = $rc($env, $ev);
+            if ($l === null || $r === null) {
+                return null;
+            }
+            if ($coerceR) {
+                $r = Affinity::NUMERIC->apply($r);
+            } elseif ($coerceL) {
+                $l = Affinity::NUMERIC->apply($l);
+            } elseif ($coerceRText) {
+                $r = Affinity::TEXT->apply($r);
+            } elseif ($coerceLText) {
+                $l = Affinity::TEXT->apply($l);
+            }
+            $cmp = Value::compare($l, $r, $coll);
+            return match ($op) {
+                '=' => $cmp === 0 ? 1 : 0,
+                '<>' => $cmp !== 0 ? 1 : 0,
+                '<' => $cmp < 0 ? 1 : 0,
+                '<=' => $cmp <= 0 ? 1 : 0,
+                '>' => $cmp > 0 ? 1 : 0,
+                '>=' => $cmp >= 0 ? 1 : 0,
+                default => 0,
+            };
+        };
+    }
+
+    private function compileAffinity(?Expr $e, TableInfo $info, string $alias): ?Affinity
+    {
+        if ($e === null) {
+            return null;
+        }
+        return match ($e->kind) {
+            Expr::COL => (function () use ($e, $info, $alias): ?Affinity {
+                $pos = $this->compileColPos($e, $info, $alias);
+                return ($pos === null || $pos < 0) ? null : $info->columns[$pos]->affinity;
+            })(),
+            Expr::CAST => Affinity::fromDeclaredType($e->typeName),
+            Expr::COLLATE => $this->compileAffinity($e->operand, $info, $alias),
+            default => null,
+        };
+    }
+
+    private function compileCollation(Expr $e, TableInfo $info, string $alias): string
+    {
+        $c = $this->explicitCollation($e->left) ?? $this->explicitCollation($e->right);
+        if ($c !== null) {
+            return $c;
+        }
+        foreach ([$e->left, $e->right] as $side) {
+            if ($side !== null && $side->kind === Expr::COL) {
+                $pos = $this->compileColPos($side, $info, $alias);
+                if ($pos !== null && $pos >= 0) {
+                    return $info->columns[$pos]->collation ?? Collation::BINARY;
+                }
+            }
+        }
+        return Collation::BINARY;
+    }
+
+    private function compileBetween(Expr $e, TableInfo $info, string $alias): ?\Closure
+    {
+        $oc = $this->compile($e->operand, $info, $alias);
+        $lo = $this->compile($e->low, $info, $alias);
+        $hi = $this->compile($e->high, $info, $alias);
+        if ($oc === null || $lo === null || $hi === null) {
+            return null;
+        }
+        $not = $e->not;
+        return static function (RowEnv $env, Evaluator $ev) use ($oc, $lo, $hi, $not): null|int {
+            $v = $oc($env, $ev);
+            $l = $lo($env, $ev);
+            $h = $hi($env, $ev);
+            if ($v === null || $l === null || $h === null) {
+                return null;
+            }
+            $in = Value::compare($v, $l) >= 0 && Value::compare($v, $h) <= 0;
+            return ($in !== $not) ? 1 : 0;
+        };
+    }
+
+    private function compileCase(Expr $e, TableInfo $info, string $alias): ?\Closure
+    {
+        $subjectC = $e->subject !== null ? $this->compile($e->subject, $info, $alias) : null;
+        if ($e->subject !== null && $subjectC === null) {
+            return null;
+        }
+        $branches = [];
+        foreach ($e->whens as [$when, $then]) {
+            $wc = $this->compile($when, $info, $alias);
+            $tc = $this->compile($then, $info, $alias);
+            if ($wc === null || $tc === null) {
+                return null;
+            }
+            $branches[] = [$wc, $tc];
+        }
+        $elseC = $e->elseExpr !== null ? $this->compile($e->elseExpr, $info, $alias) : null;
+        if ($e->elseExpr !== null && $elseC === null) {
+            return null;
+        }
+
+        if ($subjectC !== null) {
+            return static function (RowEnv $env, Evaluator $ev) use ($subjectC, $branches, $elseC): null|int|float|string|Blob {
+                $subject = $subjectC($env, $ev);
+                foreach ($branches as [$wc, $tc]) {
+                    $w = $wc($env, $ev);
+                    if ($subject !== null && $w !== null && Value::compare($subject, $w) === 0) {
+                        return $tc($env, $ev);
+                    }
+                }
+                return $elseC !== null ? $elseC($env, $ev) : null;
+            };
+        }
+        return static function (RowEnv $env, Evaluator $ev) use ($branches, $elseC): null|int|float|string|Blob {
+            foreach ($branches as [$wc, $tc]) {
+                $cond = $wc($env, $ev);
+                if ($cond !== null && Value::isTrue($cond)) {
+                    return $tc($env, $ev);
+                }
+            }
+            return $elseC !== null ? $elseC($env, $ev) : null;
+        };
+    }
+
+    private function compileFunc(Expr $e, TableInfo $info, string $alias): ?\Closure
+    {
+        $name = \strtolower((string) $e->name);
+
+        if (Aggregates::isAggregate($name)) {
+            $id = \spl_object_id($e);
+            return static fn (RowEnv $env, Evaluator $ev): null|int|float|string|Blob => $ev->aggregateValues[$id] ?? null;
+        }
+
+        // Only the plain scalar functions are compiled; date/like/glob and the
+        // executor-bound helpers fall back to evaluate().
+        if (!ScalarFunctions::exists($name)) {
+            return null;
+        }
+        $argCs = [];
+        foreach ($e->args as $a) {
+            $c = $this->compile($a, $info, $alias);
+            if ($c === null) {
+                return null;
+            }
+            $argCs[] = $c;
+        }
+        return static function (RowEnv $env, Evaluator $ev) use ($name, $argCs): null|int|float|string|Blob {
+            $args = [];
+            foreach ($argCs as $c) {
+                $args[] = $c($env, $ev);
+            }
+            return ScalarFunctions::call($name, $args);
+        };
     }
 
     public function evaluate(Expr $e, ?RowEnv $env = null): null|int|float|string|Blob

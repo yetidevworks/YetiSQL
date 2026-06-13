@@ -140,8 +140,15 @@ final class Executor
             return $this->runValues($select, $eval);
         }
 
-        ['cols' => $outputCols, 'names' => $colNames, 'order' => $orderPlan, 'aggs' => $aggregateNodes, 'isAgg' => $isAggregate]
-            = $this->compileSelect($select);
+        $meta = $this->compileSelect($select, $eval);
+        ['cols' => $outputCols, 'names' => $colNames, 'order' => $orderPlan, 'aggs' => $aggregateNodes, 'isAgg' => $isAggregate] = $meta;
+
+        // Single-table WHERE/projection compiled to closures (once per statement,
+        // cached in the metadata). Null entries fall back to evaluate().
+        $eval->compiledWhere = $meta['cWhere'];
+        $eval->compiledProject = $meta['cProject'];
+        $eval->compiledGroupBy = $meta['cGroupBy'];
+        $eval->compiledAggArgs = $meta['cAggArgs'];
 
         // Ungrouped aggregate (COUNT/SUM/AVG over a filter): stream rows straight
         // through the accumulators without materializing the row set. The covered
@@ -154,10 +161,11 @@ final class Executor
         // Source rows (post-join, post-WHERE). The scan path may report that the
         // access plan already enforces the whole WHERE (eval->whereCovered), in
         // which case the per-row re-check is skipped entirely.
+        $cWhere = $eval->compiledWhere;
         $envs = [];
         foreach ($this->iterateJoined($select, $eval) as $env) {
             if ($select->where !== null && !$eval->whereCovered) {
-                $v = $eval->evaluate($select->where, $env);
+                $v = $cWhere !== null ? $cWhere($env, $eval) : $eval->evaluate($select->where, $env);
                 if ($v === null || !Value::isTrue($v)) {
                     continue;
                 }
@@ -197,9 +205,9 @@ final class Executor
      * output columns, their names, the ORDER BY plan, aggregate nodes, and
      * whether the query aggregates. Invalidated when the schema cookie changes.
      *
-     * @return array{cols:list<array<string,mixed>>,names:list<string>,order:list<array<string,mixed>>,aggs:array<int,Expr>,isAgg:bool}
+     * @return array{cookie:int,cols:list<array<string,mixed>>,names:list<string>,order:list<array<string,mixed>>,aggs:array<int,Expr>,isAgg:bool,cWhere:?\Closure,cProject:?list<?\Closure>}
      */
-    private function compileSelect(SelectStatement $select): array
+    private function compileSelect(SelectStatement $select, Evaluator $eval): array
     {
         $id = \spl_object_id($select);
         $cookie = $this->db->pager()->schemaCookie();
@@ -222,6 +230,59 @@ final class Executor
             $this->collectAggregates($select->having, $aggregateNodes);
         }
 
+        // Compile WHERE + projection + GROUP BY keys + aggregate args to closures
+        // once, for single-table queries.
+        $cWhere = null;
+        $cProject = null;
+        $cGroupBy = null;
+        $cAggArgs = null;
+        $single = $this->singleTableForCompile($select);
+        if ($single !== null) {
+            [$info, $alias] = $single;
+            if ($select->where !== null) {
+                $cWhere = $eval->compile($select->where, $info, $alias);
+            }
+            $proj = [];
+            $any = false;
+            foreach ($outputCols as $c) {
+                $cl = $c['expr'] !== null ? $eval->compile($c['expr'], $info, $alias) : null;
+                $proj[] = $cl;
+                $any = $any || $cl !== null;
+            }
+            if ($any) {
+                $cProject = $proj;
+            }
+
+            if ($select->groupBy !== []) {
+                $g = [];
+                $ok = true;
+                foreach ($select->groupBy as $ge) {
+                    $cl = $eval->compile($ge, $info, $alias);
+                    if ($cl === null) {
+                        $ok = false;
+                        break;
+                    }
+                    $g[] = $cl;
+                }
+                $cGroupBy = $ok ? $g : null;
+            }
+
+            $cAggArgs = [];
+            foreach ($aggregateNodes as $nid => $node) {
+                $args = [];
+                $ok = true;
+                foreach ($node->args as $arg) {
+                    $cl = $eval->compile($arg, $info, $alias);
+                    if ($cl === null) {
+                        $ok = false;
+                        break;
+                    }
+                    $args[] = $cl;
+                }
+                $cAggArgs[$nid] = $ok ? $args : null;
+            }
+        }
+
         $meta = [
             'cookie' => $cookie,
             'cols' => $outputCols,
@@ -229,11 +290,35 @@ final class Executor
             'order' => $orderPlan,
             'aggs' => $aggregateNodes,
             'isAgg' => $select->groupBy !== [] || $aggregateNodes !== [],
+            'cWhere' => $cWhere,
+            'cProject' => $cProject,
+            'cGroupBy' => $cGroupBy,
+            'cAggArgs' => $cAggArgs,
         ];
         if (\count($this->selectMeta) >= self::SELECT_META_MAX) {
             $this->selectMeta = [];
         }
         return $this->selectMeta[$id] = $meta;
+    }
+
+    /** @return array{0:TableInfo,1:string}|null [info, alias] for a single base-table query */
+    private function singleTableForCompile(SelectStatement $select): ?array
+    {
+        if ($select->joins !== [] || $select->from === null) {
+            return null;
+        }
+        $ref = $select->from;
+        if ($ref->func !== null || $ref->subquery !== null || $ref->name === null) {
+            return null;
+        }
+        if (\YetiDevWorks\YetiSQL\Engine\Schema::isTempMaster((string) $ref->name)) {
+            return null;
+        }
+        $info = $this->db->schema()->getTable((string) $ref->name);
+        if ($info === null) {
+            return null;
+        }
+        return [$info, $ref->alias ?? $info->name];
     }
 
     /** @return array{0:list<string>,1:list<list<null|int|float|string|Blob>>,2:list<list<null|int|float|string|Blob>>} */
@@ -537,7 +622,15 @@ final class Executor
      */
     private function projectRow(array $outputCols, RowEnv $env, Evaluator $eval): array
     {
+        $proj = $eval->compiledProject;
         $out = [];
+        if ($proj !== null) {
+            foreach ($outputCols as $i => $c) {
+                $cl = $proj[$i] ?? null;
+                $out[] = $cl !== null ? $cl($env, $eval) : $eval->evaluate($c['expr'], $env);
+            }
+            return $out;
+        }
         foreach ($outputCols as $c) {
             $out[] = $eval->evaluate($c['expr'], $env);
         }
@@ -698,19 +791,28 @@ final class Executor
             $accs[$id] = Aggregates::newAccumulator(\strtolower((string) $node->name));
         }
 
+        $cWhere = $eval->compiledWhere;
+        $cArgs = $eval->compiledAggArgs;
         $rep = null;
         foreach ($this->iterateJoined($select, $eval) as $env) {
             if ($select->where !== null && !$eval->whereCovered) {
-                $v = $eval->evaluate($select->where, $env);
+                $v = $cWhere !== null ? $cWhere($env, $eval) : $eval->evaluate($select->where, $env);
                 if ($v === null || !Value::isTrue($v)) {
                     continue;
                 }
             }
             $rep ??= $env;
             foreach ($aggregateNodes as $id => $node) {
+                $argCs = $cArgs[$id] ?? null;
                 $args = [];
-                foreach ($node->args as $arg) {
-                    $args[] = $eval->evaluate($arg, $env);
+                if ($argCs !== null) {
+                    foreach ($argCs as $ac) {
+                        $args[] = $ac($env, $eval);
+                    }
+                } else {
+                    foreach ($node->args as $arg) {
+                        $args[] = $eval->evaluate($arg, $env);
+                    }
                 }
                 Aggregates::step($accs[$id], $args, $node->star);
             }
@@ -752,11 +854,19 @@ final class Executor
         foreach ($aggregateNodes as $id => $node) {
             $names[$id] = \strtolower((string) $node->name);
         }
+        $cGroup = $eval->compiledGroupBy;
+        $cArgs = $eval->compiledAggArgs;
 
         foreach ($envs as $env) {
             $keyParts = [];
-            foreach ($select->groupBy as $g) {
-                $keyParts[] = $this->valueKey($eval->evaluate($g, $env));
+            if ($cGroup !== null) {
+                foreach ($cGroup as $gc) {
+                    $keyParts[] = $this->valueKey($gc($env, $eval));
+                }
+            } else {
+                foreach ($select->groupBy as $g) {
+                    $keyParts[] = $this->valueKey($eval->evaluate($g, $env));
+                }
             }
             $key = \implode("\x1f", $keyParts);
             if (!isset($accsByGroup[$key])) {
@@ -768,9 +878,16 @@ final class Executor
                 $repByGroup[$key] = $env;
             }
             foreach ($aggregateNodes as $id => $node) {
+                $argCs = $cArgs[$id] ?? null;
                 $args = [];
-                foreach ($node->args as $arg) {
-                    $args[] = $eval->evaluate($arg, $env);
+                if ($argCs !== null) {
+                    foreach ($argCs as $ac) {
+                        $args[] = $ac($env, $eval);
+                    }
+                } else {
+                    foreach ($node->args as $arg) {
+                        $args[] = $eval->evaluate($arg, $env);
+                    }
                 }
                 Aggregates::step($accsByGroup[$key][$id], $args, $node->star);
             }
