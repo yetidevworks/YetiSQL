@@ -995,6 +995,16 @@ final class Executor
 
     private function rememberCoveredCount(string $key, int $count): void
     {
+        // Never cache a count computed inside an open transaction. The cache key
+        // includes totalChanges(), which advances for writes in the transaction
+        // but is NOT rewound on ROLLBACK, so a value cached mid-transaction would
+        // be re-served under the same key after the rollback — returning a stale
+        // count for the reverted data. In-transaction counts therefore always
+        // recompute (correctly seeing uncommitted state); committed counts cache
+        // normally in autocommit mode.
+        if ($this->db->inTransaction()) {
+            return;
+        }
         if (\count($this->coveredCountCache) >= self::COVERED_COUNT_CACHE_MAX) {
             $this->coveredCountCache = [];
         }
