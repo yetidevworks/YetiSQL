@@ -2118,12 +2118,31 @@ final class Executor
         if ($index !== null) {
             $idx = $this->indexTree($index);
             $tree = new TableBTree($this->db->pager(), $info->rootPage);
+            $keys = [];
             foreach ($tree->scan() as [$rowid, $payload]) {
                 $logical = $this->decodeRow($info, $rowid, $payload);
-                $idx->put($this->indexKey($index, $logical, $rowid));
+                $keys[] = $this->indexKey($index, $logical, $rowid);
+            }
+            $collations = $index->collations;
+            \usort($keys, fn (array $a, array $b): int => $this->compareIndexKeys($a, $b, $collations));
+            foreach ($keys as $key) {
+                $idx->put($key);
             }
         }
         return Result::affected(0);
+    }
+
+    /** @param list<string> $collations */
+    private function compareIndexKeys(array $a, array $b, array $collations): int
+    {
+        $n = \min(\count($a), \count($b));
+        for ($i = 0; $i < $n; $i++) {
+            $c = Value::compare($a[$i], $b[$i], $collations[$i] ?? 'BINARY');
+            if ($c !== 0) {
+                return $c;
+            }
+        }
+        return \count($a) <=> \count($b);
     }
 
     // === PRAGMA ==========================================================
