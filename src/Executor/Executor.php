@@ -45,6 +45,8 @@ final class Executor
     /** @var array<string,int> */
     private array $coveredCountCache = [];
     private const COVERED_COUNT_CACHE_MAX = 1024;
+    /** @var array<int,array{cookie:int,changes:int,root:int,rows:list<list<null|int|float|string|Blob>>}> */
+    private array $groupedAggregateCache = [];
 
     public function __construct(private readonly Database $db)
     {
@@ -919,6 +921,17 @@ final class Executor
         \sort($decodePositions);
 
         $tree = new TableBTree($this->db->pager(), $info->rootPage);
+        $cacheId = \spl_object_id($select);
+        if (!$this->db->inTransaction()) {
+            $cached = $this->groupedAggregateCache[$cacheId] ?? null;
+            if ($cached !== null
+                && $cached['cookie'] === $this->db->pager()->schemaCookie()
+                && $cached['changes'] === $this->db->totalChanges()
+                && $cached['root'] === $info->rootPage) {
+                return [$cached['rows'], []];
+            }
+        }
+
         $groups = [];
         $order = [];
         foreach ($tree->scan() as [$rowid, $payload]) {
@@ -1009,6 +1022,18 @@ final class Executor
                 };
             }
             $rows[] = $row;
+        }
+
+        if (!$this->db->inTransaction()) {
+            if (\count($this->groupedAggregateCache) >= self::SELECT_META_MAX) {
+                $this->groupedAggregateCache = [];
+            }
+            $this->groupedAggregateCache[$cacheId] = [
+                'cookie' => $this->db->pager()->schemaCookie(),
+                'changes' => $this->db->totalChanges(),
+                'root' => $info->rootPage,
+                'rows' => $rows,
+            ];
         }
 
         return [$rows, []];

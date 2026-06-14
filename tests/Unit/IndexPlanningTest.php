@@ -139,6 +139,31 @@ final class IndexPlanningTest extends TestCase
         self::assertSame(61, (int) $db->query("SELECT COUNT(*) FROM t WHERE city='SF'")->fetchColumn());
     }
 
+    public function testGroupedAggregateCacheInvalidatesAfterWrite(): void
+    {
+        $db = new PDO('yetisql::memory:');
+        $this->seed($db, withIndexes: false);
+
+        $before = $this->groupCountsByCity($db);
+        self::assertSame(60, $before['SF']);
+        self::assertSame($before, $this->groupCountsByCity($db));
+
+        $db->exec("INSERT INTO t (id, name, age, city) VALUES (1000, 'new', 42, 'SF')");
+
+        $after = $this->groupCountsByCity($db);
+        self::assertSame(61, $after['SF']);
+    }
+
+    /** @return array<string,int> */
+    private function groupCountsByCity(PDO $db): array
+    {
+        $out = [];
+        foreach ($db->query('SELECT city, COUNT(*) FROM t GROUP BY city')->fetchAll(PDO::FETCH_NUM) as $row) {
+            $out[(string) $row[0]] = (int) $row[1];
+        }
+        return $out;
+    }
+
     public function testIndexPersistsAcrossReopen(): void
     {
         $db = new PDO('yetisql:' . $this->path);
