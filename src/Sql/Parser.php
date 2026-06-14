@@ -7,6 +7,7 @@ namespace YetiDevWorks\YetiSQL\Sql;
 use YetiDevWorks\YetiSQL\Engine\Blob;
 use YetiDevWorks\YetiSQL\Exception\SqlException;
 use YetiDevWorks\YetiSQL\Sql\Ast\ColumnDef;
+use YetiDevWorks\YetiSQL\Sql\Ast\AlterTableStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateIndexStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateTableStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateViewStatement;
@@ -87,6 +88,7 @@ final class Parser
             $t->isKeyword('UPDATE') => $this->updateStatement(),
             $t->isKeyword('DELETE') => $this->deleteStatement(),
             $t->isKeyword('DROP') => $this->dropStatement(),
+            $t->isKeyword('ALTER') => $this->alterStatement(),
             $t->isKeyword('PRAGMA') => $this->pragmaStatement(),
             $t->isKeyword('BEGIN') => $this->beginStatement(),
             $t->isKeyword('COMMIT'), $t->isKeyword('END') => $this->endTransaction(TransactionStatement::COMMIT),
@@ -521,7 +523,9 @@ final class Parser
                 $col->unique = true;
                 $this->consumeConflictClause();
             } elseif ($this->accept(Token::KEYWORD, 'DEFAULT')) {
+                $dstart = $this->peek()->pos;
                 $col->default = $this->defaultValue();
+                $col->defaultSql = \rtrim(\substr($this->sql, $dstart, $this->peek()->pos - $dstart));
             } elseif ($this->accept(Token::KEYWORD, 'COLLATE')) {
                 $col->collation = $this->name();
             } elseif ($this->accept(Token::KEYWORD, 'CHECK')) {
@@ -773,6 +777,44 @@ final class Parser
         }
         $name = $this->qualifiedName();
         return new DropStatement($kind, $name, $ifExists);
+    }
+
+    private function alterStatement(): AlterTableStatement
+    {
+        $this->expect(Token::KEYWORD, 'ALTER');
+        $this->expect(Token::KEYWORD, 'TABLE');
+        $table = $this->qualifiedName();
+
+        if ($this->accept(Token::KEYWORD, 'RENAME')) {
+            if ($this->accept(Token::KEYWORD, 'TO')) {
+                $newName = $this->name();
+                return new AlterTableStatement($table, AlterTableStatement::RENAME_TABLE, newName: $newName);
+            }
+            $this->accept(Token::KEYWORD, 'COLUMN'); // optional
+            $old = $this->name();
+            $this->expect(Token::KEYWORD, 'TO');
+            $new = $this->name();
+            return new AlterTableStatement(
+                $table,
+                AlterTableStatement::RENAME_COLUMN,
+                newName: $new,
+                columnName: $old,
+            );
+        }
+
+        if ($this->accept(Token::KEYWORD, 'ADD')) {
+            $this->accept(Token::KEYWORD, 'COLUMN'); // optional
+            $col = $this->columnDef();
+            return new AlterTableStatement($table, AlterTableStatement::ADD_COLUMN, column: $col);
+        }
+
+        if ($this->accept(Token::KEYWORD, 'DROP')) {
+            $this->accept(Token::KEYWORD, 'COLUMN'); // optional
+            $col = $this->name();
+            return new AlterTableStatement($table, AlterTableStatement::DROP_COLUMN, columnName: $col);
+        }
+
+        throw SqlException::parse('expected RENAME, ADD or DROP after ALTER TABLE');
     }
 
     private function pragmaStatement(): PragmaStatement

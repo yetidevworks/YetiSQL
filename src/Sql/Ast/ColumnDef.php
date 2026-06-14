@@ -17,6 +17,8 @@ final class ColumnDef
         public bool $primaryKeyDesc = false,
         public ?Expr $default = null,
         public ?string $collation = null,
+        /** Verbatim SQL text of the DEFAULT clause's value, for re-serialization. */
+        public ?string $defaultSql = null,
     ) {
     }
 }

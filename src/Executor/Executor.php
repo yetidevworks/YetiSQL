@@ -13,6 +13,7 @@ use YetiDevWorks\YetiSQL\Engine\TableInfo;
 use YetiDevWorks\YetiSQL\Exception\SqlException;
 use YetiDevWorks\YetiSQL\Functions\Aggregates;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateIndexStatement;
+use YetiDevWorks\YetiSQL\Sql\Ast\AlterTableStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateTableStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateViewStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DeleteStatement;
@@ -108,6 +109,7 @@ final class Executor
             || $stmt instanceof CreateTableStatement
             || $stmt instanceof CreateIndexStatement
             || $stmt instanceof CreateViewStatement
+            || $stmt instanceof AlterTableStatement
             || $stmt instanceof DropStatement;
     }
 
@@ -121,6 +123,7 @@ final class Executor
             $stmt instanceof DeleteStatement => $this->execDelete($stmt, $params),
             $stmt instanceof CreateTableStatement => $this->execCreateTable($stmt),
             $stmt instanceof CreateViewStatement => $this->execCreateView($stmt),
+            $stmt instanceof AlterTableStatement => $this->execAlter($stmt),
             $stmt instanceof DropStatement => $this->execDrop($stmt),
             $stmt instanceof CreateIndexStatement => $this->execCreateIndex($stmt),
             $stmt instanceof PragmaStatement => $this->execPragma($stmt),
@@ -2425,7 +2428,11 @@ final class Executor
         $values = RecordCodec::decode($payload);
         $n = $info->columnCount();
         if (\count($values) < $n) {
-            $values = \array_pad($values, $n, null);
+            // Columns added via ALTER TABLE ADD COLUMN are absent from rows
+            // written earlier; fill them with the column's declared default.
+            for ($i = \count($values); $i < $n; $i++) {
+                $values[$i] = $info->columns[$i]->defaultValue;
+            }
         }
         if ($info->hasRowidAlias()) {
             $values[$info->rowidAlias] = $rowid;
@@ -3583,6 +3590,83 @@ final class Executor
     {
         $this->db->schema()->createView($stmt);
         return Result::affected(0);
+    }
+
+    private function execAlter(AlterTableStatement $stmt): Result
+    {
+        $schema = $this->db->schema();
+        if ($schema->getTable($stmt->table) === null && $schema->hasView($stmt->table)) {
+            throw new SqlException("cannot alter {$stmt->table} because it is a view");
+        }
+        switch ($stmt->action) {
+            case AlterTableStatement::RENAME_TABLE:
+                $schema->renameTable($stmt->table, (string) $stmt->newName);
+                break;
+            case AlterTableStatement::RENAME_COLUMN:
+                $schema->renameColumn($stmt->table, (string) $stmt->columnName, (string) $stmt->newName);
+                break;
+            case AlterTableStatement::ADD_COLUMN:
+                $info = $schema->getTable($stmt->table);
+                $hasRows = false;
+                if ($info !== null) {
+                    foreach ((new TableBTree($this->db->pager(), $info->rootPage))->scan() as $_) {
+                        $hasRows = true;
+                        break;
+                    }
+                }
+                $schema->addColumn($stmt->table, $stmt->column, $hasRows);
+                break;
+            case AlterTableStatement::DROP_COLUMN:
+                $this->execDropColumn($stmt);
+                break;
+        }
+        return Result::affected(0);
+    }
+
+    private function execDropColumn(AlterTableStatement $stmt): void
+    {
+        $schema = $this->db->schema();
+        $info = $schema->getTable($stmt->table);
+        if ($info === null) {
+            throw new SqlException("no such table: {$stmt->table}");
+        }
+        $col = (string) $stmt->columnName;
+        $pos = $info->columnPos($col);
+        if ($pos === null) {
+            throw new SqlException("no such column: \"$col\"");
+        }
+        if ($info->columnCount() <= 1) {
+            throw new SqlException("cannot drop column \"$col\": no other columns exist");
+        }
+        if ($pos === $info->rowidAlias || $info->columns[$pos]->primaryKey) {
+            throw new SqlException("cannot drop column \"$col\": PRIMARY KEY column");
+        }
+        foreach ($schema->resolvedIndexes($stmt->table) as $idx) {
+            if (\in_array($pos, $idx->columnPositions, true)) {
+                throw new SqlException("cannot drop column \"$col\": used in index {$idx->name}");
+            }
+        }
+
+        // Splice the column's value out of every stored record.
+        $tree = new TableBTree($this->db->pager(), $info->rootPage);
+        $n = $info->columnCount();
+        $updates = [];
+        foreach ($tree->scan() as [$rowid, $payload]) {
+            $values = RecordCodec::decode($payload);
+            // Materialize any virtual ADD COLUMN columns with their real default
+            // (so a surviving one keeps its value), but leave the rowid-alias
+            // slot stored as null per the table's storage convention.
+            for ($i = \count($values); $i < $n; $i++) {
+                $values[$i] = $info->columns[$i]->defaultValue;
+            }
+            \array_splice($values, $pos, 1);
+            $updates[] = [$rowid, RecordCodec::encode(\array_values($values))];
+        }
+        foreach ($updates as [$rowid, $newPayload]) {
+            $tree->put($rowid, $newPayload);
+        }
+
+        $schema->dropColumn($stmt->table, $col);
     }
 
     private function execDrop(DropStatement $stmt): Result

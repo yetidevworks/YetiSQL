@@ -290,6 +290,252 @@ final class Schema
         unset($this->indexes[\strtolower($name)]);
     }
 
+    // --- ALTER TABLE ------------------------------------------------------
+
+    public function renameTable(string $old, string $new): void
+    {
+        $info = $this->getTable($old);
+        if ($info === null) {
+            throw new SqlException("no such table: $old");
+        }
+        if ($this->hasTable($new) || $this->hasView($new)) {
+            throw SqlException::constraint("there is already another table or index with this name: $new");
+        }
+        $ast = $this->parseTableSql($info->sql);
+        $ast->name = $new;
+        $newSql = $this->serializeCreateTable($ast);
+        $ast->sql = $newSql;
+        $newInfo = $this->buildTableInfoFromAst($ast, $info->rootPage);
+
+        $this->rewriteMasterRow('table', $old, ['table', $new, $new, $info->rootPage, $newSql]);
+
+        foreach ($this->indexes as $k => $idx) {
+            if (\strtolower($idx['table']) !== \strtolower($old)) {
+                continue;
+            }
+            $idx['ast']->table = $new;
+            $idx['table'] = $new;
+            $idx['sql'] = $this->serializeCreateIndex($idx['ast']);
+            $this->indexes[$k] = $idx;
+            $this->rewriteMasterRow('index', $idx['name'], ['index', $idx['name'], $new, $idx['rootPage'], $idx['sql']]);
+        }
+
+        unset($this->tables[\strtolower($old)]);
+        $this->tables[\strtolower($new)] = $newInfo;
+        $this->pager->bumpSchemaCookie();
+    }
+
+    public function renameColumn(string $table, string $old, string $new): void
+    {
+        $info = $this->getTable($table);
+        if ($info === null) {
+            throw new SqlException("no such table: $table");
+        }
+        if ($info->columnPos($old) === null) {
+            throw new SqlException("no such column: \"$old\"");
+        }
+        if ($info->columnPos($new) !== null) {
+            throw SqlException::constraint("duplicate column name: $new");
+        }
+        $ast = $this->parseTableSql($info->sql);
+        foreach ($ast->columns as $cd) {
+            if (\strcasecmp($cd->name, $old) === 0) {
+                $cd->name = $new;
+            }
+        }
+        $rename = static fn (string $c): string => \strcasecmp($c, $old) === 0 ? $new : $c;
+        $ast->primaryKeyColumns = \array_map($rename, $ast->primaryKeyColumns);
+        $ast->uniqueConstraints = \array_map(
+            static fn (array $grp): array => \array_map($rename, $grp),
+            $ast->uniqueConstraints,
+        );
+        $newSql = $this->serializeCreateTable($ast);
+        $ast->sql = $newSql;
+        $newInfo = $this->buildTableInfoFromAst($ast, $info->rootPage);
+
+        $this->rewriteMasterRow('table', $table, ['table', $table, $table, $info->rootPage, $newSql]);
+        $this->tables[\strtolower($table)] = $newInfo;
+
+        foreach ($this->indexes as $k => $idx) {
+            if (\strtolower($idx['table']) !== \strtolower($table)) {
+                continue;
+            }
+            $changed = false;
+            foreach ($idx['ast']->columns as $term) {
+                if ($term->expr->kind === \YetiDevWorks\YetiSQL\Sql\Ast\Expr::COL
+                    && \strcasecmp((string) $term->expr->name, $old) === 0) {
+                    $term->expr->name = $new;
+                    $changed = true;
+                }
+            }
+            if ($changed) {
+                $idx['sql'] = $this->serializeCreateIndex($idx['ast']);
+                $this->indexes[$k] = $idx;
+                $this->rewriteMasterRow('index', $idx['name'], ['index', $idx['name'], $idx['table'], $idx['rootPage'], $idx['sql']]);
+            }
+        }
+        $this->pager->bumpSchemaCookie();
+    }
+
+    public function addColumn(string $table, \YetiDevWorks\YetiSQL\Sql\Ast\ColumnDef $col, bool $tableHasRows = true): void
+    {
+        $info = $this->getTable($table);
+        if ($info === null) {
+            throw new SqlException("no such table: $table");
+        }
+        if ($info->columnPos($col->name) !== null) {
+            throw SqlException::constraint("duplicate column name: {$col->name}");
+        }
+        if ($col->primaryKey) {
+            throw new SqlException('Cannot add a PRIMARY KEY column');
+        }
+        if ($col->unique) {
+            throw new SqlException('Cannot add a UNIQUE column');
+        }
+        // SQLite permits a NOT NULL column without a non-NULL default only when
+        // there are no existing rows that the constraint could violate.
+        if ($col->notNull && $tableHasRows && $this->defaultIsNull($col)) {
+            throw new SqlException('Cannot add a NOT NULL column with default value NULL');
+        }
+        $ast = $this->parseTableSql($info->sql);
+        $ast->columns[] = $col;
+        $newSql = $this->serializeCreateTable($ast);
+        $ast->sql = $newSql;
+        $newInfo = $this->buildTableInfoFromAst($ast, $info->rootPage);
+
+        $this->rewriteMasterRow('table', $table, ['table', $table, $table, $info->rootPage, $newSql]);
+        $this->tables[\strtolower($table)] = $newInfo;
+        $this->pager->bumpSchemaCookie();
+    }
+
+    /** Update the catalog after a column's values have been spliced from every row. */
+    public function dropColumn(string $table, string $colName): void
+    {
+        $info = $this->getTable($table);
+        if ($info === null) {
+            throw new SqlException("no such table: $table");
+        }
+        $ast = $this->parseTableSql($info->sql);
+        $ast->columns = \array_values(\array_filter(
+            $ast->columns,
+            static fn (\YetiDevWorks\YetiSQL\Sql\Ast\ColumnDef $c): bool => \strcasecmp($c->name, $colName) !== 0,
+        ));
+        $newSql = $this->serializeCreateTable($ast);
+        $ast->sql = $newSql;
+        $newInfo = $this->buildTableInfoFromAst($ast, $info->rootPage);
+
+        $this->rewriteMasterRow('table', $table, ['table', $table, $table, $info->rootPage, $newSql]);
+        $this->tables[\strtolower($table)] = $newInfo;
+        $this->pager->bumpSchemaCookie();
+    }
+
+    private function defaultIsNull(\YetiDevWorks\YetiSQL\Sql\Ast\ColumnDef $col): bool
+    {
+        if ($col->default === null) {
+            return true;
+        }
+        return $col->default->kind === \YetiDevWorks\YetiSQL\Sql\Ast\Expr::LIT && $col->default->value === null;
+    }
+
+    private function parseTableSql(string $sql): CreateTableStatement
+    {
+        $parser = new Parser($sql);
+        /** @var CreateTableStatement $ast */
+        $ast = $parser->parseStatement();
+        return $ast;
+    }
+
+    private function rewriteMasterRow(string $type, string $name, array $newRecord): void
+    {
+        foreach ($this->master->scan() as [$rowid, $payload]) {
+            $r = RecordCodec::decode($payload);
+            if ($r[0] === $type && \strtolower((string) $r[1]) === \strtolower($name)) {
+                $this->master->put($rowid, RecordCodec::encode($newRecord));
+                return;
+            }
+        }
+    }
+
+    // --- SQL serialization (for ALTER round-tripping) ---------------------
+
+    private function serializeCreateTable(CreateTableStatement $ast): string
+    {
+        $parts = [];
+        foreach ($ast->columns as $col) {
+            $parts[] = $this->serializeColumnDef($col);
+        }
+        if ($ast->primaryKeyColumns !== []) {
+            $parts[] = 'PRIMARY KEY (' . \implode(', ', \array_map([$this, 'quoteIdent'], $ast->primaryKeyColumns)) . ')';
+        }
+        foreach ($ast->uniqueConstraints as $grp) {
+            $parts[] = 'UNIQUE (' . \implode(', ', \array_map([$this, 'quoteIdent'], $grp)) . ')';
+        }
+        $sql = 'CREATE TABLE ' . $this->quoteIdent($ast->name) . ' (' . \implode(', ', $parts) . ')';
+        if ($ast->withoutRowid) {
+            $sql .= ' WITHOUT ROWID';
+        }
+        return $sql;
+    }
+
+    private function serializeColumnDef(\YetiDevWorks\YetiSQL\Sql\Ast\ColumnDef $col): string
+    {
+        $s = $this->quoteIdent($col->name);
+        if ($col->typeName !== null && $col->typeName !== '') {
+            $s .= ' ' . $col->typeName;
+        }
+        if ($col->primaryKey) {
+            $s .= ' PRIMARY KEY';
+            if ($col->primaryKeyDesc) {
+                $s .= ' DESC';
+            }
+            if ($col->autoincrement) {
+                $s .= ' AUTOINCREMENT';
+            }
+        }
+        if ($col->notNull) {
+            $s .= ' NOT NULL';
+        }
+        if ($col->unique) {
+            $s .= ' UNIQUE';
+        }
+        if ($col->defaultSql !== null) {
+            $s .= ' DEFAULT ' . $col->defaultSql;
+        }
+        if ($col->collation !== null) {
+            $s .= ' COLLATE ' . $col->collation;
+        }
+        return $s;
+    }
+
+    private function serializeCreateIndex(CreateIndexStatement $ast): string
+    {
+        $cols = [];
+        foreach ($ast->columns as $term) {
+            $c = $this->exprToSql($term->expr);
+            if ($term->desc) {
+                $c .= ' DESC';
+            }
+            $cols[] = $c;
+        }
+        $sql = 'CREATE ' . ($ast->unique ? 'UNIQUE ' : '') . 'INDEX ' . $this->quoteIdent($ast->name)
+            . ' ON ' . $this->quoteIdent($ast->table) . ' (' . \implode(', ', $cols) . ')';
+        return $sql;
+    }
+
+    private function exprToSql(\YetiDevWorks\YetiSQL\Sql\Ast\Expr $e): string
+    {
+        return match ($e->kind) {
+            \YetiDevWorks\YetiSQL\Sql\Ast\Expr::COL => ($e->table !== null ? $this->quoteIdent($e->table) . '.' : '')
+                . $this->quoteIdent((string) $e->name),
+            default => throw new SqlException('cannot serialize index expression after ALTER'),
+        };
+    }
+
+    private function quoteIdent(string $name): string
+    {
+        return '"' . \str_replace('"', '""', $name) . '"';
+    }
+
     /** @param callable(list<mixed>):bool $match */
     private function deleteMasterRows(callable $match): void
     {
@@ -332,14 +578,16 @@ final class Schema
     {
         $columns = [];
         foreach ($ast->columns as $cd) {
+            $affinity = Affinity::fromDeclaredType($cd->typeName);
             $columns[] = new ColumnInfo(
                 name: $cd->name,
                 declaredType: $cd->typeName,
-                affinity: Affinity::fromDeclaredType($cd->typeName),
+                affinity: $affinity,
                 notNull: $cd->notNull,
                 primaryKey: $cd->primaryKey,
                 default: $cd->default,
                 collation: $cd->collation ?? 'BINARY',
+                defaultValue: $affinity->apply(self::constDefault($cd->default)),
             );
         }
 
@@ -377,6 +625,31 @@ final class Schema
     private static function isIntegerType(?string $type): bool
     {
         return $type !== null && \strtoupper(\trim($type)) === 'INTEGER';
+    }
+
+    /**
+     * Resolve a column DEFAULT to a constant scalar. Handles the literal forms
+     * permitted for ALTER TABLE ADD COLUMN (a literal or a signed number);
+     * non-constant defaults resolve to null (never read, since such columns are
+     * always materialized at insert time).
+     */
+    private static function constDefault(?\YetiDevWorks\YetiSQL\Sql\Ast\Expr $e): null|int|float|string|Blob
+    {
+        if ($e === null) {
+            return null;
+        }
+        $kind = $e->kind;
+        if ($kind === \YetiDevWorks\YetiSQL\Sql\Ast\Expr::LIT) {
+            return $e->value;
+        }
+        if ($kind === \YetiDevWorks\YetiSQL\Sql\Ast\Expr::UNARY
+            && $e->operand !== null
+            && $e->operand->kind === \YetiDevWorks\YetiSQL\Sql\Ast\Expr::LIT
+            && (\is_int($e->operand->value) || \is_float($e->operand->value))) {
+            $v = $e->operand->value;
+            return $e->op === '-' ? -$v : $v;
+        }
+        return null;
     }
 
     private static function findColumn(CreateTableStatement $ast, string $name): ?int

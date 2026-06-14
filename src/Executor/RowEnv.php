@@ -96,7 +96,9 @@ final class RowEnv
         }
         $offsets = $frame['offsets'] ?? ($frame['offsets'] = RecordCodec::columnOffsets($payload));
         if (!isset($offsets[$pos])) {
-            return $frame['values'][$pos] = null;
+            // Column absent from this record: added via ALTER TABLE ADD COLUMN
+            // after the row was written, so serve its declared default.
+            return $frame['values'][$pos] = $frame['info']->columns[$pos]->defaultValue;
         }
         [$type, $bodyOff] = $offsets[$pos];
         return $frame['values'][$pos] = RecordCodec::decodeAt($payload, $type, $bodyOff);

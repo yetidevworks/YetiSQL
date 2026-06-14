@@ -18,6 +18,11 @@ final class ColumnInfo
         public bool $primaryKey = false,
         public ?Expr $default = null,
         public string $collation = 'BINARY',
+        /**
+         * The column's DEFAULT resolved to a constant scalar (affinity applied),
+         * returned for rows written before the column was added via ALTER TABLE.
+         */
+        public null|int|float|string|Blob $defaultValue = null,
     ) {
     }
 }
