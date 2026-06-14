@@ -100,9 +100,27 @@ final class Parser
 
     private function selectStatement(): SelectStatement
     {
-        // Common Table Expressions are accepted syntactically then ignored (post-v1).
+        $with = [];
+        $recursive = false;
         if ($this->accept(Token::KEYWORD, 'WITH')) {
-            throw SqlException::parse('WITH (CTE) is not supported in this version');
+            $recursive = $this->accept(Token::KEYWORD, 'RECURSIVE')
+                || $this->accept(Token::IDENT, 'RECURSIVE');
+            do {
+                $name = $this->name();
+                $columns = null;
+                if ($this->accept(Token::PUNCT, '(')) {
+                    $columns = [];
+                    do {
+                        $columns[] = $this->name();
+                    } while ($this->accept(Token::PUNCT, ','));
+                    $this->expect(Token::PUNCT, ')');
+                }
+                $this->expect(Token::KEYWORD, 'AS');
+                $this->expect(Token::PUNCT, '(');
+                $cteSelect = $this->selectStatement();
+                $this->expect(Token::PUNCT, ')');
+                $with[] = ['name' => $name, 'columns' => $columns, 'select' => $cteSelect];
+            } while ($this->accept(Token::PUNCT, ','));
         }
 
         $select = $this->selectCore();
@@ -130,6 +148,8 @@ final class Parser
         }
 
         $this->parseOrderLimit($select);
+        $select->with = $with;
+        $select->recursive = $recursive;
         return $select;
     }
 

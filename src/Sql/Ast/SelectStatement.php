@@ -26,6 +26,12 @@ final class SelectStatement implements Statement
         public ?SelectStatement $compound = null,
         /** @var list<array{0:Expr}> raw VALUES rows when this is a VALUES clause */
         public array $valuesRows = [],
+        /**
+         * Common table expressions in scope for this statement.
+         * @var list<array{name:string,columns:?list<string>,select:SelectStatement}>
+         */
+        public array $with = [],
+        public bool $recursive = false,
     ) {
     }
 }

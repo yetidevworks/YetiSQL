@@ -50,9 +50,40 @@ final class Executor
     /** @var \WeakMap<SelectStatement,string> */
     private \WeakMap $selectSignatures;
 
+    /**
+     * Common table expressions visible to the statement currently executing,
+     * keyed by lowercased name. Saved/restored around each WITH-bearing select
+     * so nested scopes shadow correctly.
+     *
+     * @var array<string,array{select:SelectStatement,columns:?list<string>,recursive:bool,rows:?list<list<null|int|float|string|Blob>>,outCols:?list<string>}>
+     */
+    private array $cteScope = [];
+
     public function __construct(private readonly Database $db)
     {
         $this->selectSignatures = new \WeakMap();
+    }
+
+    /**
+     * Register a select's CTEs into the active scope, returning the prior scope
+     * for restoration. CTE bodies see earlier (and, for recursion, their own)
+     * names, matching SQLite.
+     *
+     * @return array<string,mixed> the scope to restore
+     */
+    private function registerCtes(SelectStatement $select): array
+    {
+        $saved = $this->cteScope;
+        foreach ($select->with as $cte) {
+            $this->cteScope[\strtolower($cte['name'])] = [
+                'select' => $cte['select'],
+                'columns' => $cte['columns'],
+                'recursive' => $select->recursive,
+                'rows' => null,
+                'outCols' => null,
+            ];
+        }
+        return $saved;
     }
 
     public function lastInsertId(): int
@@ -96,6 +127,19 @@ final class Executor
     /** @param array<string,null|int|float|string|Blob> $params */
     private function execSelect(SelectStatement $select, array $params): Result
     {
+        if ($select->with !== []) {
+            $saved = $this->registerCtes($select);
+            try {
+                return $this->execSelectInner($select, $params);
+            } finally {
+                $this->cteScope = $saved;
+            }
+        }
+        return $this->execSelectInner($select, $params);
+    }
+
+    private function execSelectInner(SelectStatement $select, array $params): Result
+    {
         $streamed = $this->tryStreamSelect($select, $params);
         if ($streamed !== null) {
             return $streamed;
@@ -124,6 +168,11 @@ final class Executor
     /** @param array<string,null|int|float|string|Blob> $params */
     private function tryStreamSelect(SelectStatement $select, array $params): ?Result
     {
+        // A lazy cursor would outlive the CTE scope (restored when execSelect
+        // returns), so evaluate CTE-bearing statements eagerly instead.
+        if ($this->cteScope !== []) {
+            return null;
+        }
         if ($select->compound !== null
             || $select->orderBy !== []
             || $select->distinct
@@ -162,6 +211,27 @@ final class Executor
         array $params,
         ?RowEnv $outerEnv = null,
         ?Evaluator $outerEval = null,
+    ): array {
+        if ($select->with !== []) {
+            $saved = $this->registerCtes($select);
+            try {
+                return $this->runSubquerySelectInner($select, $params, $outerEnv, $outerEval);
+            } finally {
+                $this->cteScope = $saved;
+            }
+        }
+        return $this->runSubquerySelectInner($select, $params, $outerEnv, $outerEval);
+    }
+
+    /**
+     * @param array<string,null|int|float|string|Blob> $params
+     * @return list<list<null|int|float|string|Blob>>
+     */
+    private function runSubquerySelectInner(
+        SelectStatement $select,
+        array $params,
+        ?RowEnv $outerEnv,
+        ?Evaluator $outerEval,
     ): array {
         $eval = new Evaluator($this, $params);
         $eval->outerEnv = $outerEnv;
@@ -700,8 +770,10 @@ final class Executor
             ];
         }
         if ($ref->subquery !== null) {
-            // Uncorrelated derived table: materialise once.
+            // Uncorrelated derived table: materialise once. materializeRows()
+            // forces a streaming cursor result so $rows is populated here.
             $res = $this->execSelect($ref->subquery, $eval->params());
+            $rows = $res->materializeRows();
             $alias = $ref->alias ?? '';
             return [
                 'kind' => 'derived',
@@ -711,10 +783,123 @@ final class Executor
                 'empty' => false,
                 'func' => null,
                 'args' => [],
-                'rows' => $res->rows,
+                'rows' => $rows,
             ];
         }
+        if ($ref->name !== null && isset($this->cteScope[\strtolower($ref->name)])) {
+            return $this->resolveCteSource($ref, $eval);
+        }
         return $this->resolveSource($ref);
+    }
+
+    /**
+     * Resolve a FROM reference that names a CTE in scope, materializing it on
+     * first use and serving its rows like a derived table.
+     *
+     * @return array<string,mixed>
+     */
+    private function resolveCteSource(\YetiDevWorks\YetiSQL\Sql\Ast\TableRef $ref, Evaluator $eval): array
+    {
+        $key = \strtolower((string) $ref->name);
+        if ($this->cteScope[$key]['rows'] === null) {
+            $this->materializeCte($key, $eval);
+        }
+        $cte = $this->cteScope[$key];
+        $alias = $ref->alias ?? (string) $ref->name;
+        $cols = $cte['columns'] ?? $cte['outCols'] ?? [];
+        return [
+            'kind' => 'derived',
+            'alias' => $alias,
+            'info' => $this->derivedTableInfo($alias, $cols),
+            'tree' => null,
+            'empty' => false,
+            'func' => null,
+            'args' => [],
+            'rows' => $cte['rows'],
+        ];
+    }
+
+    /** Run a CTE body and cache its rows (recursive bodies via semi-naive fixpoint). */
+    private function materializeCte(string $key, Evaluator $eval): void
+    {
+        $cte = $this->cteScope[$key];
+        $select = $cte['select'];
+        $params = $eval->params();
+
+        $recursive = $cte['recursive']
+            && $select->compound !== null
+            && $this->selectReferencesCte($select->compound, $key);
+
+        if (!$recursive) {
+            // Guard against an undetected self-reference looping forever.
+            $this->cteScope[$key]['rows'] = [];
+            $res = $this->execSelect($select, $params);
+            $this->cteScope[$key]['rows'] = $res->rows;
+            $this->cteScope[$key]['outCols'] = $cte['columns'] ?? $res->columns ?? [];
+            return;
+        }
+
+        // Recursive: the anchor is the body without its compound arm; the arm is
+        // re-run against the previous iteration's new rows until none are added.
+        $dedup = \strtoupper((string) $select->compoundOp) === 'UNION';
+        $anchor = clone $select;
+        $anchor->compoundOp = null;
+        $anchor->compound = null;
+        $anchor->orderBy = [];
+        $anchor->limit = null;
+        $anchor->offset = null;
+        $anchor->with = [];
+        $anchor->recursive = false;
+
+        $anchorRes = $this->execSelect($anchor, $params);
+        $outCols = $cte['columns'] ?? $anchorRes->columns ?? [];
+
+        $result = [];
+        $seen = [];
+        $add = static function (array $rows) use (&$result, &$seen, $dedup): array {
+            $fresh = [];
+            foreach ($rows as $row) {
+                if ($dedup) {
+                    $k = \serialize($row);
+                    if (isset($seen[$k])) {
+                        continue;
+                    }
+                    $seen[$k] = true;
+                }
+                $result[] = $row;
+                $fresh[] = $row;
+            }
+            return $fresh;
+        };
+
+        $working = $add($anchorRes->rows);
+        $arm = $select->compound;
+        $guard = 0;
+        while ($working !== []) {
+            if (++$guard > 1_000_000) {
+                throw new SqlException('recursive CTE did not terminate');
+            }
+            $this->cteScope[$key]['rows'] = $working;
+            $this->cteScope[$key]['outCols'] = $outCols;
+            $res = $this->execSelect($arm, $params);
+            $working = $add($res->rows);
+        }
+        $this->cteScope[$key]['rows'] = $result;
+        $this->cteScope[$key]['outCols'] = $outCols;
+    }
+
+    /** Whether a select's FROM or a joined table names the given CTE (recursion test). */
+    private function selectReferencesCte(SelectStatement $select, string $key): bool
+    {
+        if ($select->from !== null && $select->from->name !== null && \strtolower($select->from->name) === $key) {
+            return true;
+        }
+        foreach ($select->joins as $join) {
+            if ($join->table->name !== null && \strtolower($join->table->name) === $key) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** @param list<string> $columns */
@@ -811,6 +996,18 @@ final class Executor
             $info = $this->tvfTableInfo($ref->func, $ref->alias ?? $ref->func);
             return [$ref->alias ?? $ref->func, $info];
         }
+        if ($ref->subquery !== null) {
+            // Derived table: its columns are the subquery's output names, so a
+            // `*` over it (or over a CTE built from it) expands correctly.
+            $alias = $ref->alias ?? '';
+            return [$alias, $this->derivedTableInfo($alias, $this->selectOutputNames($ref->subquery))];
+        }
+        if ($ref->name !== null && isset($this->cteScope[\strtolower($ref->name)])) {
+            $alias = $ref->alias ?? $ref->name;
+            $cte = $this->cteScope[\strtolower($ref->name)];
+            $cols = $cte['columns'] ?? $cte['outCols'] ?? $this->selectOutputNames($cte['select']);
+            return [$alias, $this->derivedTableInfo($alias, $cols)];
+        }
         if ($ref->name !== null) {
             $info = $this->db->schema()->getTable($ref->name);
             if ($info !== null) {
@@ -818,6 +1015,20 @@ final class Executor
             }
         }
         return null;
+    }
+
+    /**
+     * The output column names of a select, resolved without executing it (used
+     * for `*` expansion over derived tables and CTEs).
+     *
+     * @return list<string>
+     */
+    private function selectOutputNames(SelectStatement $select): array
+    {
+        return \array_map(
+            static fn (array $c): string => $c['name'],
+            $this->resolveOutputColumns($select),
+        );
     }
 
     /** @param list<array{0:string,1:TableInfo}> $tables */
