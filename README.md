@@ -291,13 +291,23 @@ alternative engine used for `EXPLAIN` and available opt-in via `PRAGMA vdbe=on`.
 range, `IN`, `BETWEEN`) with automatic index maintenance on writes; index-driven joins and
 index-accelerated/count-map correlated subqueries; covering-index counts (persisted subtree
 row counts); CTEs (incl. recursive), window functions, views, triggers (incl. `INSTEAD OF`),
-`ALTER TABLE`, true WAL mode, a VDBE bytecode compiler with `EXPLAIN`; and Doctrine DBAL
-and Eloquent adapters.
+`ALTER TABLE`, true WAL mode, a VDBE bytecode compiler with `EXPLAIN`; the **JSON1** functions
+(`json`, `json_extract`, `json_type`, `json_valid`, `json_quote`, `json_array`, `json_object`,
+`json_array_length`, `json_set`/`insert`/`replace`/`remove`/`patch`), the `->` and `->>`
+operators, the `json_group_array`/`json_group_object` aggregates, and the `json_each`/`json_tree`
+table-valued functions; and Doctrine DBAL and Eloquent adapters.
 
-**Not yet implemented (planned):** JSON1 and FTS5 extensions, generated columns, foreign-key
+**Not yet implemented (planned):** FTS5 extension, generated columns, foreign-key
 enforcement, `RETURNING`, and full VDBE execution of every query (today the VM covers
 single-table scans and the tree-walker handles the rest). Byte-level `sqlite3` *file*
 interop is out of scope by design.
+
+JSON1 has two documented divergences from SQLite, both stemming from YetiSQL's value
+model having no JSON "subtype": (1) feeding one JSON function's text output into another
+embeds it as a string rather than as JSON (e.g. `json_array(json('[1]'))` yields `["[1]"]`,
+not `[[1]]`); plain-column inputs match. (2) `json()` normalizes numeric literals while
+re-minifying, so a redundant trailing zero is dropped (`json('[2.50]')` &rarr; `[2.5]`);
+extracted and constructed values are unaffected.
 
 ## Testing
 

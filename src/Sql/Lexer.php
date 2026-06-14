@@ -238,8 +238,12 @@ final class Lexer
 
     private function operator(int $start): Token
     {
+        if (\substr($this->sql, $this->pos, 3) === '->>') {
+            $this->pos += 3;
+            return new Token(Token::OP, '->>', $start);
+        }
         $two = \substr($this->sql, $this->pos, 2);
-        if (\in_array($two, ['==', '!=', '<>', '<=', '>=', '||', '<<', '>>'], true)) {
+        if (\in_array($two, ['==', '!=', '<>', '<=', '>=', '||', '<<', '>>', '->'], true)) {
             $this->pos += 2;
             return new Token(Token::OP, $two, $start);
         }

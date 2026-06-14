@@ -4867,18 +4867,24 @@ final class Executor
             'pragma_index_list' => ['seq', 'name', 'unique', 'origin', 'partial'],
             'pragma_index_info', 'pragma_index_xinfo' => ['seqno', 'cid', 'name'],
             'pragma_foreign_key_list' => ['id', 'seq', 'table', 'from', 'to', 'on_update', 'on_delete', 'match'],
+            'json_each', 'json_tree' => ['key', 'value', 'type', 'atom', 'id', 'parent', 'fullkey', 'path'],
             default => throw new SqlException("no such table-valued function: $func"),
         };
     }
 
     private function tvfTableInfo(string $func, string $alias): TableInfo
     {
-        $numeric = ['cid', 'notnull', 'pk', 'seq', 'seqno', 'unique', 'partial', 'id', 'hidden'];
+        $numeric = ['cid', 'notnull', 'pk', 'seq', 'seqno', 'unique', 'partial', 'id', 'hidden', 'parent'];
+        // json_each/json_tree key/value/atom carry native JSON types, so they
+        // must not be coerced — give them BLOB (no) affinity.
+        $noAffinity = ['key', 'value', 'atom'];
         $columns = [];
         foreach ($this->tvfColumns($func) as $name) {
-            $aff = \in_array($name, $numeric, true)
-                ? \YetiDevWorks\YetiSQL\Types\Affinity::INTEGER
-                : \YetiDevWorks\YetiSQL\Types\Affinity::TEXT;
+            $aff = match (true) {
+                \in_array($name, $noAffinity, true) => \YetiDevWorks\YetiSQL\Types\Affinity::BLOB,
+                \in_array($name, $numeric, true) => \YetiDevWorks\YetiSQL\Types\Affinity::INTEGER,
+                default => \YetiDevWorks\YetiSQL\Types\Affinity::TEXT,
+            };
             $columns[] = new \YetiDevWorks\YetiSQL\Engine\ColumnInfo($name, null, $aff);
         }
         return new TableInfo($alias, 0, $columns);
@@ -4890,9 +4896,121 @@ final class Executor
      */
     private function tvfRows(string $func, array $argVals): array
     {
+        $lc = \strtolower($func);
+        if ($lc === 'json_each' || $lc === 'json_tree') {
+            return $this->jsonTvfRows($lc, $argVals);
+        }
         $arg = isset($argVals[0]) ? (string) Value::toText($argVals[0]) : '';
         $kind = \strtolower((string) \preg_replace('/^pragma_/', '', \strtolower($func)));
         return $this->pragmaFunctionResult($kind, $arg)->rows;
+    }
+
+    /**
+     * Rows for json_each (immediate children) / json_tree (recursive walk).
+     * Columns: key, value, type, atom, id, parent, fullkey, path. The `id` and
+     * `parent` values are a stable in-document numbering (SQLite's are internal
+     * byte offsets, deliberately implementation-defined).
+     *
+     * @param list<null|int|float|string|Blob> $argVals
+     * @return list<list<null|int|float|string|Blob>>
+     */
+    private function jsonTvfRows(string $func, array $argVals): array
+    {
+        if (($argVals[0] ?? null) === null) {
+            return [];
+        }
+        $root = \YetiDevWorks\YetiSQL\Functions\Json::decode((string) Value::toText($argVals[0]));
+        $basePath = '$';
+        if (\array_key_exists(1, $argVals)) {
+            if ($argVals[1] === null) {
+                return [];
+            }
+            $basePath = (string) Value::toText($argVals[1]);
+            $root = \YetiDevWorks\YetiSQL\Functions\Json::resolve($root, \YetiDevWorks\YetiSQL\Functions\Json::parsePath($basePath));
+            if ($root === \YetiDevWorks\YetiSQL\Functions\Json::MISSING) {
+                return [];
+            }
+        }
+        $rows = [];
+        $counter = 0;
+        if ($func === 'json_tree') {
+            $this->jsonTreeWalk($root, null, null, $basePath, $basePath, $rows, $counter);
+        } else {
+            $this->jsonEachRows($root, $basePath, $rows, $counter);
+        }
+        return $rows;
+    }
+
+    /**
+     * json_each: one row per immediate child of a container, or a single row for
+     * the node itself when it is a scalar. parent is always NULL.
+     *
+     * @param list<list<null|int|float|string|Blob>> $rows
+     */
+    private function jsonEachRows(mixed $node, string $basePath, array &$rows, int &$counter): void
+    {
+        if (\is_array($node)) {
+            foreach ($node as $i => $child) {
+                $rows[] = $this->jsonRow($i, $child, $counter++, null, $basePath . '[' . $i . ']', $basePath);
+            }
+        } elseif ($node instanceof \stdClass) {
+            foreach (\get_object_vars($node) as $name => $child) {
+                $full = $basePath . $this->jsonKeySegment((string) $name);
+                $rows[] = $this->jsonRow((string) $name, $child, $counter++, null, $full, $basePath);
+            }
+        } else {
+            $rows[] = $this->jsonRow(null, $node, $counter++, null, $basePath, $basePath);
+        }
+    }
+
+    /**
+     * json_tree: depth-first walk emitting every node, root first.
+     *
+     * @param list<list<null|int|float|string|Blob>> $rows
+     */
+    private function jsonTreeWalk(mixed $node, null|int|string $key, ?int $parentId, string $fullkey, string $path, array &$rows, int &$counter): void
+    {
+        $id = $counter++;
+        $rows[] = $this->jsonRow($key, $node, $id, $parentId, $fullkey, $path);
+
+        if (\is_array($node)) {
+            foreach ($node as $i => $child) {
+                $this->jsonTreeWalk($child, $i, $id, $fullkey . '[' . $i . ']', $fullkey, $rows, $counter);
+            }
+        } elseif ($node instanceof \stdClass) {
+            foreach (\get_object_vars($node) as $name => $child) {
+                $this->jsonTreeWalk($child, (string) $name, $id, $fullkey . $this->jsonKeySegment((string) $name), $fullkey, $rows, $counter);
+            }
+        }
+    }
+
+    /**
+     * Build one json_each/json_tree row: [key, value, type, atom, id, parent, fullkey, path].
+     *
+     * @return list<null|int|float|string|Blob>
+     */
+    private function jsonRow(null|int|string $key, mixed $node, int $id, ?int $parentId, string $fullkey, string $path): array
+    {
+        $isContainer = \is_array($node) || $node instanceof \stdClass;
+        $value = \YetiDevWorks\YetiSQL\Functions\Json::toSqlValue($node);
+        return [
+            $key,
+            $value,
+            \YetiDevWorks\YetiSQL\Functions\Json::typeName($node),
+            $isContainer ? null : $value,
+            $id,
+            $parentId,
+            $fullkey,
+            $path,
+        ];
+    }
+
+    /** A fullkey object segment: ".name" for a simple key, else quoted. */
+    private function jsonKeySegment(string $name): string
+    {
+        return \preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $name) === 1
+            ? '.' . $name
+            : '."' . \str_replace('"', '""', $name) . '"';
     }
 
     private function requireTable(string $name): TableInfo

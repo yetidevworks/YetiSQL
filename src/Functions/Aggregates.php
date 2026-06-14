@@ -18,6 +18,7 @@ final class Aggregates
     {
         return \in_array(\strtolower($name), [
             'count', 'sum', 'total', 'avg', 'min', 'max', 'group_concat', 'string_agg',
+            'json_group_array', 'json_group_object',
         ], true);
     }
 
@@ -33,6 +34,10 @@ final class Aggregates
             public array $parts = [];
             public string $sep = ',';
             public bool $any = false;
+            /** @var list<mixed> values for json_group_array */
+            public array $jsonArray = [];
+            /** @var list<string> pre-encoded "key":value members for json_group_object */
+            public array $jsonObject = [];
             /** @var array<string,true> seen argument keys, for DISTINCT aggregates */
             public array $seen = [];
 
@@ -73,7 +78,7 @@ final class Aggregates
         }
 
         $v = $args[0] ?? null;
-        if ($v === null && !\in_array($name, ['group_concat', 'string_agg'], true)) {
+        if ($v === null && !\in_array($name, ['group_concat', 'string_agg', 'json_group_array', 'json_group_object'], true)) {
             return; // SQLite aggregates ignore NULL inputs
         }
 
@@ -111,6 +116,18 @@ final class Aggregates
                 $acc->parts[] = (string) Value::toText($v);
                 $acc->sep = isset($args[1]) ? (string) Value::toText($args[1]) : ',';
                 break;
+
+            case 'json_group_array':
+                $acc->any = true;
+                $acc->jsonArray[] = Json::sqlToJson($v);
+                break;
+
+            case 'json_group_object':
+                // Built as text members so duplicate keys are kept (as SQLite does).
+                $acc->any = true;
+                $acc->jsonObject[] = Json::encode((string) Value::toText($v))
+                    . ':' . Json::encode(Json::sqlToJson($args[1] ?? null));
+                break;
         }
     }
 
@@ -139,6 +156,8 @@ final class Aggregates
             'group_concat', 'string_agg' => $acc->parts === []
                 ? null
                 : \implode($acc->sep ?? ',', $acc->parts),
+            'json_group_array' => Json::encode($acc->jsonArray),
+            'json_group_object' => '{' . \implode(',', $acc->jsonObject) . '}',
             default => null,
         };
     }

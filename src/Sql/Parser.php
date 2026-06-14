@@ -1157,10 +1157,17 @@ final class Parser
 
     private function concatExpr(): Expr
     {
+        // `||`, `->`, and `->>` share one precedence level (left-associative),
+        // just above the multiplicative operators, matching SQLite.
         $left = $this->unaryExpr();
-        while ($this->peek()->is(Token::OP, '||')) {
-            $this->advance();
-            $left = Expr::bin('||', $left, $this->unaryExpr());
+        while (true) {
+            $t = $this->peek();
+            if ($t->is(Token::OP, '||') || $t->is(Token::OP, '->') || $t->is(Token::OP, '->>')) {
+                $op = $this->advance()->value;
+                $left = Expr::bin($op, $left, $this->unaryExpr());
+            } else {
+                break;
+            }
         }
         return $left;
     }

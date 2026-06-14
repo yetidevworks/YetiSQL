@@ -8,6 +8,7 @@ use YetiDevWorks\YetiSQL\Engine\Blob;
 use YetiDevWorks\YetiSQL\Engine\TableInfo;
 use YetiDevWorks\YetiSQL\Exception\SqlException;
 use YetiDevWorks\YetiSQL\Functions\Aggregates;
+use YetiDevWorks\YetiSQL\Functions\Json;
 use YetiDevWorks\YetiSQL\Functions\ScalarFunctions;
 use YetiDevWorks\YetiSQL\Sql\Ast\Expr;
 use YetiDevWorks\YetiSQL\Sql\Ast\SelectStatement;
@@ -297,6 +298,10 @@ final class Evaluator
             return $this->compileComparison($e, $op, $lc, $rc, $info, $alias);
         }
 
+        if ($op === '->' || $op === '->>') {
+            return static fn (RowEnv $env, Evaluator $ev): null|int|float|string
+                => $ev->jsonArrow($op, $lc($env, $ev), $rc($env, $ev));
+        }
         if ($op === '||') {
             return static function (RowEnv $env, Evaluator $ev) use ($lc, $rc): ?string {
                 $l = $lc($env, $ev);
@@ -727,6 +732,9 @@ final class Evaluator
             return $this->compareOp($op, $l, $r, $e, $env) ? 1 : 0;
         }
 
+        if ($op === '->' || $op === '->>') {
+            return $this->jsonArrow($op, $l, $r);
+        }
         if ($op === '||') {
             if ($l === null || $r === null) {
                 return null;
@@ -816,6 +824,9 @@ final class Evaluator
             }
             return $this->compareOp($op, $l, $r, $e, $env) ? 1 : 0;
         }
+        if ($op === '->' || $op === '->>') {
+            return $this->jsonArrow($op, $l, $r);
+        }
         if ($op === '||') {
             if ($l === null || $r === null) {
                 return null;
@@ -854,6 +865,26 @@ final class Evaluator
             '~' => ~((int) Value::toNumber($v)),
             default => throw new SqlException("bad unary op $op"),
         };
+    }
+
+    /**
+     * The `->` and `->>` JSON operators. `->` returns the located value as JSON
+     * text; `->>` returns it as a SQL value. NULL on either side, or a path that
+     * matches nothing, yields NULL; malformed JSON raises (matching SQLite).
+     */
+    public function jsonArrow(string $op, mixed $l, mixed $r): null|int|float|string
+    {
+        if ($l === null || $r === null) {
+            return null;
+        }
+        $found = Json::resolve(
+            Json::decode((string) Value::toText($l)),
+            Json::arrowSegments($r),
+        );
+        if ($found === Json::MISSING) {
+            return null;
+        }
+        return $op === '->' ? Json::encode($found) : Json::toSqlValue($found);
     }
 
     /**
