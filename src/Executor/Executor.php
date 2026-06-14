@@ -2221,6 +2221,9 @@ final class Executor
         }
 
         $count = 0;
+        if (isset($plan['eqPrefix'])) {
+            return $this->tryCoveredCompositeCount($plan);
+        }
         if ($plan['kind'] === 'index_eq') {
             /** @var \YetiDevWorks\YetiSQL\Engine\IndexInfo $index */
             $index = $plan['index'];
@@ -2294,6 +2297,37 @@ final class Executor
             return [[$cached]];
         }
         $count = $tree->countRange($low, $lowInc, $high, $highInc);
+        $this->rememberCoveredCount($key, $count);
+        return [[$count]];
+    }
+
+    /** @param array<string,mixed> $plan */
+    private function tryCoveredCompositeCount(array $plan): array
+    {
+        /** @var \YetiDevWorks\YetiSQL\Engine\IndexInfo $index */
+        $index = $plan['index'];
+        $keyParts = ['prefix'];
+        foreach ($plan['eqPrefix'] as $value) {
+            $keyParts[] = $this->valueKey($value);
+        }
+        if ($plan['kind'] === 'index_range') {
+            $keyParts[] = 'range';
+            $keyParts[] = $this->valueKey($plan['low']);
+            $keyParts[] = $plan['lowInc'] ? '1' : '0';
+            $keyParts[] = $this->valueKey($plan['high']);
+            $keyParts[] = $plan['highInc'] ? '1' : '0';
+        }
+
+        $key = $this->coveredCountCacheKey($index->rootPage, 'index_prefix', $keyParts);
+        $cached = $this->coveredCountCache[$key] ?? null;
+        if ($cached !== null) {
+            return [[$cached]];
+        }
+
+        $count = 0;
+        foreach ($this->indexPrefixEntries($plan) as $_) {
+            $count++;
+        }
         $this->rememberCoveredCount($key, $count);
         return [[$count]];
     }
@@ -3321,6 +3355,7 @@ final class Executor
         // Bucket the simple `col OP const` conjuncts by column position.
         $eq = [];
         $ranges = [];
+        $parsed = [];
         foreach ($conjuncts as $conj) {
             if ($conj->kind !== Expr::BIN || !\in_array($conj->op, ['=', '<', '<=', '>', '>='], true)) {
                 continue;
@@ -3334,6 +3369,7 @@ final class Executor
                 continue; // a NULL comparison is never true; the residual filter handles it
             }
             $op = $flip ? $this->flipOp((string) $conj->op) : (string) $conj->op;
+            $parsed[] = ['pos' => $pos, 'op' => $op];
             if ($op === '=') {
                 $eq[$pos] = $value;
                 continue;
@@ -3377,7 +3413,11 @@ final class Executor
             return null;
         }
 
-        $plan = ['index' => $best['index'], 'eqPrefix' => $best['prefix'], 'coveredAll' => false];
+        $plan = [
+            'index' => $best['index'],
+            'eqPrefix' => $best['prefix'],
+            'coveredAll' => $this->compositePlanCoversAll($conjuncts, $parsed, $best['index'], $best['prefix'], $best['range']),
+        ];
         if ($best['range'] !== null) {
             $plan['kind'] = 'index_range';
             $plan += $best['range'];
@@ -3385,6 +3425,32 @@ final class Executor
             $plan['kind'] = 'index_eq';
         }
         return $plan;
+    }
+
+    /**
+     * @param list<Expr> $conjuncts
+     * @param list<array{pos:int,op:string}> $parsed
+     * @param list<null|int|float|string|Blob> $prefix
+     * @param ?array<string,mixed> $range
+     */
+    private function compositePlanCoversAll(array $conjuncts, array $parsed, \YetiDevWorks\YetiSQL\Engine\IndexInfo $index, array $prefix, ?array $range): bool
+    {
+        if (\count($parsed) !== \count($conjuncts)) {
+            return false;
+        }
+
+        $prefixCols = \array_slice($index->columnPositions, 0, \count($prefix));
+        $rangePos = $range !== null ? ($index->columnPositions[\count($prefix)] ?? null) : null;
+        foreach ($parsed as $term) {
+            if (\in_array($term['pos'], $prefixCols, true)) {
+                continue;
+            }
+            if ($rangePos !== null && $term['pos'] === $rangePos && $term['op'] !== '=') {
+                continue;
+            }
+            return false;
+        }
+        return true;
     }
 
     /**

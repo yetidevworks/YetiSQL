@@ -33,6 +33,8 @@ final class MultiColumnIndexTest extends TestCase
             'SELECT id FROM t WHERE a = 5 AND b = 5 AND id % 2 = 0 ORDER BY id',
             'SELECT id FROM t WHERE b = 2 AND a = 9 ORDER BY id',
             'SELECT COUNT(*) FROM t WHERE a = 3 AND b = 5',
+            'SELECT COUNT(*) FROM t WHERE a = 4 AND b >= 3 AND b <= 6',
+            'SELECT COUNT(*) FROM t WHERE a = 5 AND b = 5 AND id % 2 = 0',
             'SELECT id FROM t WHERE a = 3 AND b = 99 ORDER BY id',
             'SELECT id FROM t WHERE a = 6 AND b = 4 AND c IN (\'x\',\'z\') ORDER BY id',
         ];
