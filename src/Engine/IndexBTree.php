@@ -73,6 +73,29 @@ final class IndexBTree
         yield from $this->scanPageFrom($this->rootPage, $lowKey);
     }
 
+    /**
+     * Return the first key whose leading fields equal $prefix, or null when no
+     * such key exists. This is the hot path for UNIQUE conflict checks: it does
+     * one tree descent plus a leaf binary search instead of constructing a
+     * generator over the generic range scanner.
+     *
+     * @param list<null|int|float|string|Blob> $prefix
+     * @return array<int,null|int|float|string|Blob>|null
+     */
+    public function firstWithPrefix(array $prefix): ?array
+    {
+        $key = $this->firstFromPage($this->rootPage, $prefix);
+        if ($key === null) {
+            return null;
+        }
+        foreach ($prefix as $i => $value) {
+            if (Value::compare($key[$i] ?? null, $value, $this->collations[$i] ?? 'BINARY') !== 0) {
+                return null;
+            }
+        }
+        return $key;
+    }
+
     public function countLeadingRange(
         null|int|float|string|Blob $low,
         bool $lowInc,
@@ -110,6 +133,41 @@ final class IndexBTree
             $lowKey = null; // everything after the first qualifying subtree is in range
         }
         yield from $this->scanPageFrom($page->rightChild, $lowKey);
+    }
+
+    /** @param list<null|int|float|string|Blob> $lowKey */
+    private function firstFromPage(int $pageNo, array $lowKey): ?array
+    {
+        $page = $this->pager->readPage($pageNo);
+
+        if ($page->isLeaf()) {
+            $cells = $page->cells;
+            $lo = 0;
+            $hi = \count($cells) - 1;
+            $found = -1;
+            while ($lo <= $hi) {
+                $mid = ($lo + $hi) >> 1;
+                if ($this->compareKeys($this->cellKey($cells[$mid]), $lowKey) >= 0) {
+                    $found = $mid;
+                    $hi = $mid - 1;
+                } else {
+                    $lo = $mid + 1;
+                }
+            }
+            return $found === -1 ? null : $this->cellKey($cells[$found]);
+        }
+
+        foreach ($page->cells as $cell) {
+            [$child, $sep] = $this->parseInteriorCell($cell);
+            if ($this->compareKeys($sep, $lowKey) < 0) {
+                continue;
+            }
+            $found = $this->firstFromPage($child, $lowKey);
+            if ($found !== null) {
+                return $found;
+            }
+        }
+        return $this->firstFromPage($page->rightChild, $lowKey);
     }
 
     private function countLeadingPage(

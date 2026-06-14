@@ -4116,7 +4116,12 @@ final class Executor
             $cols[] = $v;
         }
         $n = \count($cols);
-        foreach ($this->indexTree($index)->scanFrom($cols) as $key) {
+        $tree = $this->indexTree($index);
+        if ($excludeRowid === null) {
+            $key = $tree->firstWithPrefix($cols);
+            return $key !== null ? (int) $key[\count($key) - 1] : null;
+        }
+        foreach ($tree->scanFrom($cols) as $key) {
             for ($i = 0; $i < $n; $i++) {
                 if (Value::compare($key[$i], $cols[$i], $index->collations[$i] ?? 'BINARY') !== 0) {
                     return null; // scanned past the block of matching keys
