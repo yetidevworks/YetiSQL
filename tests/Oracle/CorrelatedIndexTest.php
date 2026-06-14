@@ -19,12 +19,14 @@ use YetiDevWorks\YetiSQL\PDO as YetiPDO;
 final class CorrelatedIndexTest extends TestCase
 {
     /** @param array<int,YetiPDO|RealPDO> $dbs */
-    private function seed(array $dbs): void
+    private function seed(array $dbs, bool $withIndex = true): void
     {
         foreach ($dbs as $db) {
             $db->exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
             $db->exec('CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, score INTEGER)');
-            $db->exec('CREATE INDEX idx_posts_user ON posts(user_id)');
+            if ($withIndex) {
+                $db->exec('CREATE INDEX idx_posts_user ON posts(user_id)');
+            }
             for ($i = 1; $i <= 20; $i++) {
                 $db->exec("INSERT INTO users VALUES ($i, 'u$i')");
             }
@@ -67,6 +69,56 @@ final class CorrelatedIndexTest extends TestCase
             $real->query($countSql)->fetchAll(RealPDO::FETCH_NUM),
             $yeti->query($countSql)->fetchAll(YetiPDO::FETCH_NUM),
             'correlated counts after write',
+        );
+    }
+
+    public function testCorrelatedUnindexedCountSubqueriesMatchSqlite(): void
+    {
+        $yeti = new YetiPDO('yetisql::memory:');
+        $real = new RealPDO('sqlite::memory:');
+        $real->setAttribute(RealPDO::ATTR_ERRMODE, RealPDO::ERRMODE_EXCEPTION);
+        $this->seed([$yeti, $real], withIndex: false);
+
+        $countSql = 'SELECT u.id, (SELECT COUNT(*) FROM posts p WHERE p.user_id = u.id) c FROM users u ORDER BY u.id';
+        self::assertSame(
+            $real->query($countSql)->fetchAll(RealPDO::FETCH_NUM),
+            $yeti->query($countSql)->fetchAll(YetiPDO::FETCH_NUM),
+            'uncached unindexed correlated counts',
+        );
+        self::assertSame(
+            $real->query($countSql)->fetchAll(RealPDO::FETCH_NUM),
+            $yeti->query($countSql)->fetchAll(YetiPDO::FETCH_NUM),
+            'cached unindexed correlated counts',
+        );
+
+        foreach ([$yeti, $real] as $db) {
+            $db->exec('INSERT INTO posts VALUES (999, 1, 5)');
+            $db->exec('DELETE FROM posts WHERE user_id = 2');
+        }
+        self::assertSame(
+            $real->query($countSql)->fetchAll(RealPDO::FETCH_NUM),
+            $yeti->query($countSql)->fetchAll(YetiPDO::FETCH_NUM),
+            'uncached unindexed correlated counts after write',
+        );
+    }
+
+    public function testCorrelatedUnindexedCountHonorsNocaseCollation(): void
+    {
+        $yeti = new YetiPDO('yetisql::memory:');
+        $real = new RealPDO('sqlite::memory:');
+        $real->setAttribute(RealPDO::ATTR_ERRMODE, RealPDO::ERRMODE_EXCEPTION);
+        foreach ([$yeti, $real] as $db) {
+            $db->exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+            $db->exec('CREATE TABLE posts (id INTEGER PRIMARY KEY, user_name TEXT COLLATE NOCASE)');
+            $db->exec("INSERT INTO users VALUES (1, 'ann'), (2, 'BOB'), (3, 'Cy')");
+            $db->exec("INSERT INTO posts VALUES (1, 'ANN'), (2, 'ann'), (3, 'bob'), (4, 'BOB'), (5, 'cy')");
+        }
+
+        $sql = 'SELECT u.id, (SELECT COUNT(*) FROM posts p WHERE p.user_name = u.name) c FROM users u ORDER BY u.id';
+        self::assertSame(
+            $real->query($sql)->fetchAll(RealPDO::FETCH_NUM),
+            $yeti->query($sql)->fetchAll(YetiPDO::FETCH_NUM),
+            'uncached correlated counts with NOCASE collation',
         );
     }
 }

@@ -54,6 +54,8 @@ final class Executor
     private const COVERED_COUNT_CACHE_MAX = 1024;
     /** @var array<int,array{cookie:int,changes:int,root:int,rows:list<list<null|int|float|string|Blob>>}> */
     private array $groupedAggregateCache = [];
+    /** @var array<int,array{cookie:int,changes:int,root:int,pos:int,sig:string,map:array<string,int>}> */
+    private array $correlatedCountCache = [];
     /** @var \WeakMap<SelectStatement,string> */
     private \WeakMap $selectSignatures;
 
@@ -2115,6 +2117,16 @@ final class Executor
 
         $pos = $plan['pos'];
         $coll = $pos >= 0 ? $info->columns[$pos]->collation : 'BINARY';
+        if ($plan['op'] === '='
+            && $eval->outerEnv !== null
+            && $pos >= 0
+            && $pos !== $info->rowidAlias
+            && $this->indexLeading($this->db->schema()->resolvedIndexes($info->name), $pos) === null) {
+            $count = $this->tryCachedCorrelatedCount($select, $info, $pos, $plan['value']);
+            if ($count !== null) {
+                return [[$count]];
+            }
+        }
         $keyParts = [(string) $pos, (string) $plan['op']];
         if ($plan['op'] === 'between') {
             $keyParts[] = $this->valueKey($plan['low']);
@@ -2146,6 +2158,67 @@ final class Executor
 
         $this->rememberCoveredCount($key, $count);
         return [[$count]];
+    }
+
+    private function tryCachedCorrelatedCount(SelectStatement $select, TableInfo $info, int $pos, null|int|float|string|Blob $value): ?int
+    {
+        if ($this->db->inTransaction()) {
+            return null;
+        }
+        if ($pos >= 0
+            && $pos !== $info->rowidAlias
+            && \strcasecmp($info->columns[$pos]->collation, 'BINARY') !== 0) {
+            return null;
+        }
+        $value = $this->joinHashValue($info, $pos, $value);
+        if ($value === null) {
+            return 0;
+        }
+
+        $cacheId = \spl_object_id($select);
+        $sig = $this->selectSignature($select);
+        $cached = $this->correlatedCountCache[$cacheId] ?? null;
+        if ($cached === null
+            || $cached['cookie'] !== $this->db->pager()->schemaCookie()
+            || $cached['changes'] !== $this->db->totalChanges()
+            || $cached['root'] !== $info->rootPage
+            || $cached['pos'] !== $pos
+            || $cached['sig'] !== $sig) {
+            $cached = [
+                'cookie' => $this->db->pager()->schemaCookie(),
+                'changes' => $this->db->totalChanges(),
+                'root' => $info->rootPage,
+                'pos' => $pos,
+                'sig' => $sig,
+                'map' => $this->buildCountMap($info, $pos),
+            ];
+            if (\count($this->correlatedCountCache) >= self::SELECT_META_MAX) {
+                $this->correlatedCountCache = [];
+            }
+            $this->correlatedCountCache[$cacheId] = $cached;
+        }
+
+        return $cached['map'][$this->valueKey($value)] ?? 0;
+    }
+
+    /** @return array<string,int> */
+    private function buildCountMap(TableInfo $info, int $pos): array
+    {
+        $counts = [];
+        $tree = new TableBTree($this->db->pager(), $info->rootPage);
+        foreach ($tree->scan() as [$rowid, $payload]) {
+            if ($pos < 0 || $pos === $info->rowidAlias) {
+                $value = $rowid;
+            } else {
+                $value = RecordCodec::decodeColumn($payload, $pos);
+            }
+            if ($value === null) {
+                continue;
+            }
+            $key = $this->valueKey($value);
+            $counts[$key] = ($counts[$key] ?? 0) + 1;
+        }
+        return $counts;
     }
 
     /** @return array<string,mixed>|null */

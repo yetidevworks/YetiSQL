@@ -120,8 +120,9 @@ function runSuite(object $db, int $rows, int $lookups, bool $withIndex): array
         }
     });
 
-    // 8. Correlated subquery: per outer user, count their posts. (Currently the
-    //    inner lookup scans — a natural next index-acceleration target.)
+    // 8. Correlated subquery: per outer user, count their posts. With an index
+    //    this is a covered seek; without one, COUNT(*) over inner_col = outer_col
+    //    builds a transient count map instead of rescanning the inner table.
     $r['correlated'] = timeit(function () use ($db) {
         $db->query('SELECT u.id, (SELECT COUNT(*) FROM posts p WHERE p.user_id = u.id) FROM users u WHERE u.id <= 100')->fetchAll();
     });
@@ -223,8 +224,8 @@ foreach ($labels as $key => $label) {
 echo \str_repeat('-', 78) . "\n";
 echo "'YetiSQL+idx' uses indexes; 'YetiSQL scan' has no secondary indexes.\n";
 echo "The gap between those columns is what persistent indexes buy. Equality joins\n";
-echo "without indexes can still use a transient hash table; correlated subqueries\n";
-echo "without indexes still scan the inner table per outer row.\n";
+echo "without indexes can still use a transient hash table; unindexed equality\n";
+echo "COUNT(*) correlated subqueries can use a transient count map.\n";
 
 // --- WAL vs rollback journal (file-backed durability) ---------------------
 $WAL_OPS = 2000;

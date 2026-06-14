@@ -189,14 +189,14 @@ index-based planning buys. Representative run (in-memory, 5000 rows, PHP 8.3):
 ```
 workload                           SQLite  YetiSQL+idx  YetiSQL scan  vs SQLite
 ------------------------------------------------------------------------------
-bulk insert                        2.8 ms    120.3 ms     122.9 ms         43x
-PK lookups (×2000)                 1.3 ms     49.5 ms      44.7 ms         38x
-city COUNT (×200, ~20% rows)       2.9 ms      8.7 ms      84.8 ms          3x
-range query (×200)                 1.8 ms      4.0 ms      19.0 ms          2x
-group-by aggregate (×50)          31.0 ms     25.8 ms      25.2 ms          1x
-PK updates (×1000)                 0.5 ms     39.1 ms      35.9 ms         78x
-join users⋈posts (×3, ≤100)        0.0 ms     48.8 ms      41.8 ms      1888x
-correlated subquery (≤100)         0.0 ms     12.6 ms      1.41 s        369x
+bulk insert                        2.9 ms    127.2 ms     126.4 ms         44x
+PK lookups (×2000)                 1.3 ms     50.2 ms      45.3 ms         40x
+city COUNT (×200, ~20% rows)       2.9 ms      8.9 ms      86.7 ms          3x
+range query (×200)                 2.0 ms      3.9 ms      19.9 ms          2x
+group-by aggregate (×50)          32.1 ms     25.8 ms      25.9 ms          1x
+PK updates (×1000)                 0.6 ms     41.2 ms      37.0 ms         69x
+join users⋈posts (×3, ≤100)        0.0 ms     52.2 ms      43.5 ms       1092x
+correlated subquery (≤100)         0.1 ms     13.1 ms      15.1 ms        191x
 ```
 
 ```bash
@@ -206,12 +206,13 @@ php benchmarks/bench.php [rows]    # default 5000
 Takeaways:
 - **Index planning is the headline.** The `YetiSQL+idx` vs `YetiSQL scan` gap is
   what persistent indexes buy: selective `COUNT` is ~10×, range queries ~5×,
-  and **index-accelerated correlated subqueries ~110×** faster than the
-  equivalent full-scan-per-row. Equality joins without a persistent index can
-  still use a transient hash table, so the no-index join case avoids the old
-  full-inner-scan cost. Covered `COUNT(*)` over full tables, rowid ranges, and
-  leading-column index predicates count B-tree cells directly without fetching
-  rows, and `UPDATE` only re-indexes columns that change.
+  and index-accelerated correlated subqueries stay a little faster than the
+  no-index count-map path. Equality joins without a persistent index can still
+  use a transient hash table, and unindexed equality `COUNT(*)` correlated
+  subqueries can build a transient count map, so both avoid the old
+  full-inner-scan-per-outer-row cost. Covered `COUNT(*)` over full tables,
+  rowid ranges, and leading-column index predicates count B-tree cells directly
+  without fetching rows, and `UPDATE` only re-indexes columns that change.
 - **For indexed, set-oriented work YetiSQL is competitive with SQLite** in this
   in-memory harness — the group-by aggregate and indexed COUNT/range rows are
   within single-digit multiples (sometimes faster, since there's no driver/IPC
@@ -235,8 +236,9 @@ Hot-path optimisations already in place: an LRU page cache, a parsed-page cache
 (so repeated reads skip re-decoding), single-pass page encoding, binary-search
 rowid lookups, lazy/early-stop index scans, multi-column index prefix seeks,
 index-driven joins and correlated subqueries, covered table/index counts, and a
-transient hash table for unindexed equality joins, plus a compiled-closure plan
-cache for the per-row hot loop.
+transient hash table for unindexed equality joins, transient count maps for
+unindexed equality `COUNT(*)` correlated subqueries, plus a compiled-closure
+plan cache for the per-row hot loop.
 
 ### VDBE & EXPLAIN
 
@@ -287,8 +289,8 @@ alternative engine used for `EXPLAIN` and available opt-in via `PRAGMA vdbe=on`.
 
 **Working:** secondary-index, multi-column-index, and rowid query planning (equality,
 range, `IN`, `BETWEEN`) with automatic index maintenance on writes; index-driven joins and
-index-accelerated correlated subqueries; covering-index counts (persisted subtree row
-counts); CTEs (incl. recursive), window functions, views, triggers (incl. `INSTEAD OF`),
+index-accelerated/count-map correlated subqueries; covering-index counts (persisted subtree
+row counts); CTEs (incl. recursive), window functions, views, triggers (incl. `INSTEAD OF`),
 `ALTER TABLE`, true WAL mode, a VDBE bytecode compiler with `EXPLAIN`; and Doctrine DBAL
 and Eloquent adapters.
 
