@@ -488,6 +488,23 @@ final class Executor
             $sources[0]['scanner'] = fn (): \Generator => $this->scanRowids($info, $alias, $where, $eval);
         }
 
+        // Index nested-loop joins: for each inner table whose ON condition has an
+        // equi-join `inner.col = <outer expr>` and a usable access path on
+        // inner.col (rowid or index), seek the matching inner rows per outer row
+        // instead of re-scanning the whole inner table. joinMatches still applies
+        // the full ON, so the result is identical to the plain nested loop.
+        foreach ($select->joins as $j => $join) {
+            $src = $sources[$j + 1];
+            if (($src['kind'] ?? 'table') !== 'table' || ($src['empty'] ?? false) || $src['tree'] === null) {
+                continue;
+            }
+            $indexes = $this->db->schema()->resolvedIndexes($src['info']->name);
+            $key = $this->joinAccessKey($join, $src['alias'], $src['info'], $indexes);
+            if ($key !== null) {
+                $sources[$j + 1]['joinAccess'] = $key + ['indexes' => $indexes];
+            }
+        }
+
         yield from $this->joinRec($sources, $select->joins, 0, new RowEnv(), $eval);
     }
 
@@ -550,7 +567,22 @@ final class Executor
         }
 
         $matched = false;
-        if (isset($src['scanner'])) {
+        if (isset($src['joinAccess'])) {
+            // Index nested-loop: seek inner rows whose join column equals the
+            // outer key for this row. A NULL key matches nothing (NULL never
+            // equi-joins); a key with no usable plan (e.g. a non-integer value
+            // against a rowid) falls back to a scan so joinMatches can decide.
+            $acc = $src['joinAccess'];
+            $key = $eval->evaluate($acc['keyExpr'], $env);
+            if ($key === null) {
+                $scan = [];
+            } else {
+                $plan = $this->makeComparisonPlan($acc['pos'], '=', $key, $src['info'], $acc['indexes']);
+                $scan = $plan !== null
+                    ? $this->joinSeekRows($src['tree'], $plan)
+                    : $src['tree']->scan();
+            }
+        } elseif (isset($src['scanner'])) {
             $scan = ($src['scanner'])();
         } else {
             $scan = ($src['empty'] ?? false) || $src['tree'] === null ? [] : $src['tree']->scan();
@@ -2131,6 +2163,106 @@ final class Executor
             return \array_merge($this->splitAnd($e->left), $this->splitAnd($e->right));
         }
         return [$e];
+    }
+
+    /**
+     * Find an equi-join access key for an inner table: a conjunct of the ON
+     * clause shaped `inner.col = <outer expr>` where inner.col has a usable
+     * access path (rowid or index). Returns ['pos'=>int,'keyExpr'=>Expr] or null.
+     *
+     * @param list<\YetiDevWorks\YetiSQL\Engine\IndexInfo> $indexes
+     * @return array{pos:int,keyExpr:Expr}|null
+     */
+    private function joinAccessKey(JoinClause $join, ?string $innerAlias, TableInfo $innerInfo, array $indexes): ?array
+    {
+        // Only plain ON equi-joins; USING/NATURAL/CROSS fall back to a scan.
+        if ($join->on === null) {
+            return null;
+        }
+        foreach ($this->splitAnd($join->on) as $conj) {
+            if ($conj->kind !== Expr::BIN || $conj->op !== '=') {
+                continue;
+            }
+            $key = $this->equiKeyFrom($conj->left, $conj->right, $innerAlias, $innerInfo, $indexes)
+                ?? $this->equiKeyFrom($conj->right, $conj->left, $innerAlias, $innerInfo, $indexes);
+            if ($key !== null) {
+                return $key;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * @param list<\YetiDevWorks\YetiSQL\Engine\IndexInfo> $indexes
+     * @return array{pos:int,keyExpr:Expr}|null
+     */
+    private function equiKeyFrom(Expr $innerSide, Expr $outerSide, ?string $innerAlias, TableInfo $innerInfo, array $indexes): ?array
+    {
+        $pos = $this->colPositionOf($innerSide, $innerAlias, $innerInfo);
+        if ($pos === null) {
+            return null;
+        }
+        // The other side must be evaluable against the outer rows alone — it must
+        // not reference the inner table (else it is not a per-outer-row constant).
+        if ($this->exprReferencesTable($outerSide, $innerAlias, $innerInfo)) {
+            return null;
+        }
+        // Only worthwhile when inner.col can be seeked: rowid or a leading index.
+        if ($pos !== $innerInfo->rowidAlias && $this->indexLeading($indexes, $pos) === null) {
+            return null;
+        }
+        return ['pos' => $pos, 'keyExpr' => $outerSide];
+    }
+
+    /** Whether any column in $e resolves to the given (inner) table. */
+    private function exprReferencesTable(Expr $e, ?string $alias, TableInfo $info): bool
+    {
+        switch ($e->kind) {
+            case Expr::COL:
+                return $this->colPositionOf($e, $alias, $info) !== null;
+            case Expr::LIT:
+            case Expr::PARAM:
+                return false;
+            case Expr::SUBQUERY:
+            case Expr::EXISTS:
+                return true; // conservative: a subquery key is not treated as a pure outer constant
+        }
+        foreach ([$e->left, $e->right, $e->operand, $e->subject, $e->elseExpr, $e->low, $e->high, $e->escape] as $child) {
+            if ($child instanceof Expr && $this->exprReferencesTable($child, $alias, $info)) {
+                return true;
+            }
+        }
+        foreach ([...$e->args, ...$e->list] as $child) {
+            if ($this->exprReferencesTable($child, $alias, $info)) {
+                return true;
+            }
+        }
+        foreach ($e->whens as $when) {
+            if ($this->exprReferencesTable($when[0], $alias, $info) || $this->exprReferencesTable($when[1], $alias, $info)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Yield [rowid, payload] for an index/rowid equality plan, materializing the
+     * row payload for index-located rows (joins read inner columns immediately).
+     *
+     * @param array<string,mixed> $plan
+     * @return \Generator<int,array{0:int,1:string}>
+     */
+    private function joinSeekRows(TableBTree $tree, array $plan): \Generator
+    {
+        foreach ($this->scanByPlan($tree, $plan) as [$rid, $payload]) {
+            if ($payload === null) {
+                $payload = $tree->get($rid);
+                if ($payload === null) {
+                    continue;
+                }
+            }
+            yield [$rid, $payload];
+        }
     }
 
     /**
