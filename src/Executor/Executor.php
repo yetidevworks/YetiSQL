@@ -199,6 +199,10 @@ final class Executor
             if ($coveredCount !== null) {
                 return [$colNames, $coveredCount, []];
             }
+            $scanCount = $this->trySimpleScanCount($select, $outputCols, $aggregateNodes, $eval);
+            if ($scanCount !== null) {
+                return [$colNames, $scanCount, []];
+            }
             return [$colNames, ...$this->aggregateUngrouped($select, $outputCols, $aggregateNodes, $eval, $orderPlan)];
         }
 
@@ -1223,6 +1227,115 @@ final class Executor
         $count = $tree->countRange($low, $lowInc, $high, $highInc);
         $this->rememberCoveredCount($key, $count);
         return [[$count]];
+    }
+
+    /**
+     * Fast full-scan fallback for COUNT(*) over a simple single-column
+     * predicate when no covered rowid/index count applies.
+     *
+     * @param list<array{name:string,expr:?Expr,star:bool,tableStar:?string}> $outputCols
+     * @param array<int,Expr> $aggregateNodes
+     * @return list<list<int>>|null
+     */
+    private function trySimpleScanCount(SelectStatement $select, array $outputCols, array $aggregateNodes, Evaluator $eval): ?array
+    {
+        if ($select->where === null || $select->having !== null || \count($outputCols) !== 1 || \count($aggregateNodes) !== 1) {
+            return null;
+        }
+
+        $expr = $outputCols[0]['expr'];
+        if ($expr === null || $expr->kind !== Expr::FUNC || \strtolower((string) $expr->name) !== 'count' || !$expr->star || $expr->distinct) {
+            return null;
+        }
+
+        $single = $this->singleTableForCompile($select);
+        if ($single === null) {
+            return null;
+        }
+        [$info, $alias] = $single;
+
+        $plan = $this->simpleScanCountPlan($select->where, $alias, $info, $eval);
+        if ($plan === null) {
+            return null;
+        }
+        if (($plan['impossible'] ?? false) === true) {
+            return [[0]];
+        }
+
+        $pos = $plan['pos'];
+        $coll = $pos >= 0 ? $info->columns[$pos]->collation : 'BINARY';
+
+        $count = 0;
+        $tree = new TableBTree($this->db->pager(), $info->rootPage);
+        foreach ($tree->scan() as [$rowid, $payload]) {
+            if ($pos < 0 || $pos === $info->rowidAlias) {
+                $value = $rowid;
+            } else {
+                $value = RecordCodec::decodeColumn($payload, $pos);
+            }
+            if ($value === null) {
+                continue;
+            }
+            if ($this->simpleScanCountMatches($value, $plan, $coll)) {
+                $count++;
+            }
+        }
+
+        return [[$count]];
+    }
+
+    /** @return array<string,mixed>|null */
+    private function simpleScanCountPlan(Expr $where, string $alias, TableInfo $info, Evaluator $eval): ?array
+    {
+        if ($where->kind === Expr::BIN && \in_array($where->op, ['=', '<', '<=', '>', '>='], true)) {
+            [$pos, $const, $flip] = $this->colConst($where->left, $where->right, $alias, $info);
+            if ($pos === null || $const === null) {
+                return null;
+            }
+            $value = $this->affine($info, $pos, $this->constValue($const, $eval));
+            if ($value === null) {
+                return ['impossible' => true];
+            }
+            return [
+                'pos' => $pos,
+                'op' => $flip ? $this->flipOp((string) $where->op) : (string) $where->op,
+                'value' => $value,
+            ];
+        }
+
+        if ($where->kind === Expr::BETWEEN && $where->operand?->kind === Expr::COL && !$where->not) {
+            $pos = $this->colPositionOf($where->operand, $alias, $info);
+            if ($pos === null || !$this->isConstExpr($where->low) || !$this->isConstExpr($where->high)) {
+                return null;
+            }
+            $low = $this->affine($info, $pos, $this->constValue($where->low, $eval));
+            $high = $this->affine($info, $pos, $this->constValue($where->high, $eval));
+            if ($low === null || $high === null) {
+                return ['impossible' => true];
+            }
+            return ['pos' => $pos, 'op' => 'between', 'low' => $low, 'high' => $high];
+        }
+
+        return null;
+    }
+
+    /** @param array<string,mixed> $plan */
+    private function simpleScanCountMatches(null|int|float|string|Blob $value, array $plan, string $collation): bool
+    {
+        if ($plan['op'] === 'between') {
+            return Value::compare($value, $plan['low'], $collation) >= 0
+                && Value::compare($value, $plan['high'], $collation) <= 0;
+        }
+
+        $cmp = Value::compare($value, $plan['value'], $collation);
+        return match ($plan['op']) {
+            '=' => $cmp === 0,
+            '<' => $cmp < 0,
+            '<=' => $cmp <= 0,
+            '>' => $cmp > 0,
+            '>=' => $cmp >= 0,
+            default => false,
+        };
     }
 
     /** @param list<string> $parts */
