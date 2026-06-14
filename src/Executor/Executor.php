@@ -1605,7 +1605,7 @@ final class Executor
     private function simpleScanCountPlan(Expr $where, string $alias, TableInfo $info, Evaluator $eval): ?array
     {
         if ($where->kind === Expr::BIN && \in_array($where->op, ['=', '<', '<=', '>', '>='], true)) {
-            [$pos, $const, $flip] = $this->colConst($where->left, $where->right, $alias, $info);
+            [$pos, $const, $flip] = $this->colConst($where->left, $where->right, $alias, $info, $eval);
             if ($pos === null || $const === null) {
                 return null;
             }
@@ -2395,7 +2395,7 @@ final class Executor
             if ($conj->kind !== Expr::BIN || !\in_array($conj->op, ['=', '<', '<=', '>', '>='], true)) {
                 continue;
             }
-            [$pos, $const, $flip] = $this->colConst($conj->left, $conj->right, $alias, $info);
+            [$pos, $const, $flip] = $this->colConst($conj->left, $conj->right, $alias, $info, $eval);
             if ($pos === null || $pos === $info->rowidAlias) {
                 continue;
             }
@@ -2649,7 +2649,7 @@ final class Executor
     {
         // Equality / range:  col OP const
         if ($e->kind === Expr::BIN && \in_array($e->op, ['=', '<', '<=', '>', '>='], true)) {
-            [$col, $const, $flip] = $this->colConst($e->left, $e->right, $alias, $info);
+            [$col, $const, $flip] = $this->colConst($e->left, $e->right, $alias, $info, $eval);
             if ($col === null) {
                 return null;
             }
@@ -2777,17 +2777,33 @@ final class Executor
     }
 
     /** @return array{0:?int,1:?Expr,2:bool} [colPos, constExpr, flipped] */
-    private function colConst(Expr $a, Expr $b, ?string $alias, TableInfo $info): array
+    private function colConst(Expr $a, Expr $b, ?string $alias, TableInfo $info, Evaluator $eval): array
     {
         $pa = $this->colPositionOf($a, $alias, $info);
-        if ($pa !== null && $this->isConstExpr($b)) {
+        if ($pa !== null && $this->isPlannableConst($b, $alias, $info, $eval)) {
             return [$pa, $b, false];
         }
         $pb = $this->colPositionOf($b, $alias, $info);
-        if ($pb !== null && $this->isConstExpr($a)) {
+        if ($pb !== null && $this->isPlannableConst($a, $alias, $info, $eval)) {
             return [$pb, $a, true];
         }
         return [null, null, false];
+    }
+
+    /**
+     * Whether $e is a constant the planner can read now: a literal/param, or —
+     * inside a correlated subquery — an expression over only the enclosing
+     * query's columns (a per-outer-row constant). constValue() evaluates the
+     * latter against the outer scope, so an index seek can use the live value.
+     */
+    private function isPlannableConst(Expr $e, ?string $alias, TableInfo $info, Evaluator $eval): bool
+    {
+        if ($this->isConstExpr($e)) {
+            return true;
+        }
+        // exprReferencesTable() is true for any column of this (inner) table and
+        // for subqueries, so what remains references only outer columns.
+        return $eval->outerEnv !== null && !$this->exprReferencesTable($e, $alias, $info);
     }
 
     private function colPositionOf(Expr $e, ?string $alias, TableInfo $info): ?int

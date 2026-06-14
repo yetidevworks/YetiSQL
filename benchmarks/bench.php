@@ -171,6 +171,6 @@ foreach ($labels as $key => $label) {
 }
 echo \str_repeat('-', 78) . "\n";
 echo "'YetiSQL+idx' uses indexes; 'YetiSQL scan' has no secondary indexes.\n";
-echo "The gap between those two columns is what index-based planning buys —\n";
-echo "see 'join' (index nested-loop seek vs full inner scan). 'correlated' shows\n";
-echo "no gap yet: correlated subqueries still scan the inner table per outer row.\n";
+echo "The gap between those two columns is what index-based planning buys — see\n";
+echo "'join' (index nested-loop seek) and 'correlated' (the outer column drives an\n";
+echo "index seek in the subquery), both vs a full inner scan per outer row.\n";
