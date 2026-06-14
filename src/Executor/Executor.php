@@ -1914,7 +1914,10 @@ final class Executor
 
             case 'index_eq':
             case 'index_range':
-                foreach ($this->indexEntries($plan) as [$rid, $covered]) {
+                $entries = isset($plan['eqPrefix'])
+                    ? $this->indexPrefixEntries($plan)
+                    : $this->indexEntries($plan);
+                foreach ($entries as [$rid, $covered]) {
                     yield [$rid, null, $covered];
                 }
                 return;
@@ -1922,6 +1925,66 @@ final class Executor
 
         foreach ($tree->scan() as [$rid, $payload]) {
             yield [$rid, $payload, []];
+        }
+    }
+
+    /**
+     * Seek a composite index by an equality prefix (eqPrefix) plus an optional
+     * trailing range on the next column. Yields [rowid, []] (no covering data).
+     * Keys are stored lexicographically, so all rows sharing the prefix are
+     * contiguous: once a scanned key stops matching the prefix we are past them.
+     *
+     * @param array<string,mixed> $plan
+     * @return \Generator<int,array{0:int,1:array<int,null|int|float|string|Blob>}>
+     */
+    private function indexPrefixEntries(array $plan): \Generator
+    {
+        /** @var \YetiDevWorks\YetiSQL\Engine\IndexInfo $index */
+        $index = $plan['index'];
+        $idx = new \YetiDevWorks\YetiSQL\Engine\IndexBTree(
+            $this->db->pager(),
+            $index->rootPage,
+            $index->collations,
+        );
+        $prefix = $plan['eqPrefix'];
+        $p = \count($prefix);
+        $hasRange = $plan['kind'] === 'index_range';
+        $rangeColl = $index->collations[$p] ?? 'BINARY';
+
+        // Seek to the prefix, extended by the range's low bound when present.
+        $seekKey = $prefix;
+        if ($hasRange && $plan['low'] !== null) {
+            $seekKey[] = $plan['low'];
+        }
+
+        $seen = [];
+        foreach ($idx->scanFrom($seekKey) as $key) {
+            for ($i = 0; $i < $p; $i++) {
+                if (Value::compare($key[$i], $prefix[$i], $index->collations[$i] ?? 'BINARY') !== 0) {
+                    return; // past the equality prefix — no further matches
+                }
+            }
+            if ($hasRange) {
+                $kv = $key[$p] ?? null;
+                if ($plan['high'] !== null) {
+                    $cmp = Value::compare($kv, $plan['high'], $rangeColl);
+                    if ($cmp > 0 || ($cmp === 0 && !$plan['highInc'])) {
+                        return;
+                    }
+                }
+                if ($plan['low'] !== null) {
+                    $cmp = Value::compare($kv, $plan['low'], $rangeColl);
+                    if ($cmp < 0 || ($cmp === 0 && !$plan['lowInc'])) {
+                        continue;
+                    }
+                }
+            }
+            $rowid = (int) $key[\count($key) - 1];
+            if (isset($seen[$rowid])) {
+                continue;
+            }
+            $seen[$rowid] = true;
+            yield [$rowid, []];
         }
     }
 
@@ -2071,6 +2134,22 @@ final class Executor
                 $bestRank = $rank;
             }
         }
+        // A rowid equality is unique — one row — so nothing beats it.
+        if ($best !== null && $best['kind'] === 'rowid_eq') {
+            if (\count($conjuncts) === 1) {
+                $best['coveredAll'] = true;
+            }
+            return $best;
+        }
+
+        // A composite index whose leading columns are pinned by several equality
+        // conjuncts (optionally with a trailing range) is more selective than any
+        // single-column plan, so prefer it.
+        $multi = $this->multiColumnIndexPlan($conjuncts, $alias, $info, $indexes, $eval);
+        if ($multi !== null) {
+            return $multi;
+        }
+
         $combined = $this->combinedRangePlan($plans, \count($conjuncts));
         if ($combined !== null) {
             return $combined;
@@ -2079,6 +2158,92 @@ final class Executor
             $best['coveredAll'] = true;
         }
         return $best;
+    }
+
+    /**
+     * Plan a seek over a composite index: an equality prefix across the index's
+     * leading columns (a = ? AND b = ? ...), optionally followed by a range on
+     * the next column (... AND c > ?). Returns a plan carrying 'eqPrefix' (the
+     * leading equality values) plus optional range bounds, or null when no index
+     * is pinned by more than its leading column.
+     *
+     * @param list<Expr> $conjuncts
+     * @param list<\YetiDevWorks\YetiSQL\Engine\IndexInfo> $indexes
+     * @return array<string,mixed>|null
+     */
+    private function multiColumnIndexPlan(array $conjuncts, ?string $alias, TableInfo $info, array $indexes, Evaluator $eval): ?array
+    {
+        if ($indexes === []) {
+            return null;
+        }
+
+        // Bucket the simple `col OP const` conjuncts by column position.
+        $eq = [];
+        $ranges = [];
+        foreach ($conjuncts as $conj) {
+            if ($conj->kind !== Expr::BIN || !\in_array($conj->op, ['=', '<', '<=', '>', '>='], true)) {
+                continue;
+            }
+            [$pos, $const, $flip] = $this->colConst($conj->left, $conj->right, $alias, $info);
+            if ($pos === null || $pos === $info->rowidAlias) {
+                continue;
+            }
+            $value = $this->affine($info, $pos, $this->constValue($const, $eval));
+            if ($value === null) {
+                continue; // a NULL comparison is never true; the residual filter handles it
+            }
+            $op = $flip ? $this->flipOp((string) $conj->op) : (string) $conj->op;
+            if ($op === '=') {
+                $eq[$pos] = $value;
+                continue;
+            }
+            $r = $ranges[$pos] ?? ['low' => null, 'lowInc' => false, 'high' => null, 'highInc' => false];
+            match ($op) {
+                '>' => [$r['low'] = $value, $r['lowInc'] = false],
+                '>=' => [$r['low'] = $value, $r['lowInc'] = true],
+                '<' => [$r['high'] = $value, $r['highInc'] = false],
+                '<=' => [$r['high'] = $value, $r['highInc'] = true],
+                default => null,
+            };
+            $ranges[$pos] = $r;
+        }
+        if ($eq === []) {
+            return null;
+        }
+
+        // Pick the index that consumes the most leading columns.
+        $best = null;
+        $bestUsed = 1; // require strictly more than a single leading column
+        foreach ($indexes as $index) {
+            $cols = $index->columnPositions;
+            $prefix = [];
+            $i = 0;
+            while ($i < \count($cols) && isset($eq[$cols[$i]])) {
+                $prefix[] = $eq[$cols[$i]];
+                $i++;
+            }
+            if ($prefix === []) {
+                continue; // leading column not pinned by equality
+            }
+            $range = ($i < \count($cols) && isset($ranges[$cols[$i]])) ? $ranges[$cols[$i]] : null;
+            $used = \count($prefix) + ($range !== null ? 1 : 0);
+            if ($used > $bestUsed) {
+                $bestUsed = $used;
+                $best = ['index' => $index, 'prefix' => $prefix, 'range' => $range];
+            }
+        }
+        if ($best === null) {
+            return null;
+        }
+
+        $plan = ['index' => $best['index'], 'eqPrefix' => $best['prefix'], 'coveredAll' => false];
+        if ($best['range'] !== null) {
+            $plan['kind'] = 'index_range';
+            $plan += $best['range'];
+        } else {
+            $plan['kind'] = 'index_eq';
+        }
+        return $plan;
     }
 
     /**
