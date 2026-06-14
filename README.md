@@ -9,10 +9,11 @@ commit to git.
 > **Scope & honesty.** YetiSQL speaks SQLite's *SQL dialect* and stores data in its own
 > single-file binary format (`*.ysql`). It is **not** byte-compatible with the `sqlite3`
 > file format, and it is **not** a literal `\PDO` subclass (real PDO drivers are C
-> extensions). Pure PHP will never match the C engine on raw speed; the goal is
+> extensions). Pure PHP will never match the C engine on raw per-row speed; the goal is
 > portability and correctness, using every PHP-level trick (page cache, lazy column
-> decoding, compiled plan cache) to be as fast as pure PHP allows. Compatibility is
-> validated by **differential testing against the real `pdo_sqlite` extension**.
+> decoding, compiled plan cache, index planning, WAL) to be as fast as pure PHP allows —
+> and for indexed, set-oriented work it gets surprisingly close. Compatibility is validated
+> by **differential testing against the real `pdo_sqlite` extension**.
 
 ## Install
 
@@ -127,47 +128,75 @@ vendor/bin/yetisql app.ysql "SELECT * FROM users" # one-shot
 ## What works today
 
 - **DDL** — `CREATE TABLE` (type affinity, `PRIMARY KEY`, `AUTOINCREMENT`, `NOT NULL`,
-  `DEFAULT`, `UNIQUE`, `COLLATE`), `DROP TABLE/INDEX`, and `CREATE INDEX` with real
-  index B-trees the planner uses for equality/range/`IN` lookups.
+  `DEFAULT`, `UNIQUE`, `COLLATE`), `CREATE INDEX` with real index B-trees the planner uses
+  for equality/range/`IN` lookups, `CREATE VIEW`, `CREATE TRIGGER`, `DROP
+  TABLE/INDEX/VIEW/TRIGGER`, and **`ALTER TABLE`** (`RENAME TO`, `RENAME COLUMN`, `ADD
+  COLUMN`, `DROP COLUMN`).
 - **DML** — `INSERT` (multi-row, `OR REPLACE`/`OR IGNORE`, `INSERT … SELECT`, `DEFAULT
   VALUES`), `UPDATE`, `DELETE`, with positional (`?`, `?N`) and named (`:n`/`@n`/`$n`)
   parameters.
 - **Queries** — `SELECT` with `WHERE`, `INNER`/`LEFT`/`CROSS`/comma joins, `GROUP BY` /
-  `HAVING`, aggregates (`count`/`sum`/`avg`/`min`/`max`/`total`/`group_concat`), `ORDER
-  BY` (incl. positional and alias), `LIMIT`/`OFFSET`, `DISTINCT`, scalar subqueries,
-  `EXISTS`, `IN (…)`, compound `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, `CASE`, `CAST`,
-  `LIKE`/`GLOB`, subqueries in `FROM` (derived tables), table-valued PRAGMA functions
-  (`pragma_table_info(…)` etc.), and SQLite's affinity-aware comparison and three-valued logic.
+  `HAVING`, aggregates (`count`/`sum`/`avg`/`min`/`max`/`total`/`group_concat`),
+  **window functions** (`ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`/`PERCENT_RANK`/`CUME_DIST`,
+  `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`, running/`PARTITION BY` aggregates,
+  and explicit `ROWS`/`RANGE`/`GROUPS` frames), **CTEs** (`WITH`, incl. `WITH RECURSIVE`),
+  correlated and scalar subqueries, `EXISTS`, `IN (…)`, `ORDER BY` (incl. positional and
+  alias), `LIMIT`/`OFFSET`, `DISTINCT`, compound `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`,
+  `CASE`, `CAST`, `LIKE`/`GLOB`, subqueries in `FROM` (derived tables) and views,
+  table-valued PRAGMA functions (`pragma_table_info(…)` etc.), and SQLite's affinity-aware
+  comparison and three-valued logic.
+- **Views & triggers** — `CREATE VIEW` (incl. explicit column lists and views over views);
+  `BEFORE`/`AFTER` row triggers on `INSERT`/`UPDATE`/`DELETE` with `NEW`/`OLD`, `WHEN`
+  gating, `UPDATE OF`, multi-statement bodies, and cascades, plus `INSTEAD OF` triggers
+  that make views writable (non-recursive, matching `recursive_triggers=OFF`).
 - **Functions** — a broad scalar set (`abs`, `length`, `lower`/`upper`, `substr`, `trim`
   family, `replace`, `instr`, `round`, `coalesce`, `ifnull`, `nullif`, `typeof`, `hex`,
   `quote`, `printf`/`format`, `char`/`unicode`, `iif`, …).
-- **Transactions** — `BEGIN`/`COMMIT`/`ROLLBACK` with a crash-safe rollback journal and
-  `flock()` (many readers / one writer). A crash mid-write rolls back cleanly.
-- **PRAGMA** — `table_info`, `table_list`, `database_list`, and common no-op settings.
+- **Transactions & durability** — `BEGIN`/`COMMIT`/`ROLLBACK` with a crash-safe rollback
+  journal *or* **true WAL mode** (`PRAGMA journal_mode=WAL`), and `flock()` (many readers /
+  one writer). A crash mid-write rolls back cleanly under either mode.
+- **EXPLAIN** — `EXPLAIN <select>` returns the compiled **VDBE bytecode** program and
+  `EXPLAIN QUERY PLAN` returns the scan summary (see *VDBE & EXPLAIN* below).
+- **PRAGMA** — `table_info`/`table_xinfo`, `index_list`, `table_list`, `database_list`,
+  `journal_mode` (incl. `wal`), `wal_checkpoint`, and common settings.
 
 ## Storage & durability
 
 A YetiSQL database is one page-based binary file (`app.ysql`, default 4 KB pages) holding
-B+-trees for each table keyed by rowid, with overflow pages for large values. Writes are
-made crash-safe by a rollback journal (`app.ysql-journal`): a crash during commit restores
-the pre-commit state on next open. Concurrent access across processes is serialised with
-advisory `flock()` (note: advisory locking has known caveats on some network filesystems).
+B+-trees for each table keyed by rowid, with overflow pages for large values. Concurrent
+access across processes is serialised with advisory `flock()` (note: advisory locking has
+known caveats on some network filesystems).
+
+Two durability modes are available:
+
+- **Rollback journal** (default). On commit the original page images are written to
+  `app.ysql-journal` and fsync'd before the main file is updated; a crash during commit
+  restores the pre-commit state on next open.
+- **WAL** (`PRAGMA journal_mode=WAL`). Commits append the *new* page images to
+  `app.ysql-wal` as frames terminated by a commit marker, leaving the main file untouched;
+  reads merge the log over the main file. Recovery on open replays the WAL's committed
+  prefix and discards any half-written trailing transaction. `PRAGMA wal_checkpoint` (and
+  closing the database) folds the log back into the main file. WAL turns each commit's two
+  fsyncs + journal churn into a single sequential append + fsync, so many small commits get
+  **~2.5× faster** (see *Performance*).
 
 ## Performance
 
-SQLite's C engine is the gold standard; pure-PHP YetiSQL is, unavoidably, far
-slower. `benchmarks/bench.php` measures *how much*, and shows what index-based
-planning buys. Representative run (in-memory, 5000 rows, PHP 8.3):
+SQLite's C engine is the gold standard; pure-PHP YetiSQL is, unavoidably, slower
+on raw per-row work. `benchmarks/bench.php` measures *how much*, and shows what
+index-based planning buys. Representative run (in-memory, 5000 rows, PHP 8.3):
 
 ```
 workload                           SQLite  YetiSQL+idx  YetiSQL scan  vs SQLite
 ------------------------------------------------------------------------------
-bulk insert                        3.0 ms    190.9 ms     189.2 ms         65x
-PK lookups (×2000)                 1.2 ms     46.0 ms      47.1 ms         37x
-city COUNT (×200, ~20% rows)       2.9 ms    163.2 ms       5.38 s         57x
-range query (×200)                 1.8 ms    239.0 ms       5.41 s        131x
-group-by aggregate (×50)          32.0 ms      1.78 s       1.78 s         56x
-PK updates (×1000)                 0.5 ms     51.1 ms      49.1 ms         99x
+bulk insert                        2.8 ms    120.3 ms     122.9 ms         43x
+PK lookups (×2000)                 1.3 ms     49.5 ms      44.7 ms         38x
+city COUNT (×200, ~20% rows)       2.9 ms      8.7 ms      84.8 ms          3x
+range query (×200)                 1.8 ms      4.0 ms      19.0 ms          2x
+group-by aggregate (×50)          31.0 ms     25.8 ms      25.2 ms          1x
+PK updates (×1000)                 0.5 ms     39.1 ms      35.9 ms         78x
+join users⋈posts (×3, ≤100)        0.0 ms     50.1 ms      9.24 s       1259x
+correlated subquery (≤100)         0.0 ms     12.6 ms      1.41 s        369x
 ```
 
 ```bash
@@ -175,22 +204,64 @@ php benchmarks/bench.php [rows]    # default 5000
 ```
 
 Takeaways:
-- **Index planning works.** Point lookups by primary key and by indexed column
-  use rowid/index seeks; the `YetiSQL+idx` column beats `YetiSQL scan` on
-  selective and range queries. Covered `COUNT(*)` over full tables, rowid
-  ranges, and leading-column index predicates counts b-tree cells directly
-  without fetching table rows, and `UPDATE` only re-indexes columns that change.
-- **Expect tens to low hundreds x** for point operations, inserts, indexed
-  counts, and aggregates — the cost of a tree-walking interpreter and per-row
-  work in pure PHP.
-- **Large result sets are still the weak spot:** queries that must materialise
-  many rows still pay PHP object/evaluator overhead. More covering-index
-  projections and the planned VDBE compiler are the next levers.
+- **Index planning is the headline.** The `YetiSQL+idx` vs `YetiSQL scan` gap is
+  what indexes buy: selective `COUNT` is ~10×, range queries ~5×, **index
+  nested-loop joins ~180×**, and **index-accelerated correlated subqueries ~110×**
+  faster than the equivalent full-scan-per-row. Covered `COUNT(*)` over full
+  tables, rowid ranges, and leading-column index predicates count B-tree cells
+  directly without fetching rows, and `UPDATE` only re-indexes columns that change.
+- **For indexed, set-oriented work YetiSQL is competitive with SQLite** in this
+  in-memory harness — the group-by aggregate and indexed COUNT/range rows are
+  within single-digit multiples (sometimes faster, since there's no driver/IPC
+  boundary). Point operations, inserts, and updates stay tens of ×'s behind: the
+  irreducible cost of a tree-walking interpreter in pure PHP.
+
+**Durability — WAL vs rollback journal** (file-backed, 2000 single-statement commits):
+
+```
+workload                                 rollback            WAL   speedup
+------------------------------------------------------------------------------
+INSERTs, one commit each                 478.1 ms       194.7 ms      2.5x
+UPDATEs, one commit each                 509.2 ms       191.8 ms      2.7x
+```
+
+WAL replaces two fsyncs + journal create/delete per commit with one fsync and a
+sequential append, so the win scales with the number of commits (a single big
+transaction commits once and sees no difference; in-memory never touches disk).
 
 Hot-path optimisations already in place: an LRU page cache, a parsed-page cache
 (so repeated reads skip re-decoding), single-pass page encoding, binary-search
-rowid lookups, lazy/early-stop index scans, covered table/index counts, and a
-compiled-statement path.
+rowid lookups, lazy/early-stop index scans, multi-column index prefix seeks,
+index-driven joins and correlated subqueries, covered table/index counts, and a
+compiled-closure plan cache for the per-row hot loop.
+
+### VDBE & EXPLAIN
+
+YetiSQL includes a small **register virtual machine** in the SQLite VDBE tradition.
+`EXPLAIN` compiles a single-table `SELECT` to a bytecode program and returns the
+disassembly:
+
+```
+sqlite> EXPLAIN SELECT id, name FROM users WHERE age > 30 LIMIT 2;
+ 0  OpenRead   3  0  0        root=3 (users)
+ 1  Rewind     0 10  0        if empty goto 10
+ 2  Column     2  1  0        r1 = column 2
+ 3  Load       0  2  0   30   r2 = 30
+ 4  BinOp      1  2  0   >    r0 = r1 > r2
+ 5  IfNot      0  9  0        if !r0 goto 9
+ 6  Rowid      0  3  0        r3 = rowid
+ 7  Column     1  4  0        r4 = column 1
+ 8  ResultRow  3  2  0        output r3..4
+ 9  Next       0  2  0        goto 2 if more rows
+10  Halt       0  0  0
+```
+
+`PRAGMA vdbe=on` routes compilable single-table scans through the VM instead of the
+tree-walker. It is **off by default**: in PHP a register-interpreter loop runs a bit
+slower than the existing composed-closure compilation, so the closure path stays the
+default hot loop. The VM's value is the VDBE architecture and `EXPLAIN` introspection;
+its results are verified against `pdo_sqlite`, so the bytecode and the interpreter agree
+row-for-row.
 
 ## Architecture
 
@@ -198,26 +269,30 @@ compiled-statement path.
 YetiSQL\PDO / PDOStatement         PDO-shaped API
   └─ Engine\Database               autocommit / transactions / catalog
        ├─ Sql\Lexer → Parser       SQL text → AST
-       ├─ Executor                 nested-loop join → filter → group → order → limit
-       │    └─ Evaluator           affinity-aware expression evaluation
-       └─ Engine\Pager             paged file I/O, page cache, journal, flock
-            └─ TableBTree          rowid B+-tree + overflow
+       ├─ Executor                 nested-loop join → filter → group → window → order → limit
+       │    ├─ Evaluator           affinity-aware expression evaluation (+ NEW/OLD for triggers)
+       │    └─ Vdbe\Compiler/Vm    bytecode compiler + register VM (EXPLAIN; opt-in execution)
+       └─ Engine\Pager             paged file I/O, page cache, rollback journal | WAL, flock
+            └─ TableBTree / IndexBTree   rowid + secondary B+-trees, overflow
 ```
 
-The execution model is a tree-walking interpreter; a VDBE-style bytecode compiler is the
-planned performance upgrade (see roadmap).
+The default execution model is a tree-walking interpreter with a compiled-closure fast
+path for the per-row hot loop; the VDBE bytecode compiler + register VM (above) is an
+alternative engine used for `EXPLAIN` and available opt-in via `PRAGMA vdbe=on`.
 
 ## Roadmap
 
-Working: secondary-index and rowid query planning (equality, range, `IN`, `BETWEEN`)
-with automatic index maintenance on writes; covering-index counts (persisted subtree row
-counts); Doctrine DBAL and Eloquent adapters.
+**Working:** secondary-index, multi-column-index, and rowid query planning (equality,
+range, `IN`, `BETWEEN`) with automatic index maintenance on writes; index-driven joins and
+index-accelerated correlated subqueries; covering-index counts (persisted subtree row
+counts); CTEs (incl. recursive), window functions, views, triggers (incl. `INSTEAD OF`),
+`ALTER TABLE`, true WAL mode, a VDBE bytecode compiler with `EXPLAIN`; and Doctrine DBAL
+and Eloquent adapters.
 
-Not yet implemented (planned): multi-column index planning beyond the leading column,
-index-driven joins (the inner table of a join still scans), correlated subqueries, `WITH`
-(CTEs), window functions, triggers, views, `ALTER TABLE`, JSON1, FTS5, and true WAL. The
-execution model is a tree-walking interpreter; a VDBE-style bytecode compiler is the
-planned performance upgrade. Byte-level `sqlite3` *file* interop is out of scope by design.
+**Not yet implemented (planned):** JSON1 and FTS5 extensions, generated columns, foreign-key
+enforcement, `RETURNING`, and full VDBE execution of every query (today the VM covers
+single-table scans and the tree-walker handles the rest). Byte-level `sqlite3` *file*
+interop is out of scope by design.
 
 ## Testing
 
@@ -226,11 +301,14 @@ composer install
 vendor/bin/phpunit
 ```
 
-The suite includes unit tests (storage engine, codecs), a `sqllogictest`-style
-conformance corpus, a **differential oracle** that runs identical SQL against the real
-`pdo_sqlite` extension and asserts the results match, and a **Doctrine DBAL integration
-suite** that drives YetiSQL through the real DBAL stack (QueryBuilder, schema manager,
-transactions).
+The suite (225+ tests) includes unit tests (storage engine, codecs, WAL recovery), a
+`sqllogictest`-style conformance corpus, a **differential oracle** that runs identical SQL
+against the real `pdo_sqlite` extension and asserts the results match (covering joins,
+CTEs, window functions, views, triggers, `ALTER TABLE`, and the VDBE VM), and **Doctrine
+DBAL and Eloquent integration suites** that drive YetiSQL through the real ORM stacks
+(QueryBuilder, schema manager/migrations, relationships, transactions). The differential
+oracle is the project's correctness gate: new features ship only once they match
+`pdo_sqlite` row-for-row.
 
 ## License
 
