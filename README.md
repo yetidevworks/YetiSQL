@@ -322,6 +322,33 @@ not `[[1]]`); plain-column inputs match. (2) `json()` normalizes numeric literal
 re-minifying, so a redundant trailing zero is dropped (`json('[2.50]')` &rarr; `[2.5]`);
 extracted and constructed values are unaffected.
 
+## Concurrency
+
+YetiSQL is safe for multiple processes (e.g. concurrent PHP-FPM requests) sharing one
+`.ysql` file, with **single-writer / multiple-reader** semantics like SQLite's rollback-journal
+mode:
+
+- **Writers are serialized** by an advisory `flock(LOCK_EX)` held only for the duration of a
+  write transaction (a single statement in autocommit). On entering a write transaction the
+  pager re-reads the committed header *under the lock* and drops any stale page cache, so a
+  writer always operates on the latest committed state — no lost updates or B-tree corruption
+  when two processes write at once.
+- **Opening a connection never blocks** on another connection's write. A crashed writer's
+  "hot" journal is recovered under a non-blocking lock (a live writer's in-flight commit is
+  left alone).
+- **Reused connections stay coherent**: a read picks up other processes' commits (including
+  schema changes) rather than serving stale cached pages, validated by a change-counter /
+  WAL-size check.
+- **`PRAGMA busy_timeout = <ms>`** controls how long a contended write waits for the lock
+  before raising `database is locked` (default 5000 ms) — it fails fast instead of hanging.
+
+Because writes take a whole-file exclusive lock, a write-heavy workload (e.g. tracking a
+counter on every page view) serializes all writers through one lock — correct, but a
+throughput ceiling, the same as SQLite's default journal mode. Cross-process coherence
+relies on local-filesystem `flock` semantics (not guaranteed over some network filesystems).
+This is verified by a forked multi-process test suite (`tests/Concurrency`) that asserts no
+lost updates or corruption under heavy contention in both journal and WAL modes.
+
 ## Testing
 
 ```bash

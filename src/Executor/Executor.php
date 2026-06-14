@@ -5703,6 +5703,12 @@ final class Executor
             }
             return new Result(['foreign_keys'], [[$this->db->foreignKeysEnabled() ? 1 : 0]], 1);
         }
+        if ($name === 'busy_timeout') {
+            if ($stmt->value !== null) {
+                $this->db->pager()->setBusyTimeout((int) Value::toNumber($this->pragmaArg($stmt)));
+            }
+            return new Result(['timeout'], [[$this->db->pager()->busyTimeout()]], 1);
+        }
         if (\in_array($name, ['synchronous', 'cache_size', 'user_version', 'encoding'], true)) {
             // Accept settings; return a representative value for reads.
             $value = match ($name) {

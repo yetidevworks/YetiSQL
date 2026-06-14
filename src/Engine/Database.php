@@ -140,6 +140,11 @@ final class Database
 
         if ($writes && $this->autocommit && !$this->pager->inTransaction()) {
             $this->pager->beginTransaction();
+            // beginTransaction may have re-synced to another process's commit; if
+            // that commit changed the schema, rebuild the catalog before running.
+            if ($this->pager->takeSchemaChangedFlag()) {
+                $this->schema->reload();
+            }
             try {
                 $result = $this->executor->execute($stmt, $params);
                 $this->pager->commit();
@@ -149,6 +154,14 @@ final class Database
                 throw $e;
             }
         } else {
+            // A read outside any transaction: pick up other processes' commits on
+            // a reused connection before serving stale cached pages.
+            if (!$writes && !$this->pager->inTransaction()) {
+                $this->pager->syncForRead();
+                if ($this->pager->takeSchemaChangedFlag()) {
+                    $this->schema->reload();
+                }
+            }
             $result = $this->executor->execute($stmt, $params);
         }
 

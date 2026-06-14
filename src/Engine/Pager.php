@@ -81,6 +81,13 @@ final class Pager
     /** @var array<int,true> page numbers whose latest committed image lives in the WAL, not the main file */
     private array $walFrames = [];
 
+    /** WAL file size at our last sync — a cheap signal that another process committed. */
+    private int $lastWalSize = 0;
+    /** Max time (ms) to wait for a contended file lock before raising "database is locked". */
+    private int $busyTimeoutMs = 5000;
+    /** Set when a cross-process reload changed the schema cookie; consumed by Database. */
+    private bool $schemaMayHaveChanged = false;
+
     public function __construct(private readonly string $path)
     {
         $this->memory = ($path === ':memory:' || $path === '');
@@ -125,13 +132,24 @@ final class Pager
         if ($this->handle === false) {
             throw new YetiSQLException("unable to open database file: {$this->path}");
         }
+        // Unbuffered reads: PHP's userspace stream buffer can serve stale bytes
+        // for a re-seek within the buffered region, so a reader would miss another
+        // process's committed write. Unbuffered fread()s hit the (cross-process
+        // coherent) OS page cache. We cache whole pages ourselves, so the stream
+        // buffer bought us nothing anyway.
+        \stream_set_read_buffer($this->handle, 0);
 
         if ($exists) {
+            // Roll back only a *hot* journal (one left by a dead writer).
+            // recoverIfNeeded() uses a non-blocking exclusive lock to tell a hot
+            // journal from a live writer's in-flight commit, so open() never
+            // blocks on, nor wrongly rolls back, another connection's write.
             $this->recoverIfNeeded();
             $this->readHeader();
             if ($this->walMode) {
                 $this->openWalHandle(false);
                 $this->recoverWal();
+                $this->lastWalSize = $this->currentWalSize();
             }
         } else {
             $this->initNewDatabase();
@@ -382,6 +400,13 @@ final class Pager
         }
         if (!$this->memory) {
             $this->lockExclusive();
+            // Now that no other writer can be mid-commit, re-sync to the latest
+            // committed state. Without this a writer that opened (or last synced)
+            // before another process committed would flush stale-derived pages
+            // over that commit — losing the update or corrupting the b-tree.
+            if ($this->committedStateChanged()) {
+                $this->reloadCommittedState();
+            }
         }
         $this->committedPageCount = $this->pageCount;
         $this->inTxn = true;
@@ -543,6 +568,30 @@ final class Pager
     private function recoverIfNeeded(): void
     {
         $jp = $this->journalPath();
+        \clearstatcache(true, $jp);
+        if (!\is_file($jp) || \filesize($jp) === 0) {
+            return;
+        }
+        // A journal is "hot" (its writer died mid-commit) only if no live process
+        // still holds the write lock. Probe with a non-blocking exclusive lock: if
+        // a live writer owns it, the journal is just an in-flight commit, not hot,
+        // so we must NOT roll it back. Hold the lock across recovery so the rollback
+        // is atomic against other openers.
+        $wouldBlock = false;
+        if (!\flock($this->handle, LOCK_EX | LOCK_NB, $wouldBlock)) {
+            return;
+        }
+        try {
+            $this->recoverHotJournal($jp);
+        } finally {
+            \flock($this->handle, LOCK_UN);
+        }
+    }
+
+    private function recoverHotJournal(string $jp): void
+    {
+        // Re-check under the lock: the writer may have finished and removed it.
+        \clearstatcache(true, $jp);
         if (!\is_file($jp) || \filesize($jp) === 0) {
             return;
         }
@@ -650,6 +699,7 @@ final class Pager
             if ($this->walHandle === false) {
                 throw new YetiSQLException('unable to open WAL file');
             }
+            \stream_set_read_buffer($this->walHandle, 0);
         }
         $size = \filesize($this->walPath());
         if ($reset || $size === false || $size < self::WAL_HEADER_SIZE) {
@@ -674,6 +724,7 @@ final class Pager
         // Commit marker: page number 0, then the post-commit page count.
         \fwrite($this->walHandle, \pack('N', 0) . \pack('N', $this->pageCount));
         $this->fsyncWal();
+        $this->lastWalSize = $this->currentWalSize();
         $this->dirty = [];
     }
 
@@ -765,6 +816,7 @@ final class Pager
         \fseek($this->walHandle, self::WAL_HEADER_SIZE);
         $this->fsyncWal();
         $this->walFrames = [];
+        $this->lastWalSize = $this->currentWalSize();
     }
 
     private function lockExclusive(): void
@@ -772,9 +824,7 @@ final class Pager
         if ($this->locked || $this->memory) {
             return;
         }
-        if (!\flock($this->handle, LOCK_EX)) {
-            throw new YetiSQLException('could not acquire write lock');
-        }
+        $this->acquire(LOCK_EX);
         $this->locked = true;
     }
 
@@ -784,5 +834,139 @@ final class Pager
             \flock($this->handle, LOCK_UN);
             $this->locked = false;
         }
+    }
+
+    /**
+     * Acquire an flock of the given mode, retrying without blocking until the
+     * busy timeout elapses, then raising "database is locked" — so a contended
+     * worker fails fast instead of hanging indefinitely.
+     */
+    private function acquire(int $mode): void
+    {
+        $deadline = \microtime(true) + ($this->busyTimeoutMs / 1000);
+        $wouldBlock = false;
+        while (true) {
+            if (\flock($this->handle, $mode | LOCK_NB, $wouldBlock)) {
+                return;
+            }
+            if (!$wouldBlock || \microtime(true) >= $deadline) {
+                throw new YetiSQLException('database is locked');
+            }
+            \usleep(1000); // 1ms between attempts
+        }
+    }
+
+    public function setBusyTimeout(int $ms): void
+    {
+        $this->busyTimeoutMs = \max(0, $ms);
+    }
+
+    public function busyTimeout(): int
+    {
+        return $this->busyTimeoutMs;
+    }
+
+    /**
+     * Whether a cross-process reload changed the schema cookie since the last
+     * call. The Database consumes this to know when to rebuild its catalog.
+     */
+    public function takeSchemaChangedFlag(): bool
+    {
+        $changed = $this->schemaMayHaveChanged;
+        $this->schemaMayHaveChanged = false;
+        return $changed;
+    }
+
+    /**
+     * Re-sync to the latest committed on-disk state for a read, picking up other
+     * processes' commits on a reused connection. Cheap when nothing changed (a
+     * small header read / WAL-size check); only reloads — under a shared lock to
+     * avoid a torn read of an in-flight commit — when another writer committed.
+     * Never disturbs an open transaction's own uncommitted pages.
+     */
+    public function syncForRead(): void
+    {
+        if ($this->memory || $this->inTxn) {
+            return;
+        }
+        if (!$this->committedStateChanged()) {
+            return;
+        }
+        $this->acquire(LOCK_SH);
+        try {
+            $this->reloadCommittedState();
+        } finally {
+            \flock($this->handle, LOCK_UN);
+        }
+    }
+
+    /**
+     * Cheap test for whether another process committed since our last sync:
+     * the WAL grew/shrank (WAL mode) or the on-disk change counter advanced.
+     */
+    private function committedStateChanged(): bool
+    {
+        if ($this->memory) {
+            return false;
+        }
+        if ($this->walMode) {
+            return $this->currentWalSize() !== $this->lastWalSize;
+        }
+        return $this->diskChangeCounter() !== $this->changeCounter;
+    }
+
+    /**
+     * The change counter currently stored in the on-disk main-file header. Reads
+     * via the main handle, which is unbuffered (stream_set_read_buffer 0) so it
+     * sees another process's committed write rather than a stale cached buffer.
+     */
+    private function diskChangeCounter(): int
+    {
+        $raw = $this->rawRead(1, self::HEADER_SIZE);
+        if (\strlen($raw) < 36 || \substr($raw, 0, 8) !== self::MAGIC) {
+            return $this->changeCounter;
+        }
+        /** @var array{1:int} $u */
+        $u = \unpack('N', \substr($raw, 32, 4)); // change counter is at byte offset 32
+        return $u[1];
+    }
+
+    private function currentWalSize(): int
+    {
+        // Clear PHP's per-path stat cache, or filesize() can return a stale size
+        // after another process appended to the WAL.
+        \clearstatcache(true, $this->walPath());
+        $sz = @\filesize($this->walPath());
+        return $sz === false ? 0 : $sz;
+    }
+
+    /**
+     * Drop the in-memory caches and reload committed state from disk (header,
+     * and in WAL mode the committed WAL frames). Caller must hold a lock so the
+     * read sees a consistent commit. Returns whether the schema cookie changed.
+     */
+    private function reloadCommittedState(): bool
+    {
+        $oldCookie = $this->schemaCookie;
+        $this->cache = [];
+        $this->decoded = [];
+        $this->pendingEncode = [];
+        $this->dirty = [];
+        $this->walFrames = [];
+
+        $raw = $this->rawRead(1, $this->pageSize);
+        $this->cache[1] = $raw;
+        $this->parseHeaderFrom($raw);
+
+        if ($this->walMode) {
+            $this->recoverWal();
+            $this->lastWalSize = $this->currentWalSize();
+        }
+
+        if ($this->schemaCookie !== $oldCookie) {
+            $this->schemaMayHaveChanged = true;
+            return true;
+        }
+        return false;
     }
 }

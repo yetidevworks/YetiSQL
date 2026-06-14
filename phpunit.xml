@@ -25,6 +25,9 @@
         <testsuite name="vdbe">
             <directory>tests/Vdbe</directory>
         </testsuite>
+        <testsuite name="concurrency">
+            <directory>tests/Concurrency</directory>
+        </testsuite>
     </testsuites>
     <source>
         <include>
