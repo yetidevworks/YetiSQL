@@ -41,6 +41,8 @@ final class ViewTest extends TestCase
             'SELECT * FROM eng_hi ORDER BY id',
             'SELECT (SELECT COUNT(*) FROM eng), (SELECT MAX(sal) FROM hi)',
             'SELECT id, name FROM eng ORDER BY sal DESC, id',
+            'SELECT COUNT(*) FROM hi WHERE id <= 4',
+            'SELECT COUNT(*) FROM eng WHERE sal > 100',
             'SELECT v.d FROM dept_tot v WHERE v.total > 300 ORDER BY v.d',
             "SELECT type, name, tbl_name FROM sqlite_master WHERE type = 'view' ORDER BY name",
         ];

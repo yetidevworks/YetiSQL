@@ -37,6 +37,7 @@ final class CteDifferentialTest extends TestCase
                 . 'SELECT e.name, b.name FROM emp e JOIN big b ON e.mgr = b.id ORDER BY e.id',
             'WITH d AS (SELECT dept, COUNT(*) c, SUM(sal) s FROM emp GROUP BY dept) SELECT dept, c, s FROM d ORDER BY dept',
             'WITH t AS (SELECT id FROM emp WHERE sal > 200) SELECT (SELECT COUNT(*) FROM t), (SELECT MAX(id) FROM t)',
+            "WITH hi AS (SELECT * FROM emp WHERE sal >= 140) SELECT COUNT(*) FROM hi WHERE dept = 'eng'",
             'SELECT name FROM (SELECT * FROM emp) x ORDER BY id',
             'SELECT * FROM (SELECT id, name FROM emp WHERE id <= 3) y ORDER BY id',
             // recursive

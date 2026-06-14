@@ -25,6 +25,7 @@ use YetiDevWorks\YetiSQL\Sql\Ast\InsertStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\JoinClause;
 use YetiDevWorks\YetiSQL\Sql\Ast\PragmaStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\ExplainStatement;
+use YetiDevWorks\YetiSQL\Sql\Ast\ResultColumn;
 use YetiDevWorks\YetiSQL\Sql\Ast\SelectStatement;
 use YetiDevWorks\YetiSQL\Vdbe\Compiler as VdbeCompiler;
 use YetiDevWorks\YetiSQL\Vdbe\Vm as VdbeVm;
@@ -385,6 +386,11 @@ final class Executor
         // VALUES (...) ...
         if ($select->valuesRows !== []) {
             return $this->runValues($select, $eval);
+        }
+
+        $flattened = $this->flattenSimpleSourceSelect($select);
+        if ($flattened !== null) {
+            return $this->runSelect($flattened, $eval);
         }
 
         $meta = $this->compileSelect($select, $eval);
@@ -940,6 +946,216 @@ final class Executor
             }
         }
         return $this->resolveSource($ref);
+    }
+
+    private function flattenSimpleSourceSelect(SelectStatement $select): ?SelectStatement
+    {
+        if ($select->from === null
+            || $select->joins !== []
+            || $select->compound !== null
+            || $select->valuesRows !== []
+            || $select->distinct
+            || $select->groupBy !== []
+            || $select->having !== null
+            || $select->orderBy !== []) {
+            return null;
+        }
+
+        $ref = $select->from;
+        if ($ref->name === null || $ref->func !== null || $ref->subquery !== null) {
+            return null;
+        }
+        foreach ($select->columns as $column) {
+            if ($column->star || $column->tableStar !== null) {
+                return null;
+            }
+            if ($this->exprHasSubquery($column->expr)) {
+                return null;
+            }
+        }
+
+        $source = null;
+        $columnNames = null;
+        $key = \strtolower($ref->name);
+        if (isset($this->cteScope[$key])) {
+            $cte = $this->cteScope[$key];
+            if ($cte['recursive']) {
+                return null;
+            }
+            $source = $cte['select'];
+            $columnNames = $cte['columns'];
+        } else {
+            $view = $this->db->schema()->getView($ref->name);
+            if ($view === null || isset($this->viewStack[\strtolower($view['name'])])) {
+                return null;
+            }
+            $source = $view['select'];
+            $columnNames = $view['columns'] !== [] ? $view['columns'] : null;
+        }
+
+        if (!$this->isFlattenableSourceSelect($source)) {
+            return null;
+        }
+        if ($this->selectHasWindow($select) || $this->exprHasSubquery($select->where)) {
+            return null;
+        }
+
+        $map = $this->sourceProjectionMap($source, $columnNames);
+        if ($map === null) {
+            return null;
+        }
+
+        $sourceAlias = $ref->alias ?? $ref->name;
+        $flat = clone $select;
+        $flat->from = clone $source->from;
+        $flat->with = [];
+        $flat->columns = $this->rewriteResultColumns($select->columns, $sourceAlias, $map);
+        $outerWhere = $select->where !== null ? $this->rewriteSourceExpr($select->where, $sourceAlias, $map) : null;
+        $innerWhere = $source->where !== null ? $this->cloneExpr($source->where) : null;
+        $flat->where = $innerWhere !== null && $outerWhere !== null
+            ? Expr::bin('AND', $innerWhere, $outerWhere)
+            : ($innerWhere ?? $outerWhere);
+
+        return $flat;
+    }
+
+    private function isFlattenableSourceSelect(SelectStatement $source): bool
+    {
+        if ($source->from === null
+            || $source->joins !== []
+            || $source->compound !== null
+            || $source->valuesRows !== []
+            || $source->with !== []
+            || $source->distinct
+            || $source->groupBy !== []
+            || $source->having !== null
+            || $source->orderBy !== []
+            || $source->limit !== null
+            || $source->offset !== null
+            || $this->selectHasWindow($source)
+            || $this->exprHasSubquery($source->where)) {
+            return false;
+        }
+
+        $ref = $source->from;
+        return $ref->name !== null
+            && $ref->func === null
+            && $ref->subquery === null
+            && $this->db->schema()->getTable($ref->name) !== null;
+    }
+
+    /**
+     * @param ?list<string> $columnNames
+     * @return array<string,Expr>|null
+     */
+    private function sourceProjectionMap(SelectStatement $source, ?array $columnNames): ?array
+    {
+        $cols = $this->resolveOutputColumns($source);
+        if ($columnNames !== null && \count($columnNames) !== \count($cols)) {
+            return null;
+        }
+
+        $map = [];
+        foreach ($cols as $i => $col) {
+            $expr = $col['expr'];
+            if (!$expr instanceof Expr || $expr->kind !== Expr::COL) {
+                return null;
+            }
+            $name = $columnNames[$i] ?? $col['name'];
+            $map[\strtolower($name)] = $this->cloneExpr($expr);
+        }
+        return $map;
+    }
+
+    /**
+     * @param list<ResultColumn> $columns
+     * @param array<string,Expr> $map
+     * @return list<ResultColumn>
+     */
+    private function rewriteResultColumns(array $columns, string $sourceAlias, array $map): array
+    {
+        $out = [];
+        foreach ($columns as $column) {
+            $out[] = new ResultColumn(
+                expr: $column->expr !== null ? $this->rewriteSourceExpr($column->expr, $sourceAlias, $map) : null,
+                star: $column->star,
+                tableStar: $column->tableStar,
+                alias: $column->alias,
+            );
+        }
+        return $out;
+    }
+
+    /** @param array<string,Expr> $map */
+    private function rewriteSourceExpr(Expr $expr, string $sourceAlias, array $map): Expr
+    {
+        if ($expr->kind === Expr::COL
+            && ($expr->table === null || \strcasecmp($expr->table, $sourceAlias) === 0)
+            && isset($map[\strtolower((string) $expr->name)])) {
+            return $this->cloneExpr($map[\strtolower((string) $expr->name)]);
+        }
+        return $this->cloneExpr($expr, $sourceAlias, $map);
+    }
+
+    /** @param ?array<string,Expr> $map */
+    private function cloneExpr(Expr $expr, ?string $sourceAlias = null, ?array $map = null): Expr
+    {
+        $clone = clone $expr;
+        $rewrite = function (?Expr $child) use ($sourceAlias, $map): ?Expr {
+            if ($child === null) {
+                return null;
+            }
+            return $sourceAlias !== null && $map !== null
+                ? $this->rewriteSourceExpr($child, $sourceAlias, $map)
+                : $this->cloneExpr($child);
+        };
+
+        $clone->left = $rewrite($expr->left);
+        $clone->right = $rewrite($expr->right);
+        $clone->operand = $rewrite($expr->operand);
+        $clone->subject = $rewrite($expr->subject);
+        $clone->elseExpr = $rewrite($expr->elseExpr);
+        $clone->low = $rewrite($expr->low);
+        $clone->high = $rewrite($expr->high);
+        $clone->escape = $rewrite($expr->escape);
+        $clone->args = \array_map($rewrite, $expr->args);
+        $clone->list = \array_map($rewrite, $expr->list);
+        $clone->whens = \array_map(
+            static fn (array $when): array => [$rewrite($when[0]), $rewrite($when[1])],
+            $expr->whens,
+        );
+        return $clone;
+    }
+
+    private function exprHasSubquery(?Expr $expr): bool
+    {
+        if ($expr === null) {
+            return false;
+        }
+        if ($expr->kind === Expr::SUBQUERY || $expr->kind === Expr::EXISTS || $expr->select !== null) {
+            return true;
+        }
+        foreach ([$expr->left, $expr->right, $expr->operand, $expr->subject, $expr->elseExpr, $expr->low, $expr->high, $expr->escape] as $child) {
+            if ($child !== null && $this->exprHasSubquery($child)) {
+                return true;
+            }
+        }
+        foreach ($expr->args as $child) {
+            if ($this->exprHasSubquery($child)) {
+                return true;
+            }
+        }
+        foreach ($expr->list as $child) {
+            if ($this->exprHasSubquery($child)) {
+                return true;
+            }
+        }
+        foreach ($expr->whens as $when) {
+            if ($this->exprHasSubquery($when[0]) || $this->exprHasSubquery($when[1])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -2109,7 +2325,8 @@ final class Executor
 
         $plan = $this->simpleScanCountPlan($select->where, $alias, $info, $eval);
         if ($plan === null) {
-            return null;
+            $plans = $this->simpleScanCountConjunctPlans($select->where, $alias, $info, $eval);
+            return $plans !== null ? $this->scanCountWithPlans($info, $plans) : null;
         }
         if (($plan['impossible'] ?? false) === true) {
             return [[0]];
@@ -2158,6 +2375,89 @@ final class Executor
 
         $this->rememberCoveredCount($key, $count);
         return [[$count]];
+    }
+
+    /** @return list<array<string,mixed>>|null */
+    private function simpleScanCountConjunctPlans(Expr $where, string $alias, TableInfo $info, Evaluator $eval): ?array
+    {
+        $conjuncts = $this->splitAnd($where);
+        if (\count($conjuncts) < 2) {
+            return null;
+        }
+
+        $plans = [];
+        foreach ($conjuncts as $conjunct) {
+            $plan = $this->simpleScanCountPlan($conjunct, $alias, $info, $eval);
+            if ($plan === null) {
+                return null;
+            }
+            if (($plan['impossible'] ?? false) === true) {
+                return [['impossible' => true]];
+            }
+            $pos = $plan['pos'];
+            if ($pos < 0
+                || $pos === $info->rowidAlias
+                || $this->indexLeading($this->db->schema()->resolvedIndexes($info->name), $pos) !== null) {
+                return null;
+            }
+            $plans[] = $plan;
+        }
+        return $plans;
+    }
+
+    /** @param list<array<string,mixed>> $plans */
+    private function scanCountWithPlans(TableInfo $info, array $plans): array
+    {
+        if (\count($plans) === 1 && ($plans[0]['impossible'] ?? false) === true) {
+            return [[0]];
+        }
+
+        $keyParts = [];
+        foreach ($plans as $plan) {
+            $keyParts = \array_merge($keyParts, $this->simpleScanPlanKeyParts($plan));
+        }
+        $key = $this->coveredCountCacheKey($info->rootPage, 'scan_count_and', $keyParts);
+        $cached = $this->coveredCountCache[$key] ?? null;
+        if ($cached !== null) {
+            return [[$cached]];
+        }
+
+        $count = 0;
+        $tree = new TableBTree($this->db->pager(), $info->rootPage);
+        foreach ($tree->scan() as [$rowid, $payload]) {
+            foreach ($plans as $plan) {
+                $pos = $plan['pos'];
+                if ($pos < 0 || $pos === $info->rowidAlias) {
+                    $value = $rowid;
+                } else {
+                    $value = RecordCodec::decodeColumn($payload, $pos);
+                }
+                if ($value === null) {
+                    continue 2;
+                }
+                $coll = $pos >= 0 ? $info->columns[$pos]->collation : 'BINARY';
+                if (!$this->simpleScanCountMatches($value, $plan, $coll)) {
+                    continue 2;
+                }
+            }
+            $count++;
+        }
+
+        $this->rememberCoveredCount($key, $count);
+        return [[$count]];
+    }
+
+    /** @param array<string,mixed> $plan */
+    private function simpleScanPlanKeyParts(array $plan): array
+    {
+        $parts = [(string) $plan['pos'], (string) $plan['op']];
+        if ($plan['op'] === 'between') {
+            $parts[] = $this->valueKey($plan['low']);
+            $parts[] = $this->valueKey($plan['high']);
+        } else {
+            $parts[] = $this->valueKey($plan['value']);
+        }
+        return $parts;
     }
 
     private function tryCachedCorrelatedCount(SelectStatement $select, TableInfo $info, int $pos, null|int|float|string|Blob $value): ?int
