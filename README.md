@@ -128,13 +128,20 @@ vendor/bin/yetisql app.ysql "SELECT * FROM users" # one-shot
 ## What works today
 
 - **DDL** — `CREATE TABLE` (type affinity, `PRIMARY KEY`, `AUTOINCREMENT`, `NOT NULL`,
-  `DEFAULT`, `UNIQUE`, `COLLATE`), `CREATE INDEX` with real index B-trees the planner uses
-  for equality/range/`IN` lookups, `CREATE VIEW`, `CREATE TRIGGER`, `DROP
+  `DEFAULT`, `UNIQUE`, `COLLATE`, `FOREIGN KEY` … `REFERENCES`, and **generated columns**
+  `GENERATED ALWAYS AS (…)` STORED/VIRTUAL), `CREATE INDEX` with real index B-trees the
+  planner uses for equality/range/`IN` lookups, `CREATE VIEW`, `CREATE TRIGGER`, `DROP
   TABLE/INDEX/VIEW/TRIGGER`, and **`ALTER TABLE`** (`RENAME TO`, `RENAME COLUMN`, `ADD
   COLUMN`, `DROP COLUMN`).
 - **DML** — `INSERT` (multi-row, `OR REPLACE`/`OR IGNORE`, `INSERT … SELECT`, `DEFAULT
-  VALUES`), `UPDATE`, `DELETE`, with positional (`?`, `?N`) and named (`:n`/`@n`/`$n`)
-  parameters.
+  VALUES`), `UPDATE`, `DELETE`, all with an optional **`RETURNING`** clause, and positional
+  (`?`, `?N`) and named (`:n`/`@n`/`$n`) parameters.
+- **Constraints & integrity** — `UNIQUE` / `PRIMARY KEY` enforcement backed by auto-created
+  unique indexes (SQLite's `sqlite_autoindex_*` model) with full `REPLACE` / `OR IGNORE`
+  conflict resolution, `NOT NULL`, and **`FOREIGN KEY` enforcement** under
+  `PRAGMA foreign_keys=ON` (child existence checks; `ON DELETE`/`ON UPDATE`
+  `NO ACTION`/`RESTRICT`/`CASCADE`/`SET NULL`/`SET DEFAULT`; composite and self-referential
+  keys).
 - **Queries** — `SELECT` with `WHERE`, `INNER`/`LEFT`/`CROSS`/comma joins, `GROUP BY` /
   `HAVING`, aggregates (`count`/`sum`/`avg`/`min`/`max`/`total`/`group_concat`),
   **window functions** (`ROW_NUMBER`/`RANK`/`DENSE_RANK`/`NTILE`/`PERCENT_RANK`/`CUME_DIST`,
@@ -151,21 +158,26 @@ vendor/bin/yetisql app.ysql "SELECT * FROM users" # one-shot
   that make views writable (non-recursive, matching `recursive_triggers=OFF`).
 - **Functions** — a broad scalar set (`abs`, `length`, `lower`/`upper`, `substr`, `trim`
   family, `replace`, `instr`, `round`, `coalesce`, `ifnull`, `nullif`, `typeof`, `hex`,
-  `quote`, `printf`/`format`, `char`/`unicode`, `iif`, …).
+  `quote`, `printf`/`format`, `char`/`unicode`, `iif`, …), plus the **JSON1** surface
+  (`json`, `json_extract`, `json_type`, `json_valid`, `json_quote`, `json_array`,
+  `json_object`, `json_array_length`, `json_set`/`insert`/`replace`/`remove`/`patch`, the
+  `->`/`->>` operators, the `json_group_array`/`json_group_object` aggregates, and the
+  `json_each`/`json_tree` table-valued functions).
 - **Transactions & durability** — `BEGIN`/`COMMIT`/`ROLLBACK` with a crash-safe rollback
   journal *or* **true WAL mode** (`PRAGMA journal_mode=WAL`), and `flock()` (many readers /
   one writer). A crash mid-write rolls back cleanly under either mode.
 - **EXPLAIN** — `EXPLAIN <select>` returns the compiled **VDBE bytecode** program and
   `EXPLAIN QUERY PLAN` returns the scan summary (see *VDBE & EXPLAIN* below).
-- **PRAGMA** — `table_info`/`table_xinfo`, `index_list`, `table_list`, `database_list`,
-  `journal_mode` (incl. `wal`), `wal_checkpoint`, and common settings.
+- **PRAGMA** — `table_info`/`table_xinfo`, `index_list`, `foreign_key_list`, `table_list`,
+  `database_list`, `journal_mode` (incl. `wal`), `wal_checkpoint`, `foreign_keys`,
+  `busy_timeout`, and common settings.
 
 ## Storage & durability
 
 A YetiSQL database is one page-based binary file (`app.ysql`, default 4 KB pages) holding
-B+-trees for each table keyed by rowid, with overflow pages for large values. Concurrent
-access across processes is serialised with advisory `flock()` (note: advisory locking has
-known caveats on some network filesystems).
+B+-trees for each table keyed by rowid, with overflow pages for large values. Multiple
+processes can safely share one file with single-writer / multiple-reader semantics — see
+*Concurrency* below (note: advisory `flock()` has known caveats on some network filesystems).
 
 Two durability modes are available:
 
@@ -178,7 +190,7 @@ Two durability modes are available:
   prefix and discards any half-written trailing transaction. `PRAGMA wal_checkpoint` (and
   closing the database) folds the log back into the main file. WAL turns each commit's two
   fsyncs + journal churn into a single sequential append + fsync, so many small commits get
-  **~2.5× faster** (see *Performance*).
+  **~2.4× faster** (see *Performance*).
 
 ## Performance
 
@@ -189,15 +201,18 @@ index-based planning buys. Representative run (in-memory, 5000 rows, PHP 8.3):
 ```
 workload                           SQLite  YetiSQL+idx  YetiSQL scan  vs SQLite
 ------------------------------------------------------------------------------
-bulk insert                        2.9 ms    127.2 ms     126.4 ms         44x
-PK lookups (×2000)                 1.3 ms     50.2 ms      45.3 ms         40x
-city COUNT (×200, ~20% rows)       2.9 ms      8.9 ms      86.7 ms          3x
-range query (×200)                 2.0 ms      3.9 ms      19.9 ms          2x
-group-by aggregate (×50)          32.1 ms     25.8 ms      25.9 ms          1x
-PK updates (×1000)                 0.6 ms     41.2 ms      37.0 ms         69x
-join users⋈posts (×3, ≤100)        0.0 ms     52.2 ms      43.5 ms       1092x
-correlated subquery (≤100)         0.1 ms     13.1 ms      15.1 ms        191x
+bulk insert                        3.1 ms    127.9 ms     129.7 ms         42x
+PK lookups (×2000)                 1.4 ms     49.4 ms      45.3 ms         34x
+city COUNT (×200, ~20% rows)       2.9 ms      8.9 ms      85.6 ms          3x
+range query (×200)                 1.8 ms      4.2 ms      19.8 ms          2x
+group-by aggregate (×50)          31.3 ms     25.1 ms      26.4 ms          1x
+PK updates (×1000)                 0.6 ms     41.5 ms      36.9 ms         68x
+join users⋈posts (×3, ≤100)        0.0 ms     50.5 ms      42.1 ms      ~1300x
+correlated subquery (≤100)         0.0 ms     12.7 ms      14.7 ms       ~320x
 ```
+
+(The join and correlated-subquery ratios are dominated by SQLite rounding to ~0 ms at
+this scale; treat them as "fast enough to be noise on the C engine," not a literal multiple.)
 
 ```bash
 php benchmarks/bench.php [rows]    # default 5000
@@ -224,8 +239,8 @@ Takeaways:
 ```
 workload                                 rollback            WAL   speedup
 ------------------------------------------------------------------------------
-INSERTs, one commit each                 478.1 ms       194.7 ms      2.5x
-UPDATEs, one commit each                 509.2 ms       191.8 ms      2.7x
+INSERTs, one commit each                 501.6 ms       208.2 ms      2.4x
+UPDATEs, one commit each                 488.0 ms       203.5 ms      2.4x
 ```
 
 WAL replaces two fsyncs + journal create/delete per commit with one fsync and a
@@ -356,14 +371,16 @@ composer install
 vendor/bin/phpunit
 ```
 
-The suite (225+ tests) includes unit tests (storage engine, codecs, WAL recovery), a
+The suite (385 tests) includes unit tests (storage engine, codecs, WAL recovery), a
 `sqllogictest`-style conformance corpus, a **differential oracle** that runs identical SQL
 against the real `pdo_sqlite` extension and asserts the results match (covering joins,
-CTEs, window functions, views, triggers, `ALTER TABLE`, and the VDBE VM), and **Doctrine
-DBAL and Eloquent integration suites** that drive YetiSQL through the real ORM stacks
-(QueryBuilder, schema manager/migrations, relationships, transactions). The differential
-oracle is the project's correctness gate: new features ship only once they match
-`pdo_sqlite` row-for-row.
+CTEs, window functions, views, triggers, `ALTER TABLE`, JSON1, `RETURNING`, generated
+columns, foreign keys, and the VDBE VM), a **forked multi-process concurrency suite**
+(`tests/Concurrency`, ext-pcntl) that asserts no lost updates or corruption under heavy
+contention in both journal and WAL modes, and **Doctrine DBAL and Eloquent integration
+suites** that drive YetiSQL through the real ORM stacks (QueryBuilder, schema
+manager/migrations, relationships, transactions). The differential oracle is the project's
+correctness gate: new features ship only once they match `pdo_sqlite` row-for-row.
 
 ## License
 
