@@ -33,6 +33,8 @@ final class Aggregates
             public array $parts = [];
             public string $sep = ',';
             public bool $any = false;
+            /** @var array<string,true> seen argument keys, for DISTINCT aggregates */
+            public array $seen = [];
 
             public function __construct(public string $name)
             {
@@ -43,9 +45,25 @@ final class Aggregates
     /**
      * @param object $acc
      * @param list<null|int|float|string|Blob> $args evaluated argument values
+     * @param bool $distinct when true (COUNT/SUM/AVG/... DISTINCT), a repeated
+     *        argument value is ignored so each distinct value contributes once
      */
-    public static function step(object $acc, array $args, bool $star): void
+    public static function step(object $acc, array $args, bool $star, bool $distinct = false): void
     {
+        // DISTINCT dedup applies to the (single) aggregate argument. NULLs are
+        // dropped by each aggregate's own NULL handling below, so they never key
+        // the seen-set; keying matches the engine's GROUP BY value identity.
+        if ($distinct && !$star) {
+            $v0 = $args[0] ?? null;
+            if ($v0 !== null) {
+                $key = self::distinctKey($v0);
+                if (isset($acc->seen[$key])) {
+                    return;
+                }
+                $acc->seen[$key] = true;
+            }
+        }
+
         $name = $acc->name;
         if ($name === 'count') {
             if ($star || ($args[0] ?? null) !== null) {
@@ -94,6 +112,20 @@ final class Aggregates
                 $acc->sep = isset($args[1]) ? (string) Value::toText($args[1]) : ',';
                 break;
         }
+    }
+
+    /**
+     * Type-tagged identity key for DISTINCT dedup. Mirrors the executor's
+     * GROUP BY value keying so COUNT(DISTINCT x) agrees with GROUP BY x.
+     */
+    private static function distinctKey(int|float|string|Blob $v): string
+    {
+        return match (true) {
+            \is_int($v) => 'i' . $v,
+            \is_float($v) => 'f' . $v,
+            $v instanceof Blob => 'b' . $v->bytes,
+            default => 't' . $v,
+        };
     }
 
     public static function finalize(object $acc): null|int|float|string|Blob

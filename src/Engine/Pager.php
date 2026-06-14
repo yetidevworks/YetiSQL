@@ -24,6 +24,13 @@ final class Pager
     public const DEFAULT_PAGE_SIZE = 4096;
     public const HEADER_SIZE = 100;
     public const MASTER_ROOT = 2;
+    /**
+     * On-disk schema format. Bumped to 5 when the b-tree page header grew from
+     * 12 to 16 bytes to carry persisted subtree row counts. Files written by an
+     * earlier format are NOT readable (the b-tree page layout differs), so we
+     * reject them on open rather than silently misreading page contents.
+     */
+    public const SCHEMA_FORMAT = 5;
 
     private mixed $handle = null;
     private readonly bool $memory;
@@ -160,6 +167,14 @@ final class Pager
             'npageSize/Cwrite/Cread/Npages/Nfreehead/Nfreecount/Ncookie/Nschemafmt/Nchange',
             \substr($raw, 8, 31),
         );
+        if ($h['schemafmt'] !== self::SCHEMA_FORMAT) {
+            throw new YetiSQLException(\sprintf(
+                'unsupported YetiSQL schema format %d (this build reads format %d); '
+                . 'the database was written by an incompatible version',
+                $h['schemafmt'],
+                self::SCHEMA_FORMAT,
+            ));
+        }
         $this->pageSize = $h['pageSize'] === 0 ? self::DEFAULT_PAGE_SIZE : $h['pageSize'];
         $this->pageCount = $h['pages'];
         $this->freelistHead = $h['freehead'];
@@ -178,7 +193,7 @@ final class Pager
             . \pack('N', $this->freelistHead)
             . \pack('N', $this->freelistCount)
             . \pack('N', $this->schemaCookie)
-            . \pack('N', 5) // schema format
+            . \pack('N', self::SCHEMA_FORMAT) // schema format
             . \pack('N', $this->changeCounter)
             . \pack('N', self::MASTER_ROOT)
             . \pack('N', 1) // text encoding: UTF-8

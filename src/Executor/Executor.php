@@ -922,9 +922,25 @@ final class Executor
 
         $tree = new TableBTree($this->db->pager(), $info->rootPage);
         $cacheId = \spl_object_id($select);
+        // PHP reuses spl_object_id() after an object is freed, so a different
+        // statement can land on a prior one's id. Validate a structural signature
+        // (group column + each output aggregate's name/arg) so a collision on a
+        // different query misses the cache and recomputes instead of serving its
+        // rows. (Param-independent: this fast path requires no WHERE/HAVING.)
+        $sigParts = ['g' . $groupPos];
+        foreach ($outPlan as $op) {
+            if ($op['kind'] === 'group') {
+                $sigParts[] = 'G';
+                continue;
+            }
+            $spec = $aggSpecs[$op['id']];
+            $sigParts[] = $spec['name'] . ':' . ($spec['star'] ? '*' : (string) $spec['pos']);
+        }
+        $sig = \implode(',', $sigParts);
         if (!$this->db->inTransaction()) {
             $cached = $this->groupedAggregateCache[$cacheId] ?? null;
             if ($cached !== null
+                && $cached['sig'] === $sig
                 && $cached['cookie'] === $this->db->pager()->schemaCookie()
                 && $cached['changes'] === $this->db->totalChanges()
                 && $cached['root'] === $info->rootPage) {
@@ -1029,6 +1045,7 @@ final class Executor
                 $this->groupedAggregateCache = [];
             }
             $this->groupedAggregateCache[$cacheId] = [
+                'sig' => $sig,
                 'cookie' => $this->db->pager()->schemaCookie(),
                 'changes' => $this->db->totalChanges(),
                 'root' => $info->rootPage,
@@ -1100,7 +1117,7 @@ final class Executor
                         $args[] = $eval->evaluate($arg, $env);
                     }
                 }
-                Aggregates::step($accs[$id], $args, $node->star);
+                Aggregates::step($accs[$id], $args, $node->star, $node->distinct);
             }
         }
 
@@ -1472,7 +1489,7 @@ final class Executor
                         $args[] = $eval->evaluate($arg, $env);
                     }
                 }
-                Aggregates::step($accsByGroup[$key][$id], $args, $node->star);
+                Aggregates::step($accsByGroup[$key][$id], $args, $node->star, $node->distinct);
             }
         }
 
