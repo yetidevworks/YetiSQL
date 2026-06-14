@@ -290,7 +290,12 @@ final class Executor
             return [$colNames, ...$this->aggregateUngrouped($select, $outputCols, $aggregateNodes, $eval, $orderPlan)];
         }
 
-        if ($isAggregate) {
+        if ($this->selectHasWindow($select)) {
+            if ($isAggregate || $select->groupBy !== []) {
+                throw new SqlException('window functions combined with GROUP BY are not supported yet');
+            }
+            [$rows, $keys] = $this->windowProject($select, $outputCols, $eval, $orderPlan);
+        } elseif ($isAggregate) {
             $fastGrouped = $this->tryFastGroupedAggregate($select, $outputCols, $aggregateNodes, $orderPlan);
             if ($fastGrouped !== null) {
                 return [$colNames, $fastGrouped[0], $fastGrouped[1]];
@@ -1066,8 +1071,360 @@ final class Executor
     // --- aggregation -----------------------------------------------------
 
     /** @param array<int,Expr> $nodes accumulator-by-id, set on the evaluator */
+    // === window functions =================================================
+
+    private function selectHasWindow(SelectStatement $select): bool
+    {
+        foreach ($select->columns as $rc) {
+            if ($rc->expr instanceof Expr && $this->exprHasWindow($rc->expr)) {
+                return true;
+            }
+        }
+        foreach ($select->orderBy as $ot) {
+            if ($this->exprHasWindow($ot->expr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function exprHasWindow(Expr $e): bool
+    {
+        if ($e->kind === Expr::FUNC && $e->window !== null) {
+            return true;
+        }
+        foreach ([$e->left, $e->right, $e->operand, $e->subject, $e->elseExpr, $e->low, $e->high, $e->escape] as $c) {
+            if ($c instanceof Expr && $this->exprHasWindow($c)) {
+                return true;
+            }
+        }
+        foreach ([...$e->args, ...$e->list] as $c) {
+            if ($this->exprHasWindow($c)) {
+                return true;
+            }
+        }
+        foreach ($e->whens as [$w, $t]) {
+            if ($this->exprHasWindow($w) || $this->exprHasWindow($t)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** @param array<int,Expr> $nodes */
+    private function collectWindowFuncs(Expr $e, array &$nodes): void
+    {
+        if ($e->kind === Expr::FUNC && $e->window !== null) {
+            $nodes[\spl_object_id($e)] = $e;
+            return;
+        }
+        foreach ([$e->left, $e->right, $e->operand, $e->subject, $e->elseExpr, $e->low, $e->high, $e->escape] as $c) {
+            if ($c instanceof Expr) {
+                $this->collectWindowFuncs($c, $nodes);
+            }
+        }
+        foreach ([...$e->args, ...$e->list] as $c) {
+            $this->collectWindowFuncs($c, $nodes);
+        }
+        foreach ($e->whens as [$w, $t]) {
+            $this->collectWindowFuncs($w, $nodes);
+            $this->collectWindowFuncs($t, $nodes);
+        }
+    }
+
+    /**
+     * Materialize the filtered rows, compute each window function over its
+     * partitions, then project (window calls resolve to precomputed values).
+     *
+     * @param list<array{name:string,expr:?Expr,star:bool,tableStar:?string}> $outputCols
+     * @param list<array{kind:string,index:?int,expr:Expr,desc:bool}> $orderPlan
+     * @return array{0:list<list<null|int|float|string|Blob>>,1:list<list<null|int|float|string|Blob>>}
+     */
+    private function windowProject(SelectStatement $select, array $outputCols, Evaluator $eval, array $orderPlan): array
+    {
+        $this->exposeSelectAliases($select, $eval);
+
+        $envs = [];
+        foreach ($this->filteredJoined($select, $eval) as $env) {
+            $envs[] = $env;
+        }
+
+        $nodes = [];
+        foreach ($outputCols as $c) {
+            if ($c['expr'] instanceof Expr) {
+                $this->collectWindowFuncs($c['expr'], $nodes);
+            }
+        }
+        foreach ($select->orderBy as $ot) {
+            $this->collectWindowFuncs($ot->expr, $nodes);
+        }
+
+        $eval->windowValues = [];
+        foreach ($nodes as $id => $node) {
+            $eval->windowValues[$id] = $this->computeWindow($node, $envs, $eval);
+        }
+
+        // Force the tree-walker for projection so window FUNC nodes resolve.
+        $savedProject = $eval->compiledProject;
+        $eval->compiledProject = null;
+        $rows = [];
+        $keys = [];
+        foreach ($envs as $i => $env) {
+            $eval->windowRow = $i;
+            $row = $this->projectRow($outputCols, $env, $eval);
+            $rows[] = $row;
+            if ($orderPlan !== []) {
+                $keys[] = $this->computeOrderKeys($orderPlan, $env, $eval, $row);
+            }
+        }
+        $eval->compiledProject = $savedProject;
+
+        return [$rows, $keys];
+    }
+
+    /**
+     * Compute a single window function's value for every source row.
+     *
+     * @param list<RowEnv> $envs
+     * @return list<null|int|float|string|Blob>
+     */
+    private function computeWindow(Expr $node, array $envs, Evaluator $eval): array
+    {
+        $n = \count($envs);
+        $result = \array_fill(0, $n, null);
+        if ($n === 0) {
+            return $result;
+        }
+        $spec = $node->window;
+        $name = \strtolower((string) $node->name);
+
+        // Partition the row indices.
+        $partitions = [];
+        foreach ($envs as $i => $env) {
+            $pk = '';
+            foreach ($spec->partitionBy as $pe) {
+                $pk .= $this->valueKey($eval->evaluate($pe, $env)) . "\x1e";
+            }
+            $partitions[$pk][] = $i;
+        }
+
+        foreach ($partitions as $indices) {
+            $orderKeys = [];
+            if ($spec->orderBy !== []) {
+                foreach ($indices as $i) {
+                    $k = [];
+                    foreach ($spec->orderBy as $ot) {
+                        $k[] = $eval->evaluate($ot->expr, $envs[$i]);
+                    }
+                    $orderKeys[$i] = $k;
+                }
+                // PHP 8's usort is stable, so peers keep source order.
+                \usort($indices, function (int $a, int $b) use ($orderKeys, $spec): int {
+                    foreach ($spec->orderBy as $j => $ot) {
+                        $cmp = Value::compare($orderKeys[$a][$j], $orderKeys[$b][$j], $ot->collation ?? 'BINARY');
+                        if ($cmp !== 0) {
+                            return $ot->desc ? -$cmp : $cmp;
+                        }
+                    }
+                    return 0;
+                });
+            }
+            $this->computeWindowPartition($name, $node, $spec, $indices, $orderKeys, $envs, $eval, $result);
+        }
+        return $result;
+    }
+
+    /**
+     * @param list<int> $indices ordered source-row indices in one partition
+     * @param array<int,list<null|int|float|string|Blob>> $orderKeys
+     * @param list<RowEnv> $envs
+     * @param list<null|int|float|string|Blob> $result written in place
+     */
+    private function computeWindowPartition(string $name, Expr $node, $spec, array $indices, array $orderKeys, array $envs, Evaluator $eval, array &$result): void
+    {
+        $m = \count($indices);
+
+        if (\in_array($name, ['row_number', 'rank', 'dense_rank', 'ntile', 'percent_rank', 'cume_dist'], true)) {
+            $rank = 0;
+            $dense = 0;
+            for ($p = 0; $p < $m; $p++) {
+                $i = $indices[$p];
+                $peer = $p > 0 && $this->windowPeers($orderKeys[$indices[$p - 1]] ?? [], $orderKeys[$i] ?? [], $spec);
+                if (!$peer) {
+                    $rank = $p + 1;
+                    $dense++;
+                }
+                $result[$i] = match ($name) {
+                    'row_number' => $p + 1,
+                    'rank' => $rank,
+                    'dense_rank' => $dense,
+                    'percent_rank' => $m > 1 ? (float) ($rank - 1) / ($m - 1) : 0.0,
+                    'cume_dist' => $this->windowCumeDist($p, $m, $indices, $orderKeys, $spec),
+                    'ntile' => $this->windowNtile($p, $m, $node, $envs[$i], $eval),
+                    default => null,
+                };
+            }
+            return;
+        }
+
+        if ($name === 'lag' || $name === 'lead') {
+            for ($p = 0; $p < $m; $p++) {
+                $i = $indices[$p];
+                $off = isset($node->args[1]) ? (int) Value::toNumber($eval->evaluate($node->args[1], $envs[$i])) : 1;
+                $target = $name === 'lag' ? $p - $off : $p + $off;
+                if ($target >= 0 && $target < $m) {
+                    $result[$i] = $eval->evaluate($node->args[0], $envs[$indices[$target]]);
+                } else {
+                    $result[$i] = isset($node->args[2]) ? $eval->evaluate($node->args[2], $envs[$i]) : null;
+                }
+            }
+            return;
+        }
+
+        // Frame-based: first_value / last_value / nth_value and aggregates.
+        for ($p = 0; $p < $m; $p++) {
+            $i = $indices[$p];
+            [$start, $end] = $this->windowFrame($p, $m, $indices, $orderKeys, $spec, $envs, $eval);
+            if ($start > $end) {
+                $result[$i] = null;
+                continue;
+            }
+            if ($name === 'first_value') {
+                $result[$i] = $eval->evaluate($node->args[0], $envs[$indices[$start]]);
+            } elseif ($name === 'last_value') {
+                $result[$i] = $eval->evaluate($node->args[0], $envs[$indices[$end]]);
+            } elseif ($name === 'nth_value') {
+                $nth = (int) Value::toNumber($eval->evaluate($node->args[1], $envs[$i]));
+                $idx = $start + $nth - 1;
+                $result[$i] = ($nth >= 1 && $idx <= $end) ? $eval->evaluate($node->args[0], $envs[$indices[$idx]]) : null;
+            } else {
+                $acc = Aggregates::newAccumulator($name);
+                for ($q = $start; $q <= $end; $q++) {
+                    $args = [];
+                    foreach ($node->args as $arg) {
+                        $args[] = $eval->evaluate($arg, $envs[$indices[$q]]);
+                    }
+                    Aggregates::step($acc, $args, $node->star, $node->distinct);
+                }
+                $result[$i] = Aggregates::finalize($acc);
+            }
+        }
+    }
+
+    /** Whether two window ORDER BY keys are peers (equal under each term's collation). */
+    private function windowPeers(array $a, array $b, $spec): bool
+    {
+        foreach ($spec->orderBy as $j => $ot) {
+            if (Value::compare($a[$j] ?? null, $b[$j] ?? null, $ot->collation ?? 'BINARY') !== 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Frame [start,end] as inclusive positions in the ordered partition. Honors
+     * the default frame (RANGE UNBOUNDED PRECEDING..CURRENT ROW with ORDER BY,
+     * else whole partition) and explicit ROWS frames; RANGE/GROUPS bounds fall
+     * back to peer-extended row positions.
+     *
+     * @param list<int> $indices
+     * @param array<int,list<null|int|float|string|Blob>> $orderKeys
+     * @param list<RowEnv> $envs
+     * @return array{0:int,1:int}
+     */
+    private function windowFrame(int $p, int $m, array $indices, array $orderKeys, $spec, array $envs, Evaluator $eval): array
+    {
+        $frame = $spec->frame;
+        if ($frame === null) {
+            if ($spec->orderBy === []) {
+                return [0, $m - 1];
+            }
+            // Default RANGE: from partition start through the current row's peers.
+            $end = $p;
+            while ($end + 1 < $m && $this->windowPeers($orderKeys[$indices[$p]], $orderKeys[$indices[$end + 1]], $spec)) {
+                $end++;
+            }
+            return [0, $end];
+        }
+
+        $rows = $frame['units'] === 'rows';
+        $start = $this->windowBound($frame['startKind'], $frame['startVal'], $p, $m, $indices, $orderKeys, $spec, $envs, $eval, true, $rows);
+        $end = $this->windowBound($frame['endKind'], $frame['endVal'], $p, $m, $indices, $orderKeys, $spec, $envs, $eval, false, $rows);
+        return [\max(0, $start), \min($m - 1, $end)];
+    }
+
+    /**
+     * @param list<int> $indices
+     * @param array<int,list<null|int|float|string|Blob>> $orderKeys
+     * @param list<RowEnv> $envs
+     */
+    private function windowBound(string $kind, ?Expr $val, int $p, int $m, array $indices, array $orderKeys, $spec, array $envs, Evaluator $eval, bool $isStart, bool $rows): int
+    {
+        switch ($kind) {
+            case 'unboundedPreceding':
+                return 0;
+            case 'unboundedFollowing':
+                return $m - 1;
+            case 'preceding':
+                $n = (int) Value::toNumber($eval->evaluate($val, $envs[$indices[$p]]));
+                return $p - $n;
+            case 'following':
+                $n = (int) Value::toNumber($eval->evaluate($val, $envs[$indices[$p]]));
+                return $p + $n;
+            case 'currentRow':
+            default:
+                if ($rows || $spec->orderBy === []) {
+                    return $p;
+                }
+                // RANGE CURRENT ROW: extend to the peer-group boundary.
+                if ($isStart) {
+                    $s = $p;
+                    while ($s > 0 && $this->windowPeers($orderKeys[$indices[$p]], $orderKeys[$indices[$s - 1]], $spec)) {
+                        $s--;
+                    }
+                    return $s;
+                }
+                $e = $p;
+                while ($e + 1 < $m && $this->windowPeers($orderKeys[$indices[$p]], $orderKeys[$indices[$e + 1]], $spec)) {
+                    $e++;
+                }
+                return $e;
+        }
+    }
+
+    private function windowNtile(int $p, int $m, Expr $node, RowEnv $env, Evaluator $eval): int
+    {
+        $buckets = isset($node->args[0]) ? (int) Value::toNumber($eval->evaluate($node->args[0], $env)) : 1;
+        if ($buckets < 1) {
+            $buckets = 1;
+        }
+        $base = \intdiv($m, $buckets);
+        $rem = $m % $buckets;
+        // The first $rem buckets hold $base+1 rows; the rest hold $base.
+        $big = $rem * ($base + 1);
+        return $p < $big ? \intdiv($p, $base + 1) + 1 : $rem + \intdiv($p - $big, \max(1, $base)) + 1;
+    }
+
+    /**
+     * @param list<int> $indices
+     * @param array<int,list<null|int|float|string|Blob>> $orderKeys
+     */
+    private function windowCumeDist(int $p, int $m, array $indices, array $orderKeys, $spec): float
+    {
+        // Fraction of rows whose order key is <= the current row's (peers count).
+        $end = $p;
+        while ($end + 1 < $m && $this->windowPeers($orderKeys[$indices[$p]], $orderKeys[$indices[$end + 1]], $spec)) {
+            $end++;
+        }
+        return ($end + 1) / $m;
+    }
+
     private function collectAggregates(Expr $e, array &$nodes): void
     {
+        if ($e->kind === Expr::FUNC && $e->window !== null) {
+            return; // window functions are computed by the window stage, not GROUP BY
+        }
         if ($e->kind === Expr::FUNC && Aggregates::isAggregate((string) $e->name)) {
             $nodes[\spl_object_id($e)] = $e;
             return; // do not descend into aggregate args for nested aggregate detection

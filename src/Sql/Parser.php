@@ -1125,22 +1125,95 @@ final class Parser
         if ($this->accept(Token::OP, '*')) {
             $fn->star = true;
             $this->expect(Token::PUNCT, ')');
-            return $fn;
+        } else {
+            if ($this->accept(Token::KEYWORD, 'DISTINCT')) {
+                $fn->distinct = true;
+            }
+            if (!$this->peek()->is(Token::PUNCT, ')')) {
+                do {
+                    $fn->args[] = $this->expression();
+                } while ($this->accept(Token::PUNCT, ','));
+            }
+            $this->expect(Token::PUNCT, ')');
         }
-        if ($this->accept(Token::KEYWORD, 'DISTINCT')) {
-            $fn->distinct = true;
+        if ($this->peek()->isKeyword('FILTER')) {
+            throw SqlException::parse('aggregate FILTER clause is not supported in this version');
         }
-        if (!$this->peek()->is(Token::PUNCT, ')')) {
-            do {
-                $fn->args[] = $this->expression();
-            } while ($this->accept(Token::PUNCT, ','));
-        }
-        $this->expect(Token::PUNCT, ')');
-        // aggregate FILTER / OVER clauses not supported; reject if present
-        if ($this->peek()->isKeyword('FILTER') || $this->peek()->isKeyword('OVER')) {
-            throw SqlException::parse('window/FILTER clauses are not supported in this version');
+        if ($this->accept(Token::KEYWORD, 'OVER') || $this->accept(Token::IDENT, 'OVER')) {
+            $fn->window = $this->windowSpec();
         }
         return $fn;
+    }
+
+    private function windowSpec(): \YetiDevWorks\YetiSQL\Sql\Ast\WindowSpec
+    {
+        $this->expect(Token::PUNCT, '(');
+        $partition = [];
+        $order = [];
+        if ($this->accept(Token::KEYWORD, 'PARTITION') || $this->accept(Token::IDENT, 'PARTITION')) {
+            $this->expect(Token::KEYWORD, 'BY');
+            do {
+                $partition[] = $this->expression();
+            } while ($this->accept(Token::PUNCT, ','));
+        }
+        if ($this->accept(Token::KEYWORD, 'ORDER')) {
+            $this->expect(Token::KEYWORD, 'BY');
+            do {
+                $order[] = $this->orderTerm();
+            } while ($this->accept(Token::PUNCT, ','));
+        }
+        $frame = $this->maybeWindowFrame();
+        $this->expect(Token::PUNCT, ')');
+        return new \YetiDevWorks\YetiSQL\Sql\Ast\WindowSpec($partition, $order, $frame);
+    }
+
+    /** @return array{units:string,startKind:string,startVal:?\YetiDevWorks\YetiSQL\Sql\Ast\Expr,endKind:string,endVal:?\YetiDevWorks\YetiSQL\Sql\Ast\Expr}|null */
+    private function maybeWindowFrame(): ?array
+    {
+        $units = null;
+        if ($this->accept(Token::IDENT, 'ROWS') || $this->accept(Token::KEYWORD, 'ROWS')) {
+            $units = 'rows';
+        } elseif ($this->accept(Token::IDENT, 'RANGE') || $this->accept(Token::KEYWORD, 'RANGE')) {
+            $units = 'range';
+        } elseif ($this->accept(Token::IDENT, 'GROUPS') || $this->accept(Token::KEYWORD, 'GROUPS')) {
+            $units = 'groups';
+        }
+        if ($units === null) {
+            return null;
+        }
+        if ($this->accept(Token::KEYWORD, 'BETWEEN') || $this->accept(Token::IDENT, 'BETWEEN')) {
+            [$startKind, $startVal] = $this->frameBound();
+            $this->expect(Token::KEYWORD, 'AND');
+            [$endKind, $endVal] = $this->frameBound();
+        } else {
+            // A single bound is the frame start; the end is implicitly CURRENT ROW.
+            [$startKind, $startVal] = $this->frameBound();
+            $endKind = 'currentRow';
+            $endVal = null;
+        }
+        return ['units' => $units, 'startKind' => $startKind, 'startVal' => $startVal, 'endKind' => $endKind, 'endVal' => $endVal];
+    }
+
+    /** @return array{0:string,1:?\YetiDevWorks\YetiSQL\Sql\Ast\Expr} */
+    private function frameBound(): array
+    {
+        if ($this->accept(Token::KEYWORD, 'UNBOUNDED') || $this->accept(Token::IDENT, 'UNBOUNDED')) {
+            if ($this->accept(Token::IDENT, 'PRECEDING') || $this->accept(Token::KEYWORD, 'PRECEDING')) {
+                return ['unboundedPreceding', null];
+            }
+            $this->accept(Token::IDENT, 'FOLLOWING') || $this->accept(Token::KEYWORD, 'FOLLOWING');
+            return ['unboundedFollowing', null];
+        }
+        if ($this->accept(Token::KEYWORD, 'CURRENT') || $this->accept(Token::IDENT, 'CURRENT')) {
+            $this->accept(Token::IDENT, 'ROW') || $this->accept(Token::KEYWORD, 'ROW');
+            return ['currentRow', null];
+        }
+        $val = $this->expression();
+        if ($this->accept(Token::IDENT, 'PRECEDING') || $this->accept(Token::KEYWORD, 'PRECEDING')) {
+            return ['preceding', $val];
+        }
+        $this->accept(Token::IDENT, 'FOLLOWING') || $this->accept(Token::KEYWORD, 'FOLLOWING');
+        return ['following', $val];
     }
 
     private function caseExpr(): Expr

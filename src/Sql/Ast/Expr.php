@@ -58,6 +58,8 @@ final class Expr
         public ?Expr $escape = null,
         public ?string $collation = null,
         public mixed $select = null,
+        /** OVER (...) window specification, when this FUNC is a window call. */
+        public ?WindowSpec $window = null,
     ) {
     }
 

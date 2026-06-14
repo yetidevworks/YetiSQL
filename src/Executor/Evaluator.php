@@ -27,6 +27,16 @@ final class Evaluator
     public array $aggregateValues = [];
 
     /**
+     * Precomputed window-function results: spl_object_id(Expr) => list of values
+     * indexed by the row's position in the materialized result set. $windowRow
+     * selects the current row during projection.
+     *
+     * @var array<int,list<null|int|float|string|Blob>>
+     */
+    public array $windowValues = [];
+    public int $windowRow = 0;
+
+    /**
      * SELECT-list aliases visible to HAVING/ORDER BY (lower-cased name => the
      * aliased expression). Consulted only when a real column does not resolve.
      *
@@ -859,6 +869,10 @@ final class Evaluator
     private function func(Expr $e, ?RowEnv $env): null|int|float|string|Blob
     {
         $name = \strtolower((string) $e->name);
+
+        if ($e->window !== null) {
+            return $this->windowValues[\spl_object_id($e)][$this->windowRow] ?? null;
+        }
 
         if (Aggregates::isAggregate($name)) {
             return $this->aggregateValues[\spl_object_id($e)] ?? null;
