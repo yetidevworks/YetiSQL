@@ -13,6 +13,9 @@ final class TableInfo
     /** @var array<string,int> lower-cased column name => position */
     public array $columnIndex = [];
 
+    /** @var list<int> positions of GENERATED columns (empty for most tables) */
+    public array $generatedPositions = [];
+
     public function __construct(
         public string $name,
         public int $rootPage,
@@ -26,6 +29,9 @@ final class TableInfo
     ) {
         foreach ($columns as $i => $col) {
             $this->columnIndex[\strtolower($col->name)] = $i;
+            if ($col->generated !== null) {
+                $this->generatedPositions[] = $i;
+            }
         }
     }
 

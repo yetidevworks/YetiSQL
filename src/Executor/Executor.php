@@ -4283,6 +4283,9 @@ final class Executor
                 if ($pos === null) {
                     throw new SqlException("table {$info->name} has no column named $colName");
                 }
+                if ($info->columns[$pos]->generated !== null) {
+                    throw SqlException::constraint("cannot INSERT into generated column \"{$colName}\"");
+                }
                 $byPos[$pos] = $data[$k] ?? null;
                 $provided[$pos] = true;
             }
@@ -4300,9 +4303,14 @@ final class Executor
             }
         }
 
-        // Apply defaults / NOT NULL checks / affinity per column.
+        // Apply defaults / NOT NULL checks / affinity per column. Generated
+        // columns are filled afterwards from the completed row.
         $record = [];
         foreach ($info->columns as $pos => $col) {
+            if ($col->generated !== null) {
+                $record[$pos] = null;
+                continue;
+            }
             $value = $byPos[$pos];
             if (!$provided[$pos] || ($value === null && !$provided[$pos])) {
                 if ($col->default !== null) {
@@ -4321,12 +4329,15 @@ final class Executor
             $record[$pos] = $value;
         }
 
-        $payload = RecordCodec::encode(\array_values($record));
-
         $logical = $record;
         if ($info->hasRowidAlias()) {
             $logical[$info->rowidAlias] = $rowid;
         }
+        if ($info->generatedPositions !== []) {
+            $this->applyGeneratedColumns($info, $logical, $rowid, $eval);
+        }
+
+        $payload = RecordCodec::encode($this->buildRecord($info, $logical));
         $logical = \array_values($logical);
 
         if ($fireTrig) {
@@ -4445,6 +4456,9 @@ final class Executor
                 if ($pos === null) {
                     throw new SqlException("no such column: $colName");
                 }
+                if ($info->columns[$pos]->generated !== null) {
+                    throw SqlException::constraint("cannot UPDATE generated column \"{$colName}\"");
+                }
                 $v = $eval->evaluate($expr, $env);
                 if ($pos === $info->rowidAlias) {
                     $newRowid = (int) Value::toNumber($v);
@@ -4456,6 +4470,15 @@ final class Executor
                     }
                 }
                 $changed[$pos] = true;
+            }
+
+            // Recompute generated columns from the updated row, and mark them
+            // changed so dependent indexes are maintained.
+            if ($info->generatedPositions !== []) {
+                $this->applyGeneratedColumns($info, $newValues, $newRowid, $eval);
+                foreach ($info->generatedPositions as $gp) {
+                    $changed[$gp] = true;
+                }
             }
 
             if ($fireTrig) {
@@ -4582,6 +4605,34 @@ final class Executor
             );
         }
         return Result::affected(\count($targets));
+    }
+
+    /**
+     * Fill every GENERATED column of $logical (the full row vector, rowid slot
+     * set) by evaluating its expression against the row's other values. A
+     * fixpoint pass resolves generated columns that reference one another.
+     *
+     * @param list<null|int|float|string|Blob> $logical
+     */
+    private function applyGeneratedColumns(TableInfo $info, array &$logical, int $rowid, Evaluator $eval): void
+    {
+        $passes = \count($info->generatedPositions) + 1;
+        for ($pass = 0; $pass < $passes; $pass++) {
+            $env = new RowEnv();
+            $env->addFrame($info->name, $info, $logical, $rowid);
+            $changed = false;
+            foreach ($info->generatedPositions as $pos) {
+                $col = $info->columns[$pos];
+                $value = $col->affinity->apply($eval->evaluate($col->generated, $env));
+                if (($logical[$pos] ?? null) !== $value) {
+                    $changed = true;
+                }
+                $logical[$pos] = $value;
+            }
+            if (!$changed) {
+                break;
+            }
+        }
     }
 
     /** @return list<null|int|float|string|Blob> */

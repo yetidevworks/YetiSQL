@@ -23,6 +23,8 @@ final class ColumnInfo
          * returned for rows written before the column was added via ALTER TABLE.
          */
         public null|int|float|string|Blob $defaultValue = null,
+        /** GENERATED ALWAYS AS (expr): recomputed and stored on every write. */
+        public ?Expr $generated = null,
     ) {
     }
 }

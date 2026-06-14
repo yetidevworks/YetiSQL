@@ -19,6 +19,10 @@ final class ColumnDef
         public ?string $collation = null,
         /** Verbatim SQL text of the DEFAULT clause's value, for re-serialization. */
         public ?string $defaultSql = null,
+        /** GENERATED ALWAYS AS (expr) generation expression, or null. */
+        public ?Expr $generated = null,
+        /** Whether the generated column is STORED (vs VIRTUAL); informational. */
+        public bool $generatedStored = false,
     ) {
     }
 }

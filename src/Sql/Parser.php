@@ -633,15 +633,15 @@ final class Parser
                 $this->expect(Token::KEYWORD, 'ALWAYS');
                 $this->expect(Token::KEYWORD, 'AS');
                 $this->expect(Token::PUNCT, '(');
-                $this->expression();
+                $col->generated = $this->expression();
                 $this->expect(Token::PUNCT, ')');
-                $this->accept(Token::IDENT, 'STORED');
+                $col->generatedStored = $this->accept(Token::IDENT, 'STORED');
                 $this->accept(Token::IDENT, 'VIRTUAL');
             } elseif ($this->accept(Token::KEYWORD, 'AS')) {
                 $this->expect(Token::PUNCT, '(');
-                $this->expression();
+                $col->generated = $this->expression();
                 $this->expect(Token::PUNCT, ')');
-                $this->accept(Token::IDENT, 'STORED');
+                $col->generatedStored = $this->accept(Token::IDENT, 'STORED');
                 $this->accept(Token::IDENT, 'VIRTUAL');
             } else {
                 break;

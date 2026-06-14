@@ -661,6 +661,7 @@ final class Schema
                 default: $cd->default,
                 collation: $cd->collation ?? 'BINARY',
                 defaultValue: $affinity->apply(self::constDefault($cd->default)),
+                generated: $cd->generated,
             );
         }
 
