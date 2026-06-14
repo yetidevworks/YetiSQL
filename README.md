@@ -288,7 +288,10 @@ alternative engine used for `EXPLAIN` and available opt-in via `PRAGMA vdbe=on`.
 ## Roadmap
 
 **Working:** secondary-index, multi-column-index, and rowid query planning (equality,
-range, `IN`, `BETWEEN`) with automatic index maintenance on writes; index-driven joins and
+range, `IN`, `BETWEEN`) with automatic index maintenance on writes; `UNIQUE` and
+`PRIMARY KEY` constraint enforcement (backed by auto-created unique indexes, like SQLite's
+`sqlite_autoindex_*`) with `REPLACE` / `INSERT OR REPLACE` / `INSERT OR IGNORE` /
+`UPDATE OR REPLACE`/`IGNORE` conflict resolution; index-driven joins and
 index-accelerated/count-map correlated subqueries; covering-index counts (persisted subtree
 row counts); CTEs (incl. recursive), window functions, views, triggers (incl. `INSTEAD OF`),
 `ALTER TABLE`, true WAL mode, a VDBE bytecode compiler with `EXPLAIN`; the **JSON1** functions

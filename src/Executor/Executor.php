@@ -4097,6 +4097,57 @@ final class Executor
     }
 
     /**
+     * The rowid of an existing row that collides with $logical on a UNIQUE
+     * index, or null if none. A NULL in any indexed column means no conflict
+     * (SQLite treats NULLs as distinct in UNIQUE). $excludeRowid skips the row
+     * being updated.
+     *
+     * @param list<null|int|float|string|Blob> $logical
+     */
+    private function uniqueConflictRowid(\YetiDevWorks\YetiSQL\Engine\IndexInfo $index, array $logical, ?int $excludeRowid): ?int
+    {
+        $cols = [];
+        foreach ($index->columnPositions as $pos) {
+            $v = $logical[$pos] ?? null;
+            if ($v === null) {
+                return null;
+            }
+            $cols[] = $v;
+        }
+        $n = \count($cols);
+        foreach ($this->indexTree($index)->scanFrom($cols) as $key) {
+            for ($i = 0; $i < $n; $i++) {
+                if (Value::compare($key[$i], $cols[$i], $index->collations[$i] ?? 'BINARY') !== 0) {
+                    return null; // scanned past the block of matching keys
+                }
+            }
+            $rid = (int) $key[\count($key) - 1];
+            if ($rid === $excludeRowid) {
+                continue;
+            }
+            return $rid;
+        }
+        return null;
+    }
+
+    /** "table.col" label for a rowid (INTEGER PRIMARY KEY) uniqueness violation. */
+    private function rowidConflictLabel(TableInfo $info): string
+    {
+        $col = $info->hasRowidAlias() ? $info->columns[$info->rowidAlias]->name : 'rowid';
+        return "{$info->name}.{$col}";
+    }
+
+    /** "table.col[, table.col]" label for a unique-index violation. */
+    private function uniqueIndexLabel(TableInfo $info, \YetiDevWorks\YetiSQL\Engine\IndexInfo $index): string
+    {
+        $parts = [];
+        foreach ($index->columnPositions as $pos) {
+            $parts[] = "{$info->name}.{$info->columns[$pos]->name}";
+        }
+        return \implode(', ', $parts);
+    }
+
+    /**
      * @param list<null|int|float|string|Blob> $logicalValues
      * @return list<null|int|float|string|Blob>
      */
@@ -4218,20 +4269,64 @@ final class Executor
             $this->fireTriggers($info, CreateTriggerStatement::INSERT, CreateTriggerStatement::BEFORE, null, $logical, $rowid, $rowid);
         }
 
-        if ($stmt->orReplace) {
+        $uniqueIndexes = [];
+        foreach ($this->db->schema()->resolvedIndexes($info->name) as $index) {
+            if ($index->unique) {
+                $uniqueIndexes[] = $index;
+            }
+        }
+
+        if ($uniqueIndexes === []) {
+            // Fast path: the rowid is the only uniqueness constraint, so a single
+            // insert descent (putIfAbsent) enforces it without an extra probe.
+            if ($stmt->orReplace) {
+                if ($tree->exists($rowid)) {
+                    $old = $this->decodeRow($info, $rowid, (string) $tree->get($rowid));
+                    $this->deleteIndexEntries($info, $rowid, $old);
+                    $tree->delete($rowid);
+                }
+                $tree->put($rowid, $payload);
+            } elseif (!$tree->putIfAbsent($rowid, $payload)) {
+                if ($stmt->orIgnore) {
+                    return $this->db->lastInsertId();
+                }
+                throw SqlException::constraint("UNIQUE constraint failed: {$this->rowidConflictLabel($info)}");
+            }
+        } else {
+            // A table with UNIQUE/PRIMARY KEY indexes: collect every conflicting
+            // existing row (rowid PK plus each unique index) and apply the
+            // INSERT / REPLACE / IGNORE conflict resolution.
+            $conflicts = [];
             if ($tree->exists($rowid)) {
-                $old = $this->decodeRow($info, $rowid, (string) $tree->get($rowid));
-                $this->deleteIndexEntries($info, $rowid, $old);
-                $tree->delete($rowid);
+                $conflicts[] = ['rowid' => $rowid, 'label' => $this->rowidConflictLabel($info)];
+            }
+            foreach ($uniqueIndexes as $index) {
+                $rid = $this->uniqueConflictRowid($index, $logical, null);
+                if ($rid !== null) {
+                    $conflicts[] = ['rowid' => $rid, 'label' => $this->uniqueIndexLabel($info, $index)];
+                }
+            }
+
+            if ($conflicts !== []) {
+                if ($stmt->orIgnore) {
+                    return $this->db->lastInsertId();
+                }
+                if (!$stmt->orReplace) {
+                    throw SqlException::constraint('UNIQUE constraint failed: ' . $conflicts[0]['label']);
+                }
+                $deleted = [];
+                foreach ($conflicts as $c) {
+                    $rid = $c['rowid'];
+                    if (isset($deleted[$rid]) || !$tree->exists($rid)) {
+                        continue;
+                    }
+                    $deleted[$rid] = true;
+                    $old = $this->decodeRow($info, $rid, (string) $tree->get($rid));
+                    $this->deleteIndexEntries($info, $rid, $old);
+                    $tree->delete($rid);
+                }
             }
             $tree->put($rowid, $payload);
-        } elseif (!$tree->putIfAbsent($rowid, $payload)) {
-            // Rowid already present: a single insert descent enforces uniqueness
-            // (no separate exists() probe).
-            if ($stmt->orIgnore) {
-                return $this->db->lastInsertId();
-            }
-            throw SqlException::constraint("UNIQUE constraint failed: {$info->name} rowid $rowid");
         }
 
         $this->insertIndexEntries($info, $rowid, $logical);
@@ -4299,6 +4394,51 @@ final class Executor
 
             if ($fireTrig) {
                 $this->fireTriggers($info, CreateTriggerStatement::UPDATE, CreateTriggerStatement::BEFORE, $values, $newValues, $rowid, $newRowid, $changed);
+            }
+
+            // Enforce UNIQUE / PRIMARY KEY against other rows (the row's own old
+            // key is excluded). Honour UPDATE OR REPLACE / OR IGNORE.
+            $conflicts = [];
+            if ($newRowid !== $rowid && $tree->exists($newRowid)) {
+                $conflicts[] = ['rowid' => $newRowid, 'label' => $this->rowidConflictLabel($info)];
+            }
+            foreach ($this->db->schema()->resolvedIndexes($info->name) as $index) {
+                if (!$index->unique) {
+                    continue;
+                }
+                $touched = $newRowid !== $rowid;
+                foreach ($index->columnPositions as $p) {
+                    if (isset($changed[$p])) {
+                        $touched = true;
+                        break;
+                    }
+                }
+                if (!$touched) {
+                    continue;
+                }
+                $rid = $this->uniqueConflictRowid($index, $newValues, $rowid);
+                if ($rid !== null) {
+                    $conflicts[] = ['rowid' => $rid, 'label' => $this->uniqueIndexLabel($info, $index)];
+                }
+            }
+            if ($conflicts !== []) {
+                if ($stmt->orIgnore) {
+                    continue; // leave this row unchanged
+                }
+                if (!$stmt->orReplace) {
+                    throw SqlException::constraint('UNIQUE constraint failed: ' . $conflicts[0]['label']);
+                }
+                $deleted = [];
+                foreach ($conflicts as $c) {
+                    $rid = $c['rowid'];
+                    if ($rid === $rowid || isset($deleted[$rid]) || !$tree->exists($rid)) {
+                        continue;
+                    }
+                    $deleted[$rid] = true;
+                    $old = $this->decodeRow($info, $rid, (string) $tree->get($rid));
+                    $this->deleteIndexEntries($info, $rid, $old);
+                    $tree->delete($rid);
+                }
             }
 
             $record = $this->buildRecord($info, $newValues);
@@ -4371,8 +4511,104 @@ final class Executor
 
     private function execCreateTable(CreateTableStatement $stmt): Result
     {
-        $this->db->schema()->createTable($stmt);
+        $existed = $this->db->schema()->hasTable($stmt->name) || $this->db->schema()->hasView($stmt->name);
+        $info = $this->db->schema()->createTable($stmt);
+        if (!$existed) {
+            $this->createConstraintIndexes($stmt, $info);
+        }
         return Result::affected(0);
+    }
+
+    /**
+     * Back every UNIQUE / non-rowid PRIMARY KEY constraint with a real unique
+     * index (SQLite's sqlite_autoindex_* approach), so the constraint is both
+     * enforced and usable by the planner. The INTEGER PRIMARY KEY (rowid alias)
+     * needs no index — the rowid itself enforces it.
+     */
+    private function createConstraintIndexes(CreateTableStatement $stmt, TableInfo $info): void
+    {
+        /** @var list<list<string>> $groups */
+        $groups = [];
+        $seen = [];
+        $add = static function (array $cols) use (&$groups, &$seen): void {
+            if ($cols === []) {
+                return;
+            }
+            $key = \strtolower(\implode("\x1f", $cols));
+            if (isset($seen[$key])) {
+                return;
+            }
+            $seen[$key] = true;
+            $groups[] = $cols;
+        };
+
+        foreach ($stmt->columns as $i => $cd) {
+            if ($cd->unique) {
+                $add([$cd->name]);
+            }
+            if ($cd->primaryKey && $i !== $info->rowidAlias) {
+                $add([$cd->name]);
+            }
+        }
+        foreach ($stmt->uniqueConstraints as $group) {
+            $add($group);
+        }
+        if ($stmt->primaryKeyColumns !== []) {
+            $positions = \array_map(fn (string $n): ?int => $info->columnPos($n), $stmt->primaryKeyColumns);
+            $isRowid = \count($positions) === 1 && $positions[0] === $info->rowidAlias;
+            if (!$isRowid) {
+                $add($stmt->primaryKeyColumns);
+            }
+        }
+
+        $seq = 0;
+        foreach ($groups as $cols) {
+            $seq++;
+            $name = 'sqlite_autoindex_' . $stmt->name . '_' . $seq;
+            $this->createIndexFromStatement($this->autoIndexStatement($name, $stmt->name, $cols), $info);
+        }
+    }
+
+    /** @param list<string> $cols */
+    private function autoIndexStatement(string $name, string $table, array $cols): CreateIndexStatement
+    {
+        $quote = static fn (string $s): string => '"' . \str_replace('"', '""', $s) . '"';
+        $terms = [];
+        foreach ($cols as $c) {
+            $terms[] = new \YetiDevWorks\YetiSQL\Sql\Ast\OrderTerm(Expr::col(null, $c));
+        }
+        $sql = 'CREATE UNIQUE INDEX ' . $quote($name) . ' ON ' . $quote($table)
+            . ' (' . \implode(', ', \array_map($quote, $cols)) . ')';
+        return new CreateIndexStatement($name, $table, $terms, unique: true, sql: $sql);
+    }
+
+    /** Allocate, record, and populate an index b-tree for $stmt. */
+    private function createIndexFromStatement(CreateIndexStatement $stmt, TableInfo $info): void
+    {
+        $root = \YetiDevWorks\YetiSQL\Engine\IndexBTree::create($this->db->pager());
+        $this->db->schema()->recordIndex($stmt, $root);
+
+        $index = null;
+        foreach ($this->db->schema()->resolvedIndexes($stmt->table) as $candidate) {
+            if (\strcasecmp($candidate->name, $stmt->name) === 0) {
+                $index = $candidate;
+                break;
+            }
+        }
+        if ($index === null) {
+            return;
+        }
+        $idx = $this->indexTree($index);
+        $tree = new TableBTree($this->db->pager(), $info->rootPage);
+        $keys = [];
+        foreach ($tree->scan() as [$rowid, $payload]) {
+            $logical = $this->decodeRow($info, $rowid, $payload);
+            $keys[] = $this->indexKey($index, $logical, $rowid);
+        }
+        \usort($keys, fn (array $a, array $b): int => $this->compareIndexKeys($a, $b, $index->collations));
+        foreach ($keys as $key) {
+            $idx->put($key);
+        }
     }
 
     private function execCreateView(CreateViewStatement $stmt): Result
@@ -4687,31 +4923,7 @@ final class Executor
             throw SqlException::constraint("index {$stmt->name} already exists");
         }
         $info = $this->requireTable($stmt->table);
-        $root = \YetiDevWorks\YetiSQL\Engine\IndexBTree::create($this->db->pager());
-        $this->db->schema()->recordIndex($stmt, $root);
-
-        // Populate the index from existing rows.
-        $index = null;
-        foreach ($this->db->schema()->resolvedIndexes($stmt->table) as $candidate) {
-            if (\strcasecmp($candidate->name, $stmt->name) === 0) {
-                $index = $candidate;
-                break;
-            }
-        }
-        if ($index !== null) {
-            $idx = $this->indexTree($index);
-            $tree = new TableBTree($this->db->pager(), $info->rootPage);
-            $keys = [];
-            foreach ($tree->scan() as [$rowid, $payload]) {
-                $logical = $this->decodeRow($info, $rowid, $payload);
-                $keys[] = $this->indexKey($index, $logical, $rowid);
-            }
-            $collations = $index->collations;
-            \usort($keys, fn (array $a, array $b): int => $this->compareIndexKeys($a, $b, $collations));
-            foreach ($keys as $key) {
-                $idx->put($key);
-            }
-        }
+        $this->createIndexFromStatement($stmt, $info);
         return Result::affected(0);
     }
 
