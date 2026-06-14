@@ -135,6 +135,56 @@ function newYeti(): YetiPDO
     return $db;
 }
 
+/**
+ * Measure WAL vs the rollback journal on a file-backed database. The difference
+ * only appears with disk durability and many separate commits — each rollback
+ * commit pays two fsyncs plus journal create/delete and scattered in-place
+ * writes, while a WAL commit is one fsync and a sequential append. (In-memory
+ * databases never touch disk, so WAL is inert there and not measured.)
+ *
+ * @return array<string,float>
+ */
+function runWalSuite(string $journalMode, int $rows): array
+{
+    $path = \sys_get_temp_dir() . '/yetisql_bench_' . \getmypid() . '_' . $journalMode . '.ysql';
+    foreach (['', '-wal', '-journal'] as $s) {
+        if (\is_file($path . $s)) {
+            @\unlink($path . $s);
+        }
+    }
+
+    $db = new YetiPDO('yetisql:' . $path);
+    $db->setAttribute(YetiPDO::ATTR_ERRMODE, YetiPDO::ERRMODE_EXCEPTION);
+    $db->exec('PRAGMA journal_mode=' . $journalMode);
+    $db->exec('CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)');
+
+    $r = [];
+
+    // Many small autocommit INSERTs — one durable commit per row.
+    $r['autocommit_insert'] = timeit(function () use ($db, $rows) {
+        $stmt = $db->prepare('INSERT INTO u (id, v) VALUES (?, ?)');
+        for ($i = 1; $i <= $rows; $i++) {
+            $stmt->execute([$i, 'v' . $i]);
+        }
+    });
+
+    // Many small autocommit UPDATEs — again one commit per row.
+    $r['autocommit_update'] = timeit(function () use ($db, $rows) {
+        $stmt = $db->prepare('UPDATE u SET v = v WHERE id = ?');
+        for ($i = 1; $i <= $rows; $i++) {
+            $stmt->execute([$i]);
+        }
+    });
+
+    unset($db);
+    foreach (['', '-wal', '-journal'] as $s) {
+        if (\is_file($path . $s)) {
+            @\unlink($path . $s);
+        }
+    }
+    return $r;
+}
+
 function newSqlite(): PDO
 {
     $db = new PDO('sqlite::memory:');
@@ -174,3 +224,28 @@ echo "'YetiSQL+idx' uses indexes; 'YetiSQL scan' has no secondary indexes.\n";
 echo "The gap between those two columns is what index-based planning buys — see\n";
 echo "'join' (index nested-loop seek) and 'correlated' (the outer column drives an\n";
 echo "index seek in the subquery), both vs a full inner scan per outer row.\n";
+
+// --- WAL vs rollback journal (file-backed durability) ---------------------
+$WAL_OPS = 2000;
+$walRollback = runWalSuite('delete', $WAL_OPS);
+$walWal = runWalSuite('wal', $WAL_OPS);
+
+echo "\n";
+echo "Durability: WAL vs rollback journal — file-backed, $WAL_OPS ops (lower is faster)\n";
+echo \str_repeat('=', 78) . "\n";
+\printf("%-34s %14s %14s %9s\n", 'workload', 'rollback', 'WAL', 'speedup');
+echo \str_repeat('-', 78) . "\n";
+$walLabels = [
+    'autocommit_insert' => 'INSERTs, one commit each',
+    'autocommit_update' => 'UPDATEs, one commit each',
+];
+foreach ($walLabels as $key => $label) {
+    $ro = $walRollback[$key] ?? 0.0;
+    $wa = $walWal[$key] ?? 0.0;
+    $speedup = $wa > 0 ? \sprintf('%.1fx', $ro / $wa) : '-';
+    \printf("%-34s %14s %14s %9s\n", $label, fmt($ro), fmt($wa), $speedup);
+}
+echo \str_repeat('-', 78) . "\n";
+echo "WAL replaces two fsyncs + journal create/delete per commit with one fsync and\n";
+echo "a sequential append, so the win scales with the number of commits. A single\n";
+echo "big transaction commits once and sees no difference; in-memory never hits disk.\n";
