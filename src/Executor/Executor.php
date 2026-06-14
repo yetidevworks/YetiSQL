@@ -4005,10 +4005,25 @@ final class Executor
         if ($name === 'database_list') {
             return new Result(['seq', 'name', 'file'], [[0, 'main', '']], 1);
         }
-        if (\in_array($name, ['foreign_keys', 'journal_mode', 'synchronous', 'cache_size', 'user_version', 'encoding'], true)) {
+        if ($name === 'journal_mode') {
+            $pager = $this->db->pager();
+            $arg = \strtolower($this->pragmaArg($stmt));
+            if ($arg === 'wal') {
+                $pager->enableWal();
+            } elseif (\in_array($arg, ['delete', 'truncate', 'persist', 'off', 'memory', 'rollback'], true)) {
+                $pager->disableWal();
+            }
+            return new Result(['journal_mode'], [[$pager->journalMode()]], 1);
+        }
+        if ($name === 'wal_checkpoint') {
+            $this->db->pager()->checkpoint();
+            // SQLite returns (busy, log frames, checkpointed frames); the log is
+            // reset on every checkpoint here, so report 0 outstanding frames.
+            return new Result(['busy', 'log', 'checkpointed'], [[0, 0, 0]], 1);
+        }
+        if (\in_array($name, ['foreign_keys', 'synchronous', 'cache_size', 'user_version', 'encoding'], true)) {
             // Accept settings; return a representative value for reads.
             $value = match ($name) {
-                'journal_mode' => 'rollback',
                 'encoding' => 'UTF-8',
                 default => 0,
             };

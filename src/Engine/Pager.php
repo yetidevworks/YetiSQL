@@ -17,6 +17,14 @@ use YetiDevWorks\YetiSQL\Exception\YetiSQLException;
  * fsync, then delete the journal. The journal's existence on open means a prior
  * commit was interrupted, so we restore the originals — a crash mid-write rolls
  * back cleanly. An in-memory database keeps the same API with no file/journal.
+ *
+ * WAL mode (PRAGMA journal_mode=WAL): on commit the *new* image of every changed
+ * page is appended as a frame to "<path>-wal" (ending each transaction with a
+ * commit marker carrying the post-commit page count), fsync'd, and the main file
+ * is left untouched. Reads see WAL-resident pages from the in-memory cache, which
+ * always holds them once committed or replayed. A checkpoint copies WAL pages
+ * into the main file and resets the log; recovery on open replays the committed
+ * prefix of the WAL, discarding any half-written trailing transaction.
  */
 final class Pager
 {
@@ -64,6 +72,14 @@ final class Pager
     private int $schemaCookie = 0;
     private int $changeCounter = 0;
     private bool $locked = false;
+
+    private const WAL_MAGIC = "YWAL\x00";
+    private const WAL_HEADER_SIZE = 12; // magic(5) + pageSize(4) + reserved(3)
+
+    private bool $walMode = false;
+    private mixed $walHandle = null;
+    /** @var array<int,true> page numbers whose latest committed image lives in the WAL, not the main file */
+    private array $walFrames = [];
 
     public function __construct(private readonly string $path)
     {
@@ -113,6 +129,10 @@ final class Pager
         if ($exists) {
             $this->recoverIfNeeded();
             $this->readHeader();
+            if ($this->walMode) {
+                $this->openWalHandle(false);
+                $this->recoverWal();
+            }
         } else {
             $this->initNewDatabase();
         }
@@ -181,14 +201,18 @@ final class Pager
         $this->freelistCount = $h['freecount'];
         $this->schemaCookie = $h['cookie'];
         $this->changeCounter = $h['change'];
+        // Write/read version bytes encode the durability mode: 2 = WAL, else
+        // rollback journal. (Only meaningful for file-backed databases.)
+        $this->walMode = !$this->memory && $h['write'] === 2;
     }
 
     private function writeHeader(): void
     {
+        $version = $this->walMode ? 2 : 1;
         $header = self::MAGIC
             . \pack('n', $this->pageSize)
-            . \pack('C', 1)
-            . \pack('C', 1)
+            . \pack('C', $version)
+            . \pack('C', $version)
             . \pack('N', $this->pageCount)
             . \pack('N', $this->freelistHead)
             . \pack('N', $this->freelistCount)
@@ -372,7 +396,10 @@ final class Pager
         $this->changeCounter++;
         $this->writeHeader();
 
-        if (!$this->memory) {
+        if ($this->walMode && !$this->memory) {
+            $this->commitToWal();
+            $this->unlock();
+        } elseif (!$this->memory) {
             $this->writeJournal();
             $this->flushDirty();
             $this->fsync();
@@ -426,6 +453,14 @@ final class Pager
     {
         if ($this->inTxn) {
             $this->rollback();
+        }
+        if ($this->walMode && !$this->memory) {
+            // Fold the WAL into the main file so a plain reopen sees everything.
+            $this->checkpoint();
+        }
+        if ($this->walHandle !== null && \is_resource($this->walHandle)) {
+            \fclose($this->walHandle);
+            $this->walHandle = null;
         }
         if ($this->handle !== null && \is_resource($this->handle)) {
             $this->unlock();
@@ -551,6 +586,185 @@ final class Pager
         }
         \fclose($j);
         @\unlink($jp);
+    }
+
+    // --- write-ahead log --------------------------------------------------
+
+    public function journalMode(): string
+    {
+        if ($this->memory) {
+            return 'memory';
+        }
+        return $this->walMode ? 'wal' : 'delete';
+    }
+
+    /** Switch a file-backed database into WAL mode (idempotent). */
+    public function enableWal(): void
+    {
+        if ($this->memory || $this->walMode || $this->inTxn) {
+            return;
+        }
+        $this->walMode = true;
+        $this->openWalHandle(true);
+        // Persist the mode flag (write/read version = 2) into the main header.
+        $this->writeHeader();
+        $this->lockExclusive();
+        $this->flushDirty();
+        $this->fsync();
+        $this->unlock();
+    }
+
+    /** Checkpoint and switch back to rollback-journal mode (idempotent). */
+    public function disableWal(): void
+    {
+        if ($this->memory || !$this->walMode || $this->inTxn) {
+            return;
+        }
+        $this->checkpoint();
+        $this->walMode = false;
+        $this->writeHeader();
+        $this->lockExclusive();
+        $this->flushDirty();
+        $this->fsync();
+        $this->unlock();
+        if ($this->walHandle !== null && \is_resource($this->walHandle)) {
+            \fclose($this->walHandle);
+            $this->walHandle = null;
+        }
+        if (\is_file($this->walPath())) {
+            @\unlink($this->walPath());
+        }
+        $this->walFrames = [];
+    }
+
+    private function walPath(): string
+    {
+        return $this->path . '-wal';
+    }
+
+    /** Open (and optionally reset) the WAL file handle, writing a fresh header when empty. */
+    private function openWalHandle(bool $reset): void
+    {
+        if ($this->walHandle === null || !\is_resource($this->walHandle)) {
+            $this->walHandle = \fopen($this->walPath(), 'c+b');
+            if ($this->walHandle === false) {
+                throw new YetiSQLException('unable to open WAL file');
+            }
+        }
+        $size = \filesize($this->walPath());
+        if ($reset || $size === false || $size < self::WAL_HEADER_SIZE) {
+            \ftruncate($this->walHandle, 0);
+            \fseek($this->walHandle, 0);
+            \fwrite($this->walHandle, self::WAL_MAGIC . \pack('N', $this->pageSize) . "\x00\x00\x00");
+            \fflush($this->walHandle);
+            $this->walFrames = [];
+        }
+    }
+
+    /** Append this transaction's dirty pages to the WAL, then a commit marker. */
+    private function commitToWal(): void
+    {
+        $this->materializeAll();
+        \ksort($this->dirty);
+        \fseek($this->walHandle, 0, \SEEK_END);
+        foreach (\array_keys($this->dirty) as $pageNo) {
+            \fwrite($this->walHandle, \pack('N', $pageNo) . $this->cache[$pageNo]);
+            $this->walFrames[$pageNo] = true;
+        }
+        // Commit marker: page number 0, then the post-commit page count.
+        \fwrite($this->walHandle, \pack('N', 0) . \pack('N', $this->pageCount));
+        $this->fsyncWal();
+        $this->dirty = [];
+    }
+
+    private function fsyncWal(): void
+    {
+        \fflush($this->walHandle);
+        if (\function_exists('fsync')) {
+            @\fsync($this->walHandle);
+        }
+    }
+
+    /**
+     * Replay the committed prefix of the WAL into the page cache, dropping any
+     * half-written trailing transaction (frames past the last commit marker).
+     */
+    private function recoverWal(): void
+    {
+        \fseek($this->walHandle, 0);
+        $hdr = \fread($this->walHandle, self::WAL_HEADER_SIZE);
+        if (\strlen($hdr) < self::WAL_HEADER_SIZE || \substr($hdr, 0, 5) !== self::WAL_MAGIC) {
+            // No usable WAL; start a clean one.
+            $this->openWalHandle(true);
+            return;
+        }
+
+        $applied = [];          // pageNo => committed image (last writer wins)
+        $pending = [];          // frames since the last commit marker
+        $committedPageCount = $this->pageCount;
+        while (true) {
+            $pnRaw = \fread($this->walHandle, 4);
+            if (\strlen($pnRaw) < 4) {
+                break;
+            }
+            /** @var array{1:int} $pn */
+            $pn = \unpack('N', $pnRaw);
+            if ($pn[1] === 0) {
+                $cntRaw = \fread($this->walHandle, 4);
+                if (\strlen($cntRaw) < 4) {
+                    break; // truncated marker: stop, discard $pending
+                }
+                /** @var array{1:int} $cnt */
+                $cnt = \unpack('N', $cntRaw);
+                foreach ($pending as $p => $data) {
+                    $applied[$p] = $data;
+                }
+                $committedPageCount = $cnt[1];
+                $pending = [];
+                continue;
+            }
+            $data = \fread($this->walHandle, $this->pageSize);
+            if (\strlen($data) < $this->pageSize) {
+                break; // truncated frame: stop, discard $pending
+            }
+            $pending[$pn[1]] = $data;
+        }
+
+        foreach ($applied as $pageNo => $data) {
+            $this->cache[$pageNo] = $data;
+            $this->walFrames[$pageNo] = true;
+            unset($this->decoded[$pageNo], $this->pendingEncode[$pageNo]);
+        }
+        $this->pageCount = $committedPageCount;
+        if (isset($this->cache[1])) {
+            $this->parseHeaderFrom($this->cache[1]);
+            $this->pageCount = $committedPageCount; // marker is authoritative for extent
+        }
+    }
+
+    /** Copy WAL-resident pages into the main file and reset the log. */
+    public function checkpoint(): void
+    {
+        if ($this->memory || !$this->walMode || $this->walHandle === null) {
+            return;
+        }
+        if ($this->walFrames !== []) {
+            $this->lockExclusive();
+            $this->materializeAll();
+            foreach (\array_keys($this->walFrames) as $pageNo) {
+                $data = $this->read($pageNo);
+                \fseek($this->handle, ($pageNo - 1) * $this->pageSize);
+                \fwrite($this->handle, $data);
+            }
+            \ftruncate($this->handle, $this->pageCount * $this->pageSize);
+            $this->fsync();
+            $this->unlock();
+        }
+        // Reset the WAL to just its header.
+        \ftruncate($this->walHandle, self::WAL_HEADER_SIZE);
+        \fseek($this->walHandle, self::WAL_HEADER_SIZE);
+        $this->fsyncWal();
+        $this->walFrames = [];
     }
 
     private function lockExclusive(): void
