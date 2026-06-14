@@ -2751,7 +2751,11 @@ final class Executor
     private function pragmaFunctionResult(string $kind, string $arg): Result
     {
         return match ($kind) {
-            'table_info', 'table_xinfo' => $this->tableInfoResult($arg),
+            'table_info' => $this->tableInfoResult($arg, false),
+            // table_xinfo is table_info plus a trailing "hidden" column (0 for
+            // ordinary columns; we have no generated/hidden columns). Laravel's
+            // schema grammar selects "hidden" from pragma_table_xinfo.
+            'table_xinfo' => $this->tableInfoResult($arg, true),
             'index_list' => $this->indexListResult($arg),
             'index_info', 'index_xinfo' => new Result(['seqno', 'cid', 'name'], [], 0),
             'foreign_key_list' => new Result(
@@ -2763,9 +2767,12 @@ final class Executor
         };
     }
 
-    private function tableInfoResult(string $tableName): Result
+    private function tableInfoResult(string $tableName, bool $extended = false): Result
     {
         $cols = ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'];
+        if ($extended) {
+            $cols[] = 'hidden';
+        }
         $info = $this->db->schema()->getTable($tableName);
         if ($info === null) {
             return new Result($cols, [], 0);
@@ -2774,7 +2781,7 @@ final class Executor
         $pkSeq = 0;
         foreach ($info->columns as $i => $col) {
             $pk = ($i === $info->rowidAlias || $col->primaryKey) ? ++$pkSeq : 0;
-            $rows[] = [
+            $row = [
                 $i,
                 $col->name,
                 $col->declaredType ?? '',
@@ -2782,6 +2789,10 @@ final class Executor
                 $col->default !== null ? $this->exprLabel($col->default) : null,
                 $pk,
             ];
+            if ($extended) {
+                $row[] = 0; // not a hidden/generated column
+            }
+            $rows[] = $row;
         }
         return new Result($cols, $rows, \count($rows));
     }
@@ -2802,7 +2813,8 @@ final class Executor
     private function tvfColumns(string $func): array
     {
         return match (\strtolower($func)) {
-            'pragma_table_info', 'pragma_table_xinfo' => ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'],
+            'pragma_table_info' => ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk'],
+            'pragma_table_xinfo' => ['cid', 'name', 'type', 'notnull', 'dflt_value', 'pk', 'hidden'],
             'pragma_index_list' => ['seq', 'name', 'unique', 'origin', 'partial'],
             'pragma_index_info', 'pragma_index_xinfo' => ['seqno', 'cid', 'name'],
             'pragma_foreign_key_list' => ['id', 'seq', 'table', 'from', 'to', 'on_update', 'on_delete', 'match'],
@@ -2812,7 +2824,7 @@ final class Executor
 
     private function tvfTableInfo(string $func, string $alias): TableInfo
     {
-        $numeric = ['cid', 'notnull', 'pk', 'seq', 'seqno', 'unique', 'partial', 'id'];
+        $numeric = ['cid', 'notnull', 'pk', 'seq', 'seqno', 'unique', 'partial', 'id', 'hidden'];
         $columns = [];
         foreach ($this->tvfColumns($func) as $name) {
             $aff = \in_array($name, $numeric, true)

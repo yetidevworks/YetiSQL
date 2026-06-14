@@ -19,6 +19,9 @@
         <testsuite name="doctrine">
             <directory>tests/Doctrine</directory>
         </testsuite>
+        <testsuite name="eloquent">
+            <directory>tests/Eloquent</directory>
+        </testsuite>
     </testsuites>
     <source>
         <include>

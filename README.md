@@ -77,6 +77,44 @@ DBAL's QueryBuilder CRUD, prepared statements, joins, transactions, and the sche
 manager (`listTableNames`, `listTableColumns`) are validated against the real DBAL stack
 in the test suite — this is the project's v1 compatibility gate.
 
+## Eloquent / Laravel
+
+YetiSQL ships an Eloquent (`illuminate/database`) driver. Because YetiSQL speaks the
+SQLite dialect, the connection extends Laravel's `SQLiteConnection`, reusing its SQLite
+query grammar, schema grammar, and processor. `YetiSql::register()` wires a `yetisql`
+driver into a Capsule (or a Laravel app's `DatabaseManager`).
+
+```php
+use Illuminate\Database\Capsule\Manager as Capsule;
+use YetiDevWorks\YetiSQL\Eloquent\YetiSql;
+
+$capsule = new Capsule();
+$capsule->addConnection([
+    'driver'   => 'yetisql',
+    'database' => 'app.ysql',   // or ':memory:'
+    'prefix'   => '',
+]);
+YetiSql::register($capsule);     // register the yetisql driver
+$capsule->setAsGlobal();
+$capsule->bootEloquent();
+
+// Migrations
+$capsule->schema()->create('users', function ($t) {
+    $t->increments('id');
+    $t->string('name');
+    $t->integer('age')->nullable();
+});
+
+// Query builder + Eloquent models, relationships, and transactions all work.
+Capsule::table('users')->insert(['name' => 'Alice', 'age' => 30]);
+$adults = Capsule::table('users')->where('age', '>=', 18)->get();
+```
+
+In a full Laravel app, call `YetiSql::register(app('db'))` from a service provider's
+`boot()` and set a connection with `'driver' => 'yetisql'`. The schema builder
+(migrations + introspection), query builder, Eloquent models with relationships and eager
+loading, and transactions are validated against the real Eloquent stack in the test suite.
+
 ## CLI
 
 A small `sqlite3`-style shell ships in `bin/yetisql`:
@@ -172,14 +210,14 @@ planned performance upgrade (see roadmap).
 ## Roadmap
 
 Working: secondary-index and rowid query planning (equality, range, `IN`, `BETWEEN`)
-with automatic index maintenance on writes.
+with automatic index maintenance on writes; covering-index counts (persisted subtree row
+counts); Doctrine DBAL and Eloquent adapters.
 
 Not yet implemented (planned): multi-column index planning beyond the leading column,
-covering-index projections, index-driven joins (the inner table of a join still scans),
-correlated subqueries, `WITH` (CTEs), window functions, triggers, views, `ALTER TABLE`,
-JSON1, FTS5, true WAL, and the Eloquent adapter. The execution model is a tree-walking
-interpreter; a VDBE-style bytecode compiler is the planned performance upgrade. Byte-level
-`sqlite3` *file* interop is out of scope by design.
+index-driven joins (the inner table of a join still scans), correlated subqueries, `WITH`
+(CTEs), window functions, triggers, views, `ALTER TABLE`, JSON1, FTS5, and true WAL. The
+execution model is a tree-walking interpreter; a VDBE-style bytecode compiler is the
+planned performance upgrade. Byte-level `sqlite3` *file* interop is out of scope by design.
 
 ## Testing
 
