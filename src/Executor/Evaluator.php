@@ -878,7 +878,7 @@ final class Evaluator
             return null;
         }
         $found = Json::resolve(
-            Json::decode((string) Value::toText($l)),
+            Json::decode((string) Value::toText($l), true),
             Json::arrowSegments($r),
         );
         if ($found === Json::MISSING) {

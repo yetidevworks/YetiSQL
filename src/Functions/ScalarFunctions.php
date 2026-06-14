@@ -345,7 +345,7 @@ final class ScalarFunctions
         if (($a[0] ?? null) === null) {
             return null;
         }
-        return Json::encode(Json::decode((string) Value::toText($a[0])));
+        return Json::encode(Json::decode((string) Value::toText($a[0]), true));
     }
 
     private static function fn_json_valid(array $a): ?int
@@ -361,7 +361,7 @@ final class ScalarFunctions
         if (($a[0] ?? null) === null) {
             return null;
         }
-        $value = Json::decode((string) Value::toText($a[0]));
+        $value = Json::decode((string) Value::toText($a[0]), true);
         if (\array_key_exists(1, $a)) {
             if ($a[1] === null) {
                 return null;
@@ -380,7 +380,7 @@ final class ScalarFunctions
         if (($a[0] ?? null) === null) {
             return null;
         }
-        $doc = Json::decode((string) Value::toText($a[0]));
+        $doc = Json::decode((string) Value::toText($a[0]), true);
         $paths = \array_slice($a, 1);
         if ($paths === []) {
             return null;
@@ -429,7 +429,7 @@ final class ScalarFunctions
         if (($a[0] ?? null) === null) {
             return null;
         }
-        $value = Json::decode((string) Value::toText($a[0]));
+        $value = Json::decode((string) Value::toText($a[0]), true);
         if (\array_key_exists(1, $a)) {
             if ($a[1] === null) {
                 return null;

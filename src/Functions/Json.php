@@ -28,12 +28,28 @@ final class Json
     /** Sentinel returned by resolve() when a path matches nothing. */
     public const MISSING = "\0__json_missing__\0";
 
-    /** Parse JSON text, throwing the SQLite-style error on malformed input. */
-    public static function decode(string $json): mixed
+    /**
+     * Parse JSON text, throwing the SQLite-style error on malformed input.
+     * Cached results must only be used by read-only JSON operations because
+     * object nodes are shared.
+     */
+    public static function decode(string $json, bool $readOnlyCache = false): mixed
     {
+        /** @var array<string,mixed> $cache */
+        static $cache = [];
+        if ($readOnlyCache && \strlen($json) <= 8192 && \array_key_exists($json, $cache)) {
+            return $cache[$json];
+        }
+
         $value = \json_decode($json, false);
         if (\json_last_error() !== \JSON_ERROR_NONE) {
             throw new SqlException('malformed JSON');
+        }
+        if ($readOnlyCache && \strlen($json) <= 8192) {
+            if (\count($cache) >= 4096) {
+                $cache = [];
+            }
+            $cache[$json] = $value;
         }
         return $value;
     }

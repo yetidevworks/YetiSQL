@@ -5874,7 +5874,7 @@ final class Executor
         if (($argVals[0] ?? null) === null) {
             return [];
         }
-        $root = \YetiDevWorks\YetiSQL\Functions\Json::decode((string) Value::toText($argVals[0]));
+        $root = \YetiDevWorks\YetiSQL\Functions\Json::decode((string) Value::toText($argVals[0]), true);
         $basePath = '$';
         if (\array_key_exists(1, $argVals)) {
             if ($argVals[1] === null) {
