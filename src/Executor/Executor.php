@@ -58,6 +58,8 @@ final class Executor
     private array $groupedAggregateCache = [];
     /** @var array<int,array{cookie:int,changes:int,root:int,pos:int,sig:string,map:array<string,int>}> */
     private array $correlatedCountCache = [];
+    /** @var array<string,array<string,list<array{rowid:int,values:list<null|int|float|string|Blob>}>>> */
+    private array $fkCascadeChildCache = [];
     /** @var \WeakMap<SelectStatement,string> */
     private \WeakMap $selectSignatures;
 
@@ -4428,6 +4430,7 @@ final class Executor
     /** @param array<string,null|int|float|string|Blob> $params */
     private function execUpdate(UpdateStatement $stmt, array $params): Result
     {
+        $this->fkCascadeChildCache = [];
         if ($this->db->schema()->hasView($stmt->table)) {
             return $this->execModifyView($stmt->table, CreateTriggerStatement::UPDATE, $stmt->where, $stmt->set, $params);
         }
@@ -4581,6 +4584,7 @@ final class Executor
     /** @param array<string,null|int|float|string|Blob> $params */
     private function execDelete(DeleteStatement $stmt, array $params): Result
     {
+        $this->fkCascadeChildCache = [];
         if ($this->db->schema()->hasView($stmt->table)) {
             return $this->execModifyView($stmt->table, CreateTriggerStatement::DELETE, $stmt->where, null, $params);
         }
@@ -4858,7 +4862,7 @@ final class Executor
      * @param list<null|int|float|string|Blob> $parentKey
      * @return list<array{rowid:int,values:list<null|int|float|string|Blob>}>
      */
-    private function fkChildRowsReferencing(TableInfo $child, ForeignKey $fk, array $parentKey): array
+    private function fkChildRowsReferencing(TableInfo $child, ForeignKey $fk, array $parentKey, bool $allowCascadeCache = false): array
     {
         $positions = [];
         foreach ($fk->columns as $cname) {
@@ -4890,6 +4894,14 @@ final class Executor
             return $matches;
         }
 
+        if ($allowCascadeCache && $this->fkCanCacheChildScan($child, $positions)) {
+            $cacheKey = $child->rootPage . ':' . \implode(',', $positions);
+            if (!isset($this->fkCascadeChildCache[$cacheKey])) {
+                $this->fkCascadeChildCache[$cacheKey] = $this->buildFkChildReferenceMap($child, $positions);
+            }
+            return $this->fkCascadeChildCache[$cacheKey][$this->fkChildKey($key)] ?? [];
+        }
+
         foreach ($tree->scan() as [$rowid, $payload]) {
             $vals = $this->decodeRow($child, $rowid, $payload);
             $match = true;
@@ -4905,6 +4917,46 @@ final class Executor
             }
         }
         return $matches;
+    }
+
+    /** @param list<int> $positions */
+    private function fkCanCacheChildScan(TableInfo $child, array $positions): bool
+    {
+        foreach ($positions as $pos) {
+            if (($child->columns[$pos]->collation ?? 'BINARY') !== 'BINARY') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * @param list<int> $positions
+     * @return array<string,list<array{rowid:int,values:list<null|int|float|string|Blob>}>>
+     */
+    private function buildFkChildReferenceMap(TableInfo $child, array $positions): array
+    {
+        $map = [];
+        $tree = new TableBTree($this->db->pager(), $child->rootPage);
+        foreach ($tree->scan() as [$rowid, $payload]) {
+            $vals = $this->decodeRow($child, $rowid, $payload);
+            $key = [];
+            foreach ($positions as $pos) {
+                $v = $pos === $child->rowidAlias ? $rowid : ($vals[$pos] ?? null);
+                if ($v === null) {
+                    continue 2;
+                }
+                $key[] = $v;
+            }
+            $map[$this->fkChildKey($key)][] = ['rowid' => $rowid, 'values' => $vals];
+        }
+        return $map;
+    }
+
+    /** @param list<null|int|float|string|Blob> $key */
+    private function fkChildKey(array $key): string
+    {
+        return \implode("\x1f", \array_map([$this, 'valueKey'], $key));
     }
 
     /**
@@ -4950,11 +5002,16 @@ final class Executor
                 }
             }
 
-            $rows = $this->fkChildRowsReferencing($child, $fk, $oldKey);
+            $action = $isDelete ? $fk->onDelete : $fk->onUpdate;
+            $rows = $this->fkChildRowsReferencing(
+                $child,
+                $fk,
+                $oldKey,
+                $isDelete && $action === ForeignKey::CASCADE,
+            );
             if ($rows === []) {
                 continue;
             }
-            $action = $isDelete ? $fk->onDelete : $fk->onUpdate;
             $pending[] = ['child' => $child, 'fk' => $fk, 'rows' => $rows, 'action' => $action, 'newKey' => $newKey];
         }
 
