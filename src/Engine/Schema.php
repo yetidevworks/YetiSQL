@@ -7,6 +7,8 @@ namespace YetiDevWorks\YetiSQL\Engine;
 use YetiDevWorks\YetiSQL\Exception\SqlException;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateIndexStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateTableStatement;
+use YetiDevWorks\YetiSQL\Sql\Ast\CreateViewStatement;
+use YetiDevWorks\YetiSQL\Sql\Ast\SelectStatement;
 use YetiDevWorks\YetiSQL\Sql\Parser;
 use YetiDevWorks\YetiSQL\Types\Affinity;
 
@@ -22,6 +24,8 @@ final class Schema
     private array $tables = [];
     /** @var array<string,array{name:string,table:string,rootPage:int,sql:string,ast:CreateIndexStatement}> */
     private array $indexes = [];
+    /** @var array<string,array{name:string,columns:list<string>,select:SelectStatement,sql:string}> */
+    private array $views = [];
 
     private TableBTree $master;
 
@@ -35,6 +39,7 @@ final class Schema
     {
         $this->tables = [];
         $this->indexes = [];
+        $this->views = [];
         foreach ($this->master->scan() as [$rowid, $payload]) {
             $r = RecordCodec::decode($payload);
             [$type, $name, $tblName, $rootPage, $sql] = [$r[0], $r[1], $r[2], $r[3], $r[4]];
@@ -43,6 +48,16 @@ final class Schema
                     (string) $sql,
                     (int) $rootPage,
                 );
+            } elseif ($type === 'view') {
+                $parser = new Parser((string) $sql);
+                /** @var CreateViewStatement $ast */
+                $ast = $parser->parseStatement();
+                $this->views[\strtolower((string) $name)] = [
+                    'name' => (string) $name,
+                    'columns' => $ast->columns,
+                    'select' => $ast->select,
+                    'sql' => (string) $sql,
+                ];
             } elseif ($type === 'index') {
                 $parser = new Parser((string) $sql);
                 /** @var CreateIndexStatement $ast */
@@ -172,8 +187,8 @@ final class Schema
 
     public function createTable(CreateTableStatement $stmt): TableInfo
     {
-        if ($this->hasTable($stmt->name)) {
-            if ($stmt->ifNotExists) {
+        if ($this->hasTable($stmt->name) || $this->hasView($stmt->name)) {
+            if ($stmt->ifNotExists && !$this->hasView($stmt->name)) {
                 return $this->getTable($stmt->name);
             }
             throw SqlException::constraint("table {$stmt->name} already exists");
@@ -188,6 +203,53 @@ final class Schema
         $this->pager->bumpSchemaCookie();
         $this->tables[\strtolower($stmt->name)] = $info;
         return $info;
+    }
+
+    public function hasView(string $name): bool
+    {
+        return isset($this->views[\strtolower($name)]);
+    }
+
+    /** @return array{name:string,columns:list<string>,select:SelectStatement,sql:string}|null */
+    public function getView(string $name): ?array
+    {
+        return $this->views[\strtolower($name)] ?? null;
+    }
+
+    /** @return list<string> */
+    public function viewNames(): array
+    {
+        return \array_map(static fn (array $v): string => $v['name'], \array_values($this->views));
+    }
+
+    public function createView(CreateViewStatement $stmt): void
+    {
+        if ($this->hasView($stmt->name) || $this->hasTable($stmt->name)) {
+            if ($stmt->ifNotExists) {
+                return;
+            }
+            $kind = $this->hasView($stmt->name) ? 'view' : 'table';
+            throw SqlException::constraint("{$kind} {$stmt->name} already exists");
+        }
+        $rowid = $this->master->maxRowid() + 1;
+        $this->master->put($rowid, RecordCodec::encode([
+            'view', $stmt->name, $stmt->name, 0, $stmt->sql,
+        ]));
+        $this->pager->bumpSchemaCookie();
+        $this->views[\strtolower($stmt->name)] = [
+            'name' => $stmt->name,
+            'columns' => $stmt->columns,
+            'select' => $stmt->select,
+            'sql' => $stmt->sql,
+        ];
+    }
+
+    public function dropView(string $name): void
+    {
+        $this->deleteMasterRows(static fn (array $r): bool =>
+            $r[0] === 'view' && \strtolower((string) $r[1]) === \strtolower($name));
+        $this->pager->bumpSchemaCookie();
+        unset($this->views[\strtolower($name)]);
     }
 
     public function recordIndex(CreateIndexStatement $stmt, int $rootPage): void

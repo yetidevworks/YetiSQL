@@ -14,6 +14,7 @@ use YetiDevWorks\YetiSQL\Exception\SqlException;
 use YetiDevWorks\YetiSQL\Functions\Aggregates;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateIndexStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateTableStatement;
+use YetiDevWorks\YetiSQL\Sql\Ast\CreateViewStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DeleteStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DropStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\Expr;
@@ -59,6 +60,9 @@ final class Executor
      */
     private array $cteScope = [];
 
+    /** @var array<string,true> views currently being expanded (circular-reference guard) */
+    private array $viewStack = [];
+
     public function __construct(private readonly Database $db)
     {
         $this->selectSignatures = new \WeakMap();
@@ -103,6 +107,7 @@ final class Executor
             || $stmt instanceof DeleteStatement
             || $stmt instanceof CreateTableStatement
             || $stmt instanceof CreateIndexStatement
+            || $stmt instanceof CreateViewStatement
             || $stmt instanceof DropStatement;
     }
 
@@ -115,6 +120,7 @@ final class Executor
             $stmt instanceof UpdateStatement => $this->execUpdate($stmt, $params),
             $stmt instanceof DeleteStatement => $this->execDelete($stmt, $params),
             $stmt instanceof CreateTableStatement => $this->execCreateTable($stmt),
+            $stmt instanceof CreateViewStatement => $this->execCreateView($stmt),
             $stmt instanceof DropStatement => $this->execDrop($stmt),
             $stmt instanceof CreateIndexStatement => $this->execCreateIndex($stmt),
             $stmt instanceof PragmaStatement => $this->execPragma($stmt),
@@ -794,7 +800,52 @@ final class Executor
         if ($ref->name !== null && isset($this->cteScope[\strtolower($ref->name)])) {
             return $this->resolveCteSource($ref, $eval);
         }
+        if ($ref->name !== null) {
+            $view = $this->db->schema()->getView($ref->name);
+            if ($view !== null) {
+                return $this->resolveViewSource($ref, $view, $eval);
+            }
+        }
         return $this->resolveSource($ref);
+    }
+
+    /**
+     * Resolve a FROM reference that names a view: run its stored SELECT and
+     * serve the rows like a derived table. The view's SELECT is isolated from
+     * the enclosing query's CTE scope, and a stack guards circular definitions.
+     *
+     * @param array{name:string,columns:list<string>,select:SelectStatement,sql:string} $view
+     * @return array<string,mixed>
+     */
+    private function resolveViewSource(\YetiDevWorks\YetiSQL\Sql\Ast\TableRef $ref, array $view, Evaluator $eval): array
+    {
+        $key = \strtolower($view['name']);
+        if (isset($this->viewStack[$key])) {
+            throw new SqlException("view {$view['name']} is circularly defined");
+        }
+        $savedCte = $this->cteScope;
+        $this->viewStack[$key] = true;
+        $this->cteScope = [];
+        try {
+            $res = $this->execSelect($view['select'], $eval->params());
+            $rows = $res->materializeRows();
+            $resultCols = $res->columns ?? [];
+        } finally {
+            $this->cteScope = $savedCte;
+            unset($this->viewStack[$key]);
+        }
+        $alias = $ref->alias ?? $view['name'];
+        $cols = $view['columns'] !== [] ? $view['columns'] : $resultCols;
+        return [
+            'kind' => 'derived',
+            'alias' => $alias,
+            'info' => $this->derivedTableInfo($alias, $cols),
+            'tree' => null,
+            'empty' => false,
+            'func' => null,
+            'args' => [],
+            'rows' => $rows,
+        ];
     }
 
     /**
@@ -1012,6 +1063,14 @@ final class Executor
             $cte = $this->cteScope[\strtolower($ref->name)];
             $cols = $cte['columns'] ?? $cte['outCols'] ?? $this->selectOutputNames($cte['select']);
             return [$alias, $this->derivedTableInfo($alias, $cols)];
+        }
+        if ($ref->name !== null) {
+            $view = $this->db->schema()->getView($ref->name);
+            if ($view !== null) {
+                $alias = $ref->alias ?? $ref->name;
+                $cols = $view['columns'] !== [] ? $view['columns'] : $this->selectOutputNames($view['select']);
+                return [$alias, $this->derivedTableInfo($alias, $cols)];
+            }
         }
         if ($ref->name !== null) {
             $info = $this->db->schema()->getTable($ref->name);
@@ -3520,6 +3579,12 @@ final class Executor
         return Result::affected(0);
     }
 
+    private function execCreateView(CreateViewStatement $stmt): Result
+    {
+        $this->db->schema()->createView($stmt);
+        return Result::affected(0);
+    }
+
     private function execDrop(DropStatement $stmt): Result
     {
         $schema = $this->db->schema();
@@ -3531,6 +3596,14 @@ final class Executor
                 throw new SqlException("no such table: {$stmt->name}");
             }
             $schema->dropTable($stmt->name);
+        } elseif ($stmt->kind === DropStatement::VIEW) {
+            if (!$schema->hasView($stmt->name)) {
+                if ($stmt->ifExists) {
+                    return Result::affected(0);
+                }
+                throw new SqlException("no such view: {$stmt->name}");
+            }
+            $schema->dropView($stmt->name);
         } elseif ($stmt->kind === DropStatement::INDEX) {
             if ($schema->getIndex($stmt->name) === null) {
                 if ($stmt->ifExists) {
@@ -3740,6 +3813,9 @@ final class Executor
     {
         $info = $this->db->schema()->getTable($name);
         if ($info === null) {
+            if ($this->db->schema()->hasView($name)) {
+                throw new SqlException("cannot modify $name because it is a view");
+            }
             throw new SqlException("no such table: $name");
         }
         return $info;

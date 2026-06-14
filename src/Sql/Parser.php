@@ -9,6 +9,7 @@ use YetiDevWorks\YetiSQL\Exception\SqlException;
 use YetiDevWorks\YetiSQL\Sql\Ast\ColumnDef;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateIndexStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateTableStatement;
+use YetiDevWorks\YetiSQL\Sql\Ast\CreateViewStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DeleteStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DropStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\Expr;
@@ -376,15 +377,43 @@ final class Parser
     {
         $start = $this->peek()->pos;
         $this->expect(Token::KEYWORD, 'CREATE');
-        $this->accept(Token::KEYWORD, 'TEMP');
-        $this->accept(Token::KEYWORD, 'TEMPORARY');
+        $temporary = $this->accept(Token::KEYWORD, 'TEMP')
+            || $this->accept(Token::KEYWORD, 'TEMPORARY');
 
         $unique = $this->accept(Token::KEYWORD, 'UNIQUE');
         if ($this->accept(Token::KEYWORD, 'INDEX')) {
             return $this->createIndexBody($unique, $start);
         }
+        if ($this->accept(Token::KEYWORD, 'VIEW')) {
+            return $this->createViewBody($start, $temporary);
+        }
         $this->expect(Token::KEYWORD, 'TABLE');
         return $this->createTableBody($start);
+    }
+
+    private function createViewBody(int $start, bool $temporary): CreateViewStatement
+    {
+        $ifNotExists = false;
+        if ($this->accept(Token::KEYWORD, 'IF')) {
+            $this->expect(Token::KEYWORD, 'NOT');
+            $this->expect(Token::KEYWORD, 'EXISTS');
+            $ifNotExists = true;
+        }
+        $name = $this->qualifiedName();
+
+        $columns = [];
+        if ($this->accept(Token::PUNCT, '(')) {
+            do {
+                $columns[] = $this->name();
+            } while ($this->accept(Token::PUNCT, ','));
+            $this->expect(Token::PUNCT, ')');
+        }
+
+        $this->expect(Token::KEYWORD, 'AS');
+        $select = $this->selectStatement();
+
+        $sql = \rtrim(\substr($this->sql, $start, $this->peek()->pos - $start));
+        return new CreateViewStatement($name, $select, $columns, $ifNotExists, $temporary, $sql);
     }
 
     private function createTableBody(int $start): CreateTableStatement
