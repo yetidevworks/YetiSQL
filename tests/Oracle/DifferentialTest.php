@@ -79,6 +79,13 @@ final class DifferentialTest extends TestCase
             // subqueries
             'SELECT id FROM t WHERE age > (SELECT AVG(age) FROM t) ORDER BY id',
             'SELECT (SELECT COUNT(*) FROM t)',
+            // correlated subqueries
+            'SELECT a.id, (SELECT COUNT(*) FROM t b WHERE b.age > a.age) AS older FROM t a ORDER BY a.id',
+            'SELECT id FROM t a WHERE EXISTS (SELECT 1 FROM t b WHERE b.city = a.city AND b.id <> a.id) ORDER BY id',
+            'SELECT id FROM t a WHERE NOT EXISTS (SELECT 1 FROM t b WHERE b.age > a.age) ORDER BY id',
+            'SELECT name FROM t a WHERE a.score > (SELECT AVG(b.score) FROM t b WHERE b.city = a.city) ORDER BY name',
+            'SELECT id FROM t a WHERE a.city IN (SELECT b.city FROM t b WHERE b.age > a.age) ORDER BY id',
+            'SELECT a.name FROM t a WHERE a.age = (SELECT MAX(b.age) FROM t b WHERE b.city = a.city) ORDER BY a.name',
             // compound
             'SELECT id FROM t WHERE id < 3 UNION SELECT id FROM t WHERE id > 4 ORDER BY id',
         ];

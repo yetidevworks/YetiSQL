@@ -157,12 +157,21 @@ final class Executor
      * @param array<string,null|int|float|string|Blob> $params
      * @return list<list<null|int|float|string|Blob>>
      */
-    public function runSubquerySelect(SelectStatement $select, array $params): array
-    {
+    public function runSubquerySelect(
+        SelectStatement $select,
+        array $params,
+        ?RowEnv $outerEnv = null,
+        ?Evaluator $outerEval = null,
+    ): array {
         $eval = new Evaluator($this, $params);
+        $eval->outerEnv = $outerEnv;
+        $eval->outerEval = $outerEval;
         [$cols, $rows] = $this->runSelect($select, $eval);
         if ($select->compound !== null) {
-            [, $rightRows] = $this->runSelect($select->compound, new Evaluator($this, $params));
+            $compoundEval = new Evaluator($this, $params);
+            $compoundEval->outerEnv = $outerEnv;
+            $compoundEval->outerEval = $outerEval;
+            [, $rightRows] = $this->runSelect($select->compound, $compoundEval);
             $rows = $this->applyCompound((string) $select->compoundOp, $rows, $rightRows);
         }
         if ($select->orderBy !== []) {

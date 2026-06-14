@@ -73,10 +73,35 @@ final class Evaluator
     private array $cmpColl = [];
 
     /** @param array<string,null|int|float|string|Blob> $params bound parameters */
+    /**
+     * Enclosing-query scope for correlated subqueries: the outer row's RowEnv
+     * and the Evaluator that owns it (so resolution can walk further out for
+     * nested correlation). Null for a top-level (non-subquery) evaluator.
+     */
+    public ?RowEnv $outerEnv = null;
+    public ?Evaluator $outerEval = null;
+
     public function __construct(
         private readonly Executor $executor,
         private array $params = [],
     ) {
+    }
+
+    /**
+     * Resolve a column against the enclosing query scope(s) for a correlated
+     * subquery. Tries the immediate outer row, then walks outward.
+     *
+     * @return array{0:bool,1:null|int|float|string|Blob} [found, value]
+     */
+    public function resolveOuter(?string $table, string $name): array
+    {
+        if ($this->outerEnv !== null && $this->outerEnv->hasColumn($table, $name)) {
+            return [true, $this->outerEnv->resolveColumn($table, $name)];
+        }
+        if ($this->outerEval !== null) {
+            return $this->outerEval->resolveOuter($table, $name);
+        }
+        return [false, null];
     }
 
     /** @param array<string,null|int|float|string|Blob> $params */
@@ -545,6 +570,13 @@ final class Evaluator
                 if ($e->table === null && isset($this->aliasExprs[\strtolower((string) $e->name)])) {
                     return $this->evaluate($this->aliasExprs[\strtolower((string) $e->name)], $env);
                 }
+                // Correlated subquery: resolve against the enclosing query scope.
+                if ($this->outerEnv !== null) {
+                    [$found, $value] = $this->resolveOuter($e->table, (string) $e->name);
+                    if ($found) {
+                        return $value;
+                    }
+                }
                 if ($env === null) {
                     throw new SqlException("no such column: {$e->name}");
                 }
@@ -585,10 +617,10 @@ final class Evaluator
                 return $this->likeExpr($e, $env);
 
             case Expr::SUBQUERY:
-                return $this->scalarSubquery($e->select);
+                return $this->scalarSubquery($e->select, $env);
 
             case Expr::EXISTS:
-                $rows = $this->executor->runSubquerySelect($e->select, $this->params);
+                $rows = $this->executor->runSubquerySelect($e->select, $this->params, $env, $this);
                 return $rows === [] ? 0 : 1;
 
             default:
@@ -922,7 +954,7 @@ final class Evaluator
 
         $candidates = [];
         if ($e->select !== null) {
-            foreach ($this->executor->runSubquerySelect($e->select, $this->params) as $row) {
+            foreach ($this->executor->runSubquerySelect($e->select, $this->params, $env, $this) as $row) {
                 $candidates[] = $row[0] ?? null;
             }
         } else {
@@ -1026,9 +1058,9 @@ final class Evaluator
         return $class . ']';
     }
 
-    private function scalarSubquery(SelectStatement $select): null|int|float|string|Blob
+    private function scalarSubquery(SelectStatement $select, ?RowEnv $outerEnv): null|int|float|string|Blob
     {
-        $rows = $this->executor->runSubquerySelect($select, $this->params);
+        $rows = $this->executor->runSubquerySelect($select, $this->params, $outerEnv, $this);
         if ($rows === []) {
             return null;
         }
