@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace YetiDevWorks\YetiSQL\Vdbe;
 
 use YetiDevWorks\YetiSQL\Engine\Pager;
+use YetiDevWorks\YetiSQL\Engine\RecordCodec;
 use YetiDevWorks\YetiSQL\Engine\TableBTree;
 use YetiDevWorks\YetiSQL\Engine\TableInfo;
 use YetiDevWorks\YetiSQL\Executor\Evaluator;
 use YetiDevWorks\YetiSQL\Executor\RowEnv;
+use YetiDevWorks\YetiSQL\Types\Affinity;
 use YetiDevWorks\YetiSQL\Types\Value;
 
 /**
@@ -33,6 +35,8 @@ final class Vm
         $gen = null;
         $env = null;
         $rowid = 0;
+        $payload = null;
+        $decoded = [];
 
         $limit = $program->limit;
         $offset = $program->offset ?? 0;
@@ -55,8 +59,8 @@ final class Vm
                         break;
                     }
                     [$rowid, $payload] = $gen->current();
-                    $env = new RowEnv();
-                    $env->addLazyFrame($alias, $info, $payload, $rowid);
+                    $env = null;
+                    $decoded = [];
                     $pc++;
                     break;
 
@@ -64,8 +68,8 @@ final class Vm
                     $gen->next();
                     if ($gen->valid()) {
                         [$rowid, $payload] = $gen->current();
-                        $env = new RowEnv();
-                        $env->addLazyFrame($alias, $info, $payload, $rowid);
+                        $env = null;
+                        $decoded = [];
                         $pc = $p2;
                         break;
                     }
@@ -73,7 +77,10 @@ final class Vm
                     break;
 
                 case Opcode::COLUMN:
-                    $reg[$p2] = $env->valueAt(0, $p1);
+                    if (!\array_key_exists($p1, $decoded)) {
+                        $decoded[$p1] = RecordCodec::decodeColumn($payload, $p1);
+                    }
+                    $reg[$p2] = $decoded[$p1];
                     $pc++;
                     break;
 
@@ -93,6 +100,16 @@ final class Vm
                     break;
 
                 case Opcode::BINOP:
+                    $fast = $this->combineBinaryFast($aux[0], $reg[$p1], $reg[$p2], $aux[2] ?? null, $aux[3] ?? null, $aux[4] ?? 'BINARY');
+                    if ($fast !== false) {
+                        $reg[$p3] = $fast;
+                        $pc++;
+                        break;
+                    }
+                    if ($env === null) {
+                        $env = new RowEnv();
+                        $env->addLazyFrame($alias, $info, $payload, $rowid);
+                    }
                     $reg[$p3] = $eval->combineBinary($aux[0], $reg[$p1], $reg[$p2], $aux[1], $env);
                     $pc++;
                     break;
@@ -153,5 +170,67 @@ final class Vm
         }
 
         return [$program->resultColumns, $rows];
+    }
+
+    private function combineBinaryFast(string $op, mixed $l, mixed $r, ?Affinity $la, ?Affinity $ra, string $collation): mixed
+    {
+        if ($op === 'AND') {
+            if ($l !== null && !Value::isTrue($l)) {
+                return 0;
+            }
+            if ($r !== null && !Value::isTrue($r)) {
+                return 0;
+            }
+            return ($l === null || $r === null) ? null : 1;
+        }
+        if ($op === 'OR') {
+            if ($l !== null && Value::isTrue($l)) {
+                return 1;
+            }
+            if ($r !== null && Value::isTrue($r)) {
+                return 1;
+            }
+            return ($l === null || $r === null) ? null : 0;
+        }
+        if ($op === 'IS' || $op === 'IS NOT') {
+            $eq = ($l === null && $r === null) || ($l !== null && $r !== null && Value::compare($l, $r) === 0);
+            return ($eq === ($op === 'IS')) ? 1 : 0;
+        }
+        if (!\in_array($op, ['=', '<>', '<', '<=', '>', '>='], true)) {
+            return false;
+        }
+        if ($l === null || $r === null) {
+            return null;
+        }
+
+        [$l, $r] = $this->applyComparisonAffinity($l, $r, $la, $ra);
+        $cmp = Value::compare($l, $r, $collation);
+        return match ($op) {
+            '=' => $cmp === 0 ? 1 : 0,
+            '<>' => $cmp !== 0 ? 1 : 0,
+            '<' => $cmp < 0 ? 1 : 0,
+            '<=' => $cmp <= 0 ? 1 : 0,
+            '>' => $cmp > 0 ? 1 : 0,
+            '>=' => $cmp >= 0 ? 1 : 0,
+            default => false,
+        };
+    }
+
+    /** @return array{0:mixed,1:mixed} */
+    private function applyComparisonAffinity(mixed $l, mixed $r, ?Affinity $la, ?Affinity $ra): array
+    {
+        $numeric = static fn (?Affinity $a): bool =>
+            $a === Affinity::INTEGER || $a === Affinity::REAL || $a === Affinity::NUMERIC;
+
+        if ($numeric($la) && !$numeric($ra)) {
+            $r = Affinity::NUMERIC->apply($r);
+        } elseif ($numeric($ra) && !$numeric($la)) {
+            $l = Affinity::NUMERIC->apply($l);
+        } elseif ($la === Affinity::TEXT && $ra === null) {
+            $r = Affinity::TEXT->apply($r);
+        } elseif ($ra === Affinity::TEXT && $la === null) {
+            $l = Affinity::TEXT->apply($l);
+        }
+        return [$l, $r];
     }
 }

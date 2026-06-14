@@ -7,6 +7,8 @@ namespace YetiDevWorks\YetiSQL\Vdbe;
 use YetiDevWorks\YetiSQL\Engine\TableInfo;
 use YetiDevWorks\YetiSQL\Sql\Ast\Expr;
 use YetiDevWorks\YetiSQL\Sql\Ast\SelectStatement;
+use YetiDevWorks\YetiSQL\Types\Affinity;
+use YetiDevWorks\YetiSQL\Types\Collation;
 
 /**
  * Lowers a single-table SELECT into a {@see Program}. The supported subset is a
@@ -204,7 +206,13 @@ final class Compiler
                 if ($b === null) {
                     return null;
                 }
-                $this->emit(Opcode::BINOP, $a, $b, $dest, [(string) $e->op, $e]);
+                $this->emit(Opcode::BINOP, $a, $b, $dest, [
+                    (string) $e->op,
+                    $e,
+                    $this->exprAffinity($e->left),
+                    $this->exprAffinity($e->right),
+                    $this->comparisonCollation($e),
+                ]);
                 return $dest;
 
             default:
@@ -232,6 +240,57 @@ final class Compiler
             return -1; // INTEGER PRIMARY KEY reads from the rowid, not the record
         }
         return $pos;
+    }
+
+    private function exprAffinity(?Expr $e): ?Affinity
+    {
+        if ($e === null) {
+            return null;
+        }
+        return match ($e->kind) {
+            Expr::COL => $this->columnAffinity($e),
+            Expr::CAST => Affinity::fromDeclaredType($e->typeName),
+            Expr::COLLATE => $this->exprAffinity($e->operand),
+            default => null,
+        };
+    }
+
+    private function columnAffinity(Expr $e): ?Affinity
+    {
+        $pos = $this->columnPos($e);
+        if ($pos === null) {
+            return null;
+        }
+        if ($pos < 0) {
+            return Affinity::INTEGER;
+        }
+        return $this->info->columns[$pos]->affinity;
+    }
+
+    private function comparisonCollation(Expr $e): string
+    {
+        return $this->explicitCollation($e->left)
+            ?? $this->explicitCollation($e->right)
+            ?? $this->columnCollation($e->left)
+            ?? $this->columnCollation($e->right)
+            ?? Collation::BINARY;
+    }
+
+    private function explicitCollation(?Expr $e): ?string
+    {
+        return $e !== null && $e->kind === Expr::COLLATE ? $e->collation : null;
+    }
+
+    private function columnCollation(?Expr $e): ?string
+    {
+        if ($e === null || $e->kind !== Expr::COL) {
+            return null;
+        }
+        $pos = $this->columnPos($e);
+        if ($pos === null || $pos < 0) {
+            return null;
+        }
+        return $this->info->columns[$pos]->collation;
     }
 
     private static function literalInt(?Expr $e): ?int
