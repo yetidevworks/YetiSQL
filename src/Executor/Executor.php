@@ -62,6 +62,8 @@ final class Executor
     private array $fkCascadeChildCache = [];
     /** @var \WeakMap<SelectStatement,string> */
     private \WeakMap $selectSignatures;
+    /** @var \WeakMap<TableInfo,array{dependsOnGenerated:bool,programs:array<int,?\Closure>}> */
+    private \WeakMap $generatedColumnPlans;
 
     /**
      * Common table expressions visible to the statement currently executing,
@@ -84,6 +86,7 @@ final class Executor
     public function __construct(private readonly Database $db)
     {
         $this->selectSignatures = new \WeakMap();
+        $this->generatedColumnPlans = new \WeakMap();
     }
 
     /**
@@ -4645,6 +4648,20 @@ final class Executor
      */
     private function applyGeneratedColumns(TableInfo $info, array &$logical, int $rowid, Evaluator $eval): void
     {
+        $plan = $this->generatedColumnPlan($info, $eval);
+
+        if (!$plan['dependsOnGenerated']) {
+            $env = new RowEnv();
+            $env->addFrame($info->name, $info, $logical, $rowid);
+            foreach ($info->generatedPositions as $pos) {
+                $col = $info->columns[$pos];
+                $program = $plan['programs'][$pos] ?? null;
+                $value = $program !== null ? $program($env, $eval) : $eval->evaluate($col->generated, $env);
+                $logical[$pos] = $col->affinity->apply($value);
+            }
+            return;
+        }
+
         $passes = \count($info->generatedPositions) + 1;
         for ($pass = 0; $pass < $passes; $pass++) {
             $env = new RowEnv();
@@ -4652,7 +4669,9 @@ final class Executor
             $changed = false;
             foreach ($info->generatedPositions as $pos) {
                 $col = $info->columns[$pos];
-                $value = $col->affinity->apply($eval->evaluate($col->generated, $env));
+                $program = $plan['programs'][$pos] ?? null;
+                $value = $program !== null ? $program($env, $eval) : $eval->evaluate($col->generated, $env);
+                $value = $col->affinity->apply($value);
                 if (($logical[$pos] ?? null) !== $value) {
                     $changed = true;
                 }
@@ -4662,6 +4681,65 @@ final class Executor
                 break;
             }
         }
+    }
+
+    /** @return array{dependsOnGenerated:bool,programs:array<int,?\Closure>} */
+    private function generatedColumnPlan(TableInfo $info, Evaluator $eval): array
+    {
+        if (isset($this->generatedColumnPlans[$info])) {
+            return $this->generatedColumnPlans[$info];
+        }
+
+        $dependsOnGenerated = false;
+        $programs = [];
+        foreach ($info->generatedPositions as $pos) {
+            $expr = $info->columns[$pos]->generated;
+            if ($expr === null) {
+                continue;
+            }
+            if ($this->exprReferencesGeneratedColumn($expr, $info)) {
+                $dependsOnGenerated = true;
+            }
+            $programs[$pos] = $eval->compile($expr, $info, $info->name);
+        }
+
+        return $this->generatedColumnPlans[$info] = [
+            'dependsOnGenerated' => $dependsOnGenerated,
+            'programs' => $programs,
+        ];
+    }
+
+    private function exprReferencesGeneratedColumn(Expr $expr, TableInfo $info): bool
+    {
+        if ($expr->kind === Expr::COL) {
+            if ($expr->table !== null && \strcasecmp($expr->table, $info->name) !== 0) {
+                return false;
+            }
+            $pos = $info->columnPos((string) $expr->name);
+            return $pos !== null && $info->columns[$pos]->generated !== null;
+        }
+
+        foreach ([$expr->left, $expr->right, $expr->operand, $expr->subject, $expr->elseExpr, $expr->low, $expr->high, $expr->escape] as $child) {
+            if ($child instanceof Expr && $this->exprReferencesGeneratedColumn($child, $info)) {
+                return true;
+            }
+        }
+        foreach ($expr->args as $child) {
+            if ($this->exprReferencesGeneratedColumn($child, $info)) {
+                return true;
+            }
+        }
+        foreach ($expr->list as $child) {
+            if ($this->exprReferencesGeneratedColumn($child, $info)) {
+                return true;
+            }
+        }
+        foreach ($expr->whens as [$when, $then]) {
+            if ($this->exprReferencesGeneratedColumn($when, $info) || $this->exprReferencesGeneratedColumn($then, $info)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** @return list<null|int|float|string|Blob> */
