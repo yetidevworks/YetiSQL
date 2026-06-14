@@ -21,6 +21,7 @@ use YetiDevWorks\YetiSQL\Sql\Ast\CreateViewStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DeleteStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DropStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\Expr;
+use YetiDevWorks\YetiSQL\Sql\Ast\ForeignKey;
 use YetiDevWorks\YetiSQL\Sql\Ast\InsertStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\JoinClause;
 use YetiDevWorks\YetiSQL\Sql\Ast\PragmaStatement;
@@ -4406,6 +4407,10 @@ final class Executor
 
         $this->insertIndexEntries($info, $rowid, $logical);
 
+        if ($info->foreignKeys !== [] && $this->db->foreignKeysEnabled()) {
+            $this->fkCheckChildRow($info, $logical);
+        }
+
         if ($fireTrig) {
             $this->fireTriggers($info, CreateTriggerStatement::INSERT, CreateTriggerStatement::AFTER, null, $logical, $rowid, $rowid);
         }
@@ -4538,6 +4543,16 @@ final class Executor
             // Maintain only indexes whose columns (or the rowid) actually changed.
             $this->maintainIndexesForUpdate($info, $rowid, $values, $newRowid, $newValues, $changed);
 
+            if ($this->db->foreignKeysEnabled()) {
+                // Parent-side: with the new key now stored, cascade ON UPDATE
+                // actions to children that still hold the pre-update key.
+                $this->fkBeforeParentChange($info, $values, $rowid, $newValues, $newRowid);
+                // Child-side: the rewritten row's own foreign keys must resolve.
+                if ($info->foreignKeys !== []) {
+                    $this->fkCheckChildRow($info, $newValues);
+                }
+            }
+
             if ($fireTrig) {
                 $this->fireTriggers($info, CreateTriggerStatement::UPDATE, CreateTriggerStatement::AFTER, $values, $newValues, $rowid, $newRowid, $changed);
             }
@@ -4587,6 +4602,11 @@ final class Executor
         foreach ($targets as [$rowid, $values]) {
             if ($fireTrig) {
                 $this->fireTriggers($info, CreateTriggerStatement::DELETE, CreateTriggerStatement::BEFORE, $values, null, $rowid, $rowid);
+            }
+            // Parent-side: apply ON DELETE actions to referencing children
+            // (RESTRICT / NO ACTION raise here) before the row is removed.
+            if ($this->db->foreignKeysEnabled()) {
+                $this->fkBeforeParentChange($info, $values, $rowid, null, null);
             }
             $this->deleteIndexEntries($info, $rowid, $values);
             $tree->delete($rowid);
@@ -4643,6 +4663,389 @@ final class Executor
             $record[$pos] = ($pos === $info->rowidAlias) ? null : ($values[$pos] ?? null);
         }
         return \array_values($record);
+    }
+
+    // === FOREIGN KEY enforcement =========================================
+
+    /**
+     * Resolve the parent-table column positions a foreign key targets. An empty
+     * refColumns list means the parent's PRIMARY KEY.
+     *
+     * @return list<int>
+     */
+    private function fkParentPositions(TableInfo $parent, ForeignKey $fk): array
+    {
+        if ($fk->refColumns !== []) {
+            $positions = [];
+            foreach ($fk->refColumns as $name) {
+                $pos = $parent->columnPos($name);
+                if ($pos === null) {
+                    throw SqlException::constraint(
+                        "foreign key mismatch - \"{$fk->refTable}\" referencing \"{$parent->name}\"",
+                    );
+                }
+                $positions[] = $pos;
+            }
+            return $positions;
+        }
+        if ($parent->rowidAlias >= 0) {
+            return [$parent->rowidAlias];
+        }
+        $positions = [];
+        foreach ($parent->columns as $i => $col) {
+            if ($col->primaryKey) {
+                $positions[] = $i;
+            }
+        }
+        if ($positions === []) {
+            throw SqlException::constraint(
+                "foreign key mismatch - \"{$fk->refTable}\" referencing \"{$parent->name}\"",
+            );
+        }
+        return $positions;
+    }
+
+    /**
+     * The unique index on exactly the given column positions (in order), or null.
+     */
+    private function fkIndexOnPositions(TableInfo $info, array $positions): ?\YetiDevWorks\YetiSQL\Engine\IndexInfo
+    {
+        foreach ($this->db->schema()->resolvedIndexes($info->name) as $index) {
+            if ($index->columnPositions === $positions) {
+                return $index;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Whether the parent table has a row whose referenced columns equal the
+     * given child values (already extracted, none null). Values are coerced to
+     * the parent column affinity, as SQLite compares them.
+     *
+     * @param list<int>                          $refPositions
+     * @param list<null|int|float|string|Blob>   $childVals
+     */
+    private function fkParentKeyExists(TableInfo $parent, array $refPositions, array $childVals): bool
+    {
+        $key = [];
+        foreach ($refPositions as $k => $pos) {
+            $key[] = $parent->columns[$pos]->affinity->apply($childVals[$k]);
+        }
+
+        if (\count($refPositions) === 1 && $refPositions[0] === $parent->rowidAlias) {
+            // INTEGER PRIMARY KEY: the value must be integer-valued to match a rowid.
+            if (!\is_int($key[0])) {
+                return false;
+            }
+            $tree = new TableBTree($this->db->pager(), $parent->rootPage);
+            return $tree->exists($key[0]);
+        }
+
+        $index = $this->fkIndexOnPositions($parent, $refPositions);
+        if ($index !== null) {
+            foreach ($this->indexTree($index)->scanFrom($key) as $entry) {
+                foreach ($key as $i => $kv) {
+                    if (Value::compare($entry[$i], $kv, $index->collations[$i] ?? 'BINARY') !== 0) {
+                        return false; // scanned past the matching block
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+
+        // No backing index: fall back to a full parent scan (correctness over speed).
+        $tree = new TableBTree($this->db->pager(), $parent->rootPage);
+        foreach ($tree->scan() as [$rowid, $payload]) {
+            $vals = $this->decodeRow($parent, $rowid, $payload);
+            $match = true;
+            foreach ($refPositions as $k => $pos) {
+                $pv = $pos === $parent->rowidAlias ? $rowid : ($vals[$pos] ?? null);
+                if ($pv === null
+                    || Value::compare($pv, $key[$k], $parent->columns[$pos]->collation) !== 0) {
+                    $match = false;
+                    break;
+                }
+            }
+            if ($match) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Child-side check: every foreign key on $childInfo must point at an
+     * existing parent row. A NULL in any child key column means the constraint
+     * is satisfied (MATCH SIMPLE). Call AFTER the child row is written so a
+     * self-referential key sees itself.
+     *
+     * @param list<null|int|float|string|Blob> $logical full child row vector
+     */
+    private function fkCheckChildRow(TableInfo $childInfo, array $logical): void
+    {
+        foreach ($childInfo->foreignKeys as $fk) {
+            $childVals = [];
+            $anyNull = false;
+            foreach ($fk->columns as $cname) {
+                $pos = $childInfo->columnPos($cname);
+                if ($pos === null) {
+                    throw SqlException::constraint(
+                        "foreign key mismatch - \"{$childInfo->name}\" referencing \"{$fk->refTable}\"",
+                    );
+                }
+                $v = $logical[$pos] ?? null;
+                if ($v === null) {
+                    $anyNull = true;
+                    break;
+                }
+                $childVals[] = $v;
+            }
+            if ($anyNull) {
+                continue;
+            }
+            $parent = $this->db->schema()->getTable($fk->refTable);
+            if ($parent === null) {
+                throw SqlException::constraint(
+                    "foreign key mismatch - \"{$childInfo->name}\" referencing \"{$fk->refTable}\"",
+                );
+            }
+            $refPositions = $this->fkParentPositions($parent, $fk);
+            if (\count($refPositions) !== \count($childVals)) {
+                throw SqlException::constraint(
+                    "foreign key mismatch - \"{$childInfo->name}\" referencing \"{$fk->refTable}\"",
+                );
+            }
+            if (!$this->fkParentKeyExists($parent, $refPositions, $childVals)) {
+                throw SqlException::constraint('FOREIGN KEY constraint failed');
+            }
+        }
+    }
+
+    /**
+     * Every (childTable, foreignKey) that references $parent.
+     *
+     * @return list<array{child:TableInfo,fk:ForeignKey}>
+     */
+    private function fkReferencing(TableInfo $parent): array
+    {
+        $out = [];
+        $target = \strtolower($parent->name);
+        foreach ($this->db->schema()->tableNames() as $tableName) {
+            $child = $this->db->schema()->getTable($tableName);
+            if ($child === null) {
+                continue;
+            }
+            foreach ($child->foreignKeys as $fk) {
+                if (\strtolower($fk->refTable) === $target) {
+                    $out[] = ['child' => $child, 'fk' => $fk];
+                }
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * Child rows whose foreign-key columns equal $parentKey (none of which is
+     * null). Returns each as [rowid, full values].
+     *
+     * @param list<null|int|float|string|Blob> $parentKey
+     * @return list<array{rowid:int,values:list<null|int|float|string|Blob>}>
+     */
+    private function fkChildRowsReferencing(TableInfo $child, ForeignKey $fk, array $parentKey): array
+    {
+        $positions = [];
+        foreach ($fk->columns as $cname) {
+            $pos = $child->columnPos($cname);
+            if ($pos === null) {
+                return [];
+            }
+            $positions[] = $pos;
+        }
+        $key = [];
+        foreach ($positions as $k => $pos) {
+            $key[] = $child->columns[$pos]->affinity->apply($parentKey[$k]);
+        }
+
+        $tree = new TableBTree($this->db->pager(), $child->rootPage);
+        $matches = [];
+
+        $index = $this->fkIndexOnPositions($child, $positions);
+        if ($index !== null) {
+            foreach ($this->indexTree($index)->scanFrom($key) as $entry) {
+                foreach ($key as $i => $kv) {
+                    if (Value::compare($entry[$i], $kv, $index->collations[$i] ?? 'BINARY') !== 0) {
+                        return $matches; // past the matching block
+                    }
+                }
+                $rid = (int) $entry[\count($entry) - 1];
+                $matches[] = ['rowid' => $rid, 'values' => $this->decodeRow($child, $rid, (string) $tree->get($rid))];
+            }
+            return $matches;
+        }
+
+        foreach ($tree->scan() as [$rowid, $payload]) {
+            $vals = $this->decodeRow($child, $rowid, $payload);
+            $match = true;
+            foreach ($positions as $k => $pos) {
+                $cv = $pos === $child->rowidAlias ? $rowid : ($vals[$pos] ?? null);
+                if ($cv === null || Value::compare($cv, $key[$k], $child->columns[$pos]->collation) !== 0) {
+                    $match = false;
+                    break;
+                }
+            }
+            if ($match) {
+                $matches[] = ['rowid' => $rowid, 'values' => $vals];
+            }
+        }
+        return $matches;
+    }
+
+    /**
+     * Parent-side enforcement, run BEFORE a parent row is deleted or updated.
+     * $newValues is null for a DELETE. Applies ON DELETE / ON UPDATE actions to
+     * referencing children, raising for RESTRICT / NO ACTION when children remain.
+     *
+     * @param list<null|int|float|string|Blob>      $oldValues
+     * @param ?list<null|int|float|string|Blob>     $newValues
+     */
+    private function fkBeforeParentChange(TableInfo $parent, array $oldValues, int $oldRowid, ?array $newValues, ?int $newRowid): void
+    {
+        $isDelete = $newValues === null;
+
+        /** @var list<array{child:TableInfo,fk:ForeignKey,rows:list<array{rowid:int,values:list<null|int|float|string|Blob>}>,action:string,newKey:?list<null|int|float|string|Blob>}> $pending */
+        $pending = [];
+
+        foreach ($this->fkReferencing($parent) as ['child' => $child, 'fk' => $fk]) {
+            $refPositions = $this->fkParentPositions($parent, $fk);
+
+            $oldKey = [];
+            $nullKey = false;
+            foreach ($refPositions as $pos) {
+                $v = $pos === $parent->rowidAlias ? $oldRowid : ($oldValues[$pos] ?? null);
+                if ($v === null) {
+                    $nullKey = true;
+                    break;
+                }
+                $oldKey[] = $v;
+            }
+            if ($nullKey) {
+                continue; // a NULL parent key can have no children referencing it
+            }
+
+            $newKey = null;
+            if (!$isDelete) {
+                $newKey = [];
+                foreach ($refPositions as $pos) {
+                    $newKey[] = $pos === $parent->rowidAlias ? $newRowid : ($newValues[$pos] ?? null);
+                }
+                if ($this->fkKeysEqual($oldKey, $newKey, $parent, $refPositions)) {
+                    continue; // referenced columns unchanged
+                }
+            }
+
+            $rows = $this->fkChildRowsReferencing($child, $fk, $oldKey);
+            if ($rows === []) {
+                continue;
+            }
+            $action = $isDelete ? $fk->onDelete : $fk->onUpdate;
+            $pending[] = ['child' => $child, 'fk' => $fk, 'rows' => $rows, 'action' => $action, 'newKey' => $newKey];
+        }
+
+        // First pass: any RESTRICT / NO ACTION with surviving children aborts
+        // before we mutate, so the statement leaves no partial cascade.
+        foreach ($pending as $p) {
+            if ($p['action'] === ForeignKey::NO_ACTION || $p['action'] === ForeignKey::RESTRICT) {
+                throw SqlException::constraint('FOREIGN KEY constraint failed');
+            }
+        }
+
+        // Second pass: apply CASCADE / SET NULL / SET DEFAULT.
+        foreach ($pending as $p) {
+            $this->fkApplyAction($p['child'], $p['fk'], $p['rows'], $p['action'], $p['newKey']);
+        }
+    }
+
+    /**
+     * @param list<null|int|float|string|Blob> $a
+     * @param list<null|int|float|string|Blob> $b
+     * @param list<int>                        $positions
+     */
+    private function fkKeysEqual(array $a, array $b, TableInfo $parent, array $positions): bool
+    {
+        foreach ($positions as $k => $pos) {
+            $coll = $parent->columns[$pos]->collation;
+            if (Value::compare($a[$k] ?? null, $b[$k] ?? null, $coll) !== 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Apply one foreign-key action to a set of matched child rows.
+     *
+     * @param list<array{rowid:int,values:list<null|int|float|string|Blob>}> $rows
+     * @param ?list<null|int|float|string|Blob>                              $newKey
+     */
+    private function fkApplyAction(TableInfo $child, ForeignKey $fk, array $rows, string $action, ?array $newKey): void
+    {
+        $tree = new TableBTree($this->db->pager(), $child->rootPage);
+        $positions = [];
+        foreach ($fk->columns as $cname) {
+            $positions[] = $child->columnPos($cname);
+        }
+
+        foreach ($rows as $row) {
+            $rowid = $row['rowid'];
+            if (!$tree->exists($rowid)) {
+                continue; // already removed by an earlier cascade
+            }
+            $values = $this->decodeRow($child, $rowid, (string) $tree->get($rowid));
+
+            if ($action === ForeignKey::CASCADE && $newKey === null) {
+                // ON DELETE CASCADE: remove the child row, recursing into its own children.
+                $this->fkBeforeParentChange($child, $values, $rowid, null, null);
+                $this->deleteIndexEntries($child, $rowid, $values);
+                $tree->delete($rowid);
+                continue;
+            }
+
+            // Build the replacement values for the FK columns.
+            $newValues = $values;
+            foreach ($positions as $k => $pos) {
+                $newValues[$pos] = match ($action) {
+                    ForeignKey::CASCADE => $child->columns[$pos]->affinity->apply($newKey[$k]),
+                    ForeignKey::SET_NULL => null,
+                    ForeignKey::SET_DEFAULT => $child->columns[$pos]->defaultValue,
+                    default => $newValues[$pos],
+                };
+            }
+
+            $changed = [];
+            foreach ($positions as $pos) {
+                $changed[$pos] = true;
+            }
+            // Recompute any generated columns that depend on the changed FK columns.
+            if ($child->generatedPositions !== []) {
+                $eval = new Evaluator($this, []);
+                $this->applyGeneratedColumns($child, $newValues, $rowid, $eval);
+                foreach ($child->generatedPositions as $gp) {
+                    $changed[$gp] = true;
+                }
+            }
+
+            $tree->put($rowid, RecordCodec::encode($this->buildRecord($child, $newValues)));
+            $this->maintainIndexesForUpdate($child, $rowid, $values, $rowid, $newValues, $changed);
+
+            // The child's own foreign keys must still hold after the rewrite, and
+            // a SET action may cascade to its children (parent role).
+            $this->fkBeforeParentChange($child, $values, $rowid, $newValues, $rowid);
+            if ($this->db->foreignKeysEnabled()) {
+                $this->fkCheckChildRow($child, $newValues);
+            }
+        }
     }
 
     // === DDL =============================================================
@@ -5123,7 +5526,14 @@ final class Executor
             // reset on every checkpoint here, so report 0 outstanding frames.
             return new Result(['busy', 'log', 'checkpointed'], [[0, 0, 0]], 1);
         }
-        if (\in_array($name, ['foreign_keys', 'synchronous', 'cache_size', 'user_version', 'encoding'], true)) {
+        if ($name === 'foreign_keys') {
+            if ($stmt->value !== null) {
+                $arg = \strtolower($this->pragmaArg($stmt));
+                $this->db->setForeignKeysEnabled(\in_array($arg, ['1', 'on', 'true', 'yes'], true));
+            }
+            return new Result(['foreign_keys'], [[$this->db->foreignKeysEnabled() ? 1 : 0]], 1);
+        }
+        if (\in_array($name, ['synchronous', 'cache_size', 'user_version', 'encoding'], true)) {
             // Accept settings; return a representative value for reads.
             $value = match ($name) {
                 'encoding' => 'UTF-8',
@@ -5157,11 +5567,7 @@ final class Executor
             'table_xinfo' => $this->tableInfoResult($arg, true),
             'index_list' => $this->indexListResult($arg),
             'index_info', 'index_xinfo' => new Result(['seqno', 'cid', 'name'], [], 0),
-            'foreign_key_list' => new Result(
-                ['id', 'seq', 'table', 'from', 'to', 'on_update', 'on_delete', 'match'],
-                [],
-                0,
-            ),
+            'foreign_key_list' => $this->foreignKeyListResult($arg),
             default => new Result([], [], 0),
         };
     }
@@ -5192,6 +5598,35 @@ final class Executor
                 $row[] = 0; // not a hidden/generated column
             }
             $rows[] = $row;
+        }
+        return new Result($cols, $rows, \count($rows));
+    }
+
+    private function foreignKeyListResult(string $tableName): Result
+    {
+        $cols = ['id', 'seq', 'table', 'from', 'to', 'on_update', 'on_delete', 'match'];
+        $info = $this->db->schema()->getTable($tableName);
+        if ($info === null) {
+            return new Result($cols, [], 0);
+        }
+        $rows = [];
+        // SQLite numbers FKs from highest id to lowest, in reverse declaration order.
+        $fks = $info->foreignKeys;
+        $id = \count($fks) - 1;
+        foreach ($fks as $fk) {
+            foreach ($fk->columns as $seq => $from) {
+                $rows[] = [
+                    $id,
+                    $seq,
+                    $fk->refTable,
+                    $from,
+                    $fk->refColumns[$seq] ?? null,
+                    $fk->onUpdate,
+                    $fk->onDelete,
+                    'NONE',
+                ];
+            }
+            $id--;
         }
         return new Result($cols, $rows, \count($rows));
     }

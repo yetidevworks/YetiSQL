@@ -26,6 +26,8 @@ final class TableInfo
         public bool $autoincrement = false,
         public bool $withoutRowid = false,
         public string $sql = '',
+        /** @var list<\YetiDevWorks\YetiSQL\Sql\Ast\ForeignKey> FOREIGN KEY constraints on this table */
+        public array $foreignKeys = [],
     ) {
         foreach ($columns as $i => $col) {
             $this->columnIndex[\strtolower($col->name)] = $i;

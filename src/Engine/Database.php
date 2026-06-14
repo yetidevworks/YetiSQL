@@ -42,6 +42,9 @@ final class Database
     /** When true, single-table SELECTs that compile are run through the VDBE VM. */
     private bool $vdbeEnabled = false;
 
+    /** When true, FOREIGN KEY constraints are enforced. SQLite defaults this OFF. */
+    private bool $foreignKeysEnabled = false;
+
     public function pager(): Pager
     {
         return $this->pager;
@@ -55,6 +58,16 @@ final class Database
     public function setVdbeEnabled(bool $on): void
     {
         $this->vdbeEnabled = $on;
+    }
+
+    public function foreignKeysEnabled(): bool
+    {
+        return $this->foreignKeysEnabled;
+    }
+
+    public function setForeignKeysEnabled(bool $on): void
+    {
+        $this->foreignKeysEnabled = $on;
     }
 
     public function schema(): Schema

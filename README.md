@@ -299,12 +299,16 @@ row counts); CTEs (incl. recursive), window functions, views, triggers (incl. `I
 `json_array_length`, `json_set`/`insert`/`replace`/`remove`/`patch`), the `->` and `->>`
 operators, the `json_group_array`/`json_group_object` aggregates, and the `json_each`/`json_tree`
 table-valued functions; `RETURNING` on INSERT/UPDATE/DELETE; generated columns
-(`GENERATED ALWAYS AS`, STORED and VIRTUAL); and Doctrine DBAL and Eloquent adapters.
+(`GENERATED ALWAYS AS`, STORED and VIRTUAL); `FOREIGN KEY` enforcement under
+`PRAGMA foreign_keys=ON` (child existence checks plus `ON DELETE`/`ON UPDATE`
+`NO ACTION`/`RESTRICT`/`CASCADE`/`SET NULL`/`SET DEFAULT`, composite and
+self-referential keys, `pragma_foreign_key_list`); and Doctrine DBAL and Eloquent adapters.
 
-**Not yet implemented (planned):** FTS5 extension, foreign-key enforcement, and full
+**Not yet implemented (planned):** FTS5 extension and full
 VDBE execution of every query (today the VM covers single-table scans and the
 tree-walker handles the rest). Byte-level `sqlite3` *file* interop is out of scope by
-design.
+design. Foreign keys are enforced immediately: `DEFERRABLE` / `INITIALLY DEFERRED`
+clauses parse and run but behave as immediate constraints.
 
 Generated columns are computed and stored on every write for both STORED and VIRTUAL
 kinds — value-identical to SQLite for the deterministic expressions they're allowed to

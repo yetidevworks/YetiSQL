@@ -693,6 +693,7 @@ final class Schema
             autoincrement: $autoincrement,
             withoutRowid: $ast->withoutRowid,
             sql: $ast->sql,
+            foreignKeys: $ast->foreignKeys,
         );
     }
 

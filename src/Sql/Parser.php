@@ -7,6 +7,7 @@ namespace YetiDevWorks\YetiSQL\Sql;
 use YetiDevWorks\YetiSQL\Engine\Blob;
 use YetiDevWorks\YetiSQL\Exception\SqlException;
 use YetiDevWorks\YetiSQL\Sql\Ast\ColumnDef;
+use YetiDevWorks\YetiSQL\Sql\Ast\ForeignKey;
 use YetiDevWorks\YetiSQL\Sql\Ast\AlterTableStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateIndexStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateTableStatement;
@@ -530,6 +531,12 @@ final class Parser
         } while ($this->accept(Token::PUNCT, ','));
         $this->expect(Token::PUNCT, ')');
 
+        foreach ($stmt->columns as $cd) {
+            if ($cd->reference !== null) {
+                $stmt->foreignKeys[] = $cd->reference;
+            }
+        }
+
         if ($this->accept(Token::KEYWORD, 'WITHOUT')) {
             $this->expect(Token::KEYWORD, 'ROWID');
             $stmt->withoutRowid = true;
@@ -564,8 +571,9 @@ final class Parser
             $this->expect(Token::PUNCT, ')');
         } elseif ($this->accept(Token::KEYWORD, 'FOREIGN')) {
             $this->expect(Token::KEYWORD, 'KEY');
-            $this->parenColumnList();
-            $this->skipForeignKeyClause();
+            $childCols = $this->parenColumnList();
+            $this->expect(Token::KEYWORD, 'REFERENCES');
+            $stmt->foreignKeys[] = $this->referencesClause($childCols);
         }
     }
 
@@ -624,11 +632,7 @@ final class Parser
                 $this->expression();
                 $this->expect(Token::PUNCT, ')');
             } elseif ($this->accept(Token::KEYWORD, 'REFERENCES')) {
-                $this->name();
-                if ($this->peek()->is(Token::PUNCT, '(')) {
-                    $this->parenColumnList();
-                }
-                $this->skipForeignKeyClause();
+                $col->reference = $this->referencesClause([$name]);
             } elseif ($this->accept(Token::KEYWORD, 'GENERATED')) {
                 $this->expect(Token::KEYWORD, 'ALWAYS');
                 $this->expect(Token::KEYWORD, 'AS');
@@ -672,6 +676,63 @@ final class Parser
             $this->expect(Token::KEYWORD, 'CONFLICT');
             $this->advance(); // ROLLBACK/ABORT/FAIL/IGNORE/REPLACE
         }
+    }
+
+    /**
+     * Parse a REFERENCES clause (the REFERENCES keyword has already been consumed for
+     * table-level FOREIGN KEY, and is consumed by the caller for column-level too).
+     *
+     * @param list<string> $childCols
+     */
+    private function referencesClause(array $childCols): ForeignKey
+    {
+        $refTable = $this->name();
+        $refCols = [];
+        if ($this->peek()->is(Token::PUNCT, '(')) {
+            $refCols = $this->parenColumnList();
+        }
+
+        $onDelete = ForeignKey::NO_ACTION;
+        $onUpdate = ForeignKey::NO_ACTION;
+        while (true) {
+            $v = \strtoupper($this->peek()->value);
+            if ($v === 'ON') {
+                $this->advance();
+                $which = \strtoupper($this->advance()->value); // DELETE or UPDATE
+                $action = $this->foreignKeyAction();
+                if ($which === 'UPDATE') {
+                    $onUpdate = $action;
+                } else {
+                    $onDelete = $action;
+                }
+            } elseif ($v === 'MATCH') {
+                $this->advance();
+                $this->advance(); // match-type name, ignored (treated as MATCH SIMPLE)
+            } else {
+                break;
+            }
+        }
+        // Trailing [NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE] — accepted, enforced immediately.
+        $this->skipForeignKeyClause();
+
+        return new ForeignKey($childCols, $refTable, $refCols, $onDelete, $onUpdate);
+    }
+
+    private function foreignKeyAction(): string
+    {
+        $v = \strtoupper($this->advance()->value);
+        if ($v === 'SET') {
+            $n = \strtoupper($this->advance()->value); // NULL or DEFAULT
+            return $n === 'DEFAULT' ? ForeignKey::SET_DEFAULT : ForeignKey::SET_NULL;
+        }
+        if ($v === 'NO') {
+            $this->advance(); // ACTION
+            return ForeignKey::NO_ACTION;
+        }
+        if ($v === 'CASCADE') {
+            return ForeignKey::CASCADE;
+        }
+        return ForeignKey::RESTRICT;
     }
 
     private function skipForeignKeyClause(): void
