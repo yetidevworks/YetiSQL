@@ -301,8 +301,17 @@ final class Parser
             'FROM', 'WHERE', 'GROUP', 'HAVING', 'ORDER', 'LIMIT', 'OFFSET',
             'UNION', 'INTERSECT', 'EXCEPT', 'JOIN', 'INNER', 'LEFT', 'RIGHT',
             'FULL', 'CROSS', 'NATURAL', 'ON', 'USING', 'AS', 'AND', 'OR',
-            'WHEN', 'THEN', 'ELSE', 'END', 'COLLATE', 'ASC', 'DESC',
+            'WHEN', 'THEN', 'ELSE', 'END', 'COLLATE', 'ASC', 'DESC', 'RETURNING',
         ], true);
+    }
+
+    /** Parse a trailing `RETURNING <result-columns>` clause, or null if absent. */
+    private function returningClause(): ?array
+    {
+        if (!$this->accept(Token::KEYWORD, 'RETURNING')) {
+            return null;
+        }
+        return $this->resultColumns();
     }
 
     private function tableRef(): TableRef
@@ -780,6 +789,7 @@ final class Parser
         if ($this->accept(Token::KEYWORD, 'DEFAULT')) {
             $this->expect(Token::KEYWORD, 'VALUES');
             $stmt->defaultValues = true;
+            $stmt->returning = $this->returningClause();
             return $stmt;
         }
         if ($this->accept(Token::KEYWORD, 'VALUES')) {
@@ -799,6 +809,7 @@ final class Parser
         if ($this->peek()->isKeyword('ON')) {
             throw SqlException::parse('UPSERT (ON CONFLICT) is not supported in this version');
         }
+        $stmt->returning = $this->returningClause();
         return $stmt;
     }
 
@@ -828,7 +839,8 @@ final class Parser
         if ($this->accept(Token::KEYWORD, 'WHERE')) {
             $where = $this->expression();
         }
-        return new UpdateStatement($table, $set, $where, $orReplace, $orIgnore);
+        $returning = $this->returningClause();
+        return new UpdateStatement($table, $set, $where, $orReplace, $orIgnore, $returning);
     }
 
     private function deleteStatement(): DeleteStatement
@@ -840,7 +852,8 @@ final class Parser
         if ($this->accept(Token::KEYWORD, 'WHERE')) {
             $where = $this->expression();
         }
-        return new DeleteStatement($table, $where);
+        $returning = $this->returningClause();
+        return new DeleteStatement($table, $where, $returning);
     }
 
     private function dropStatement(): DropStatement

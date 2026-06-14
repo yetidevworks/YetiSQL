@@ -298,10 +298,11 @@ row counts); CTEs (incl. recursive), window functions, views, triggers (incl. `I
 (`json`, `json_extract`, `json_type`, `json_valid`, `json_quote`, `json_array`, `json_object`,
 `json_array_length`, `json_set`/`insert`/`replace`/`remove`/`patch`), the `->` and `->>`
 operators, the `json_group_array`/`json_group_object` aggregates, and the `json_each`/`json_tree`
-table-valued functions; and Doctrine DBAL and Eloquent adapters.
+table-valued functions; `RETURNING` on INSERT/UPDATE/DELETE; and Doctrine DBAL and
+Eloquent adapters.
 
 **Not yet implemented (planned):** FTS5 extension, generated columns, foreign-key
-enforcement, `RETURNING`, and full VDBE execution of every query (today the VM covers
+enforcement, and full VDBE execution of every query (today the VM covers
 single-table scans and the tree-walker handles the rest). Byte-level `sqlite3` *file*
 interop is out of scope by design.
 

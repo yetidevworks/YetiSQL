@@ -13,6 +13,8 @@ final class UpdateStatement implements Statement
         public ?Expr $where = null,
         public bool $orReplace = false,
         public bool $orIgnore = false,
+        /** @var list<ResultColumn>|null RETURNING result columns, or null */
+        public ?array $returning = null,
     ) {
     }
 }

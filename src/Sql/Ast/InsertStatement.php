@@ -16,6 +16,8 @@ final class InsertStatement implements Statement
         public bool $orReplace = false,
         public bool $orIgnore = false,
         public bool $defaultValues = false,
+        /** @var list<ResultColumn>|null RETURNING result columns, or null */
+        public ?array $returning = null,
     ) {
     }
 }

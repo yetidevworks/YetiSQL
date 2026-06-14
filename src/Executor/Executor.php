@@ -4196,19 +4196,83 @@ final class Executor
         $fireTrig = $this->db->schema()->hasTriggersOn($info->name);
         $count = 0;
         $lastId = 0;
+        $returnRows = [];
         foreach ($rowsData as $data) {
-            $lastId = $this->insertOneRow($info, $tree, $targetCols, $data, $stmt, $eval, $fireTrig);
+            $logical = null;
+            $rowid = $this->insertOneRow($info, $tree, $targetCols, $data, $stmt, $eval, $fireTrig, $logical);
+            if ($logical === null) {
+                continue; // OR IGNORE skipped this row
+            }
+            $lastId = $rowid;
             $count++;
+            if ($stmt->returning !== null) {
+                $returnRows[] = $this->projectReturningRow($info, $stmt->returning, $logical, $rowid, $eval);
+            }
+        }
+        if ($stmt->returning !== null) {
+            return new Result(
+                columns: $this->returningColumnNames($info, $stmt->returning),
+                rows: $returnRows,
+                rowCount: \count($returnRows),
+                lastInsertId: $lastId,
+            );
         }
         return Result::affected($count, $lastId);
+    }
+
+    /**
+     * Output column names for a RETURNING clause.
+     *
+     * @param list<\YetiDevWorks\YetiSQL\Sql\Ast\ResultColumn> $returning
+     * @return list<string>
+     */
+    private function returningColumnNames(TableInfo $info, array $returning): array
+    {
+        $names = [];
+        foreach ($returning as $rc) {
+            if ($rc->star || $rc->tableStar !== null) {
+                foreach ($info->columns as $col) {
+                    $names[] = $col->name;
+                }
+            } else {
+                $names[] = $rc->alias ?? $this->exprLabel($rc->expr);
+            }
+        }
+        return $names;
+    }
+
+    /**
+     * Project one affected row through a RETURNING clause. $logical is the row's
+     * full column vector (rowid-alias slot already set to $rowid).
+     *
+     * @param list<\YetiDevWorks\YetiSQL\Sql\Ast\ResultColumn> $returning
+     * @param list<null|int|float|string|Blob> $logical
+     * @return list<null|int|float|string|Blob>
+     */
+    private function projectReturningRow(TableInfo $info, array $returning, array $logical, int $rowid, Evaluator $eval): array
+    {
+        $env = new RowEnv();
+        $env->addFrame($info->name, $info, $logical, $rowid);
+        $row = [];
+        foreach ($returning as $rc) {
+            if ($rc->star || $rc->tableStar !== null) {
+                foreach ($info->columns as $pos => $col) {
+                    $row[] = $logical[$pos] ?? null;
+                }
+            } else {
+                $row[] = $eval->evaluate($rc->expr, $env);
+            }
+        }
+        return $row;
     }
 
     /**
      * @param list<string> $targetCols
      * @param list<null|int|float|string|Blob> $data
      */
-    private function insertOneRow(TableInfo $info, TableBTree $tree, array $targetCols, array $data, InsertStatement $stmt, Evaluator $eval, bool $fireTrig = false): int
+    private function insertOneRow(TableInfo $info, TableBTree $tree, array $targetCols, array $data, InsertStatement $stmt, Evaluator $eval, bool $fireTrig = false, ?array &$logicalOut = null): int
     {
+        $logicalOut = null;
         // Map supplied values onto a full column vector.
         $byPos = \array_fill(0, $info->columnCount(), null);
         $provided = \array_fill(0, $info->columnCount(), false);
@@ -4334,6 +4398,7 @@ final class Executor
         if ($fireTrig) {
             $this->fireTriggers($info, CreateTriggerStatement::INSERT, CreateTriggerStatement::AFTER, null, $logical, $rowid, $rowid);
         }
+        $logicalOut = $logical;
         return $rowid;
     }
 
@@ -4367,6 +4432,7 @@ final class Executor
 
         $fireTrig = $this->db->schema()->hasTriggersOn($info->name);
         $count = 0;
+        $returnRows = [];
         foreach ($targets as [$rowid, $values]) {
             $env = new RowEnv();
             $env->addFrame($info->name, $info, $values, $rowid);
@@ -4453,6 +4519,16 @@ final class Executor
                 $this->fireTriggers($info, CreateTriggerStatement::UPDATE, CreateTriggerStatement::AFTER, $values, $newValues, $rowid, $newRowid, $changed);
             }
             $count++;
+            if ($stmt->returning !== null) {
+                $returnRows[] = $this->projectReturningRow($info, $stmt->returning, $newValues, $newRowid, $eval);
+            }
+        }
+        if ($stmt->returning !== null) {
+            return new Result(
+                columns: $this->returningColumnNames($info, $stmt->returning),
+                rows: $returnRows,
+                rowCount: \count($returnRows),
+            );
         }
         return Result::affected($count);
     }
@@ -4484,6 +4560,7 @@ final class Executor
             $targets[] = [$rowid, $values];
         }
         $fireTrig = $this->db->schema()->hasTriggersOn($info->name);
+        $returnRows = [];
         foreach ($targets as [$rowid, $values]) {
             if ($fireTrig) {
                 $this->fireTriggers($info, CreateTriggerStatement::DELETE, CreateTriggerStatement::BEFORE, $values, null, $rowid, $rowid);
@@ -4493,6 +4570,16 @@ final class Executor
             if ($fireTrig) {
                 $this->fireTriggers($info, CreateTriggerStatement::DELETE, CreateTriggerStatement::AFTER, $values, null, $rowid, $rowid);
             }
+            if ($stmt->returning !== null) {
+                $returnRows[] = $this->projectReturningRow($info, $stmt->returning, $values, $rowid, $eval);
+            }
+        }
+        if ($stmt->returning !== null) {
+            return new Result(
+                columns: $this->returningColumnNames($info, $stmt->returning),
+                rows: $returnRows,
+                rowCount: \count($returnRows),
+            );
         }
         return Result::affected(\count($targets));
     }
