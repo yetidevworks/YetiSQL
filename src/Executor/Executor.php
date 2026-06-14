@@ -8,6 +8,7 @@ use Generator;
 use YetiDevWorks\YetiSQL\Engine\Blob;
 use YetiDevWorks\YetiSQL\Engine\ColumnInfo;
 use YetiDevWorks\YetiSQL\Engine\Database;
+use YetiDevWorks\YetiSQL\Engine\IndexInfo;
 use YetiDevWorks\YetiSQL\Engine\RecordCodec;
 use YetiDevWorks\YetiSQL\Engine\TableBTree;
 use YetiDevWorks\YetiSQL\Engine\TableInfo;
@@ -64,6 +65,8 @@ final class Executor
     private \WeakMap $selectSignatures;
     /** @var \WeakMap<TableInfo,array{dependsOnGenerated:bool,programs:array<int,?\Closure>}> */
     private \WeakMap $generatedColumnPlans;
+    /** @var \WeakMap<TableInfo,array{cookie:int,plans:list<array{childPositions:list<int>,parent:TableInfo,refPositions:list<int>,index:?IndexInfo}>}> */
+    private \WeakMap $fkChildCheckPlans;
 
     /**
      * Common table expressions visible to the statement currently executing,
@@ -87,6 +90,7 @@ final class Executor
     {
         $this->selectSignatures = new \WeakMap();
         $this->generatedColumnPlans = new \WeakMap();
+        $this->fkChildCheckPlans = new \WeakMap();
     }
 
     /**
@@ -4795,7 +4799,7 @@ final class Executor
     /**
      * The unique index on exactly the given column positions (in order), or null.
      */
-    private function fkIndexOnPositions(TableInfo $info, array $positions): ?\YetiDevWorks\YetiSQL\Engine\IndexInfo
+    private function fkIndexOnPositions(TableInfo $info, array $positions): ?IndexInfo
     {
         foreach ($this->db->schema()->resolvedIndexes($info->name) as $index) {
             if ($index->columnPositions === $positions) {
@@ -4813,7 +4817,7 @@ final class Executor
      * @param list<int>                          $refPositions
      * @param list<null|int|float|string|Blob>   $childVals
      */
-    private function fkParentKeyExists(TableInfo $parent, array $refPositions, array $childVals): bool
+    private function fkParentKeyExists(TableInfo $parent, array $refPositions, array $childVals, ?IndexInfo $index): bool
     {
         $key = [];
         foreach ($refPositions as $k => $pos) {
@@ -4829,7 +4833,6 @@ final class Executor
             return $tree->exists($key[0]);
         }
 
-        $index = $this->fkIndexOnPositions($parent, $refPositions);
         if ($index !== null) {
             foreach ($this->indexTree($index)->scanFrom($key) as $entry) {
                 foreach ($key as $i => $kv) {
@@ -4872,16 +4875,10 @@ final class Executor
      */
     private function fkCheckChildRow(TableInfo $childInfo, array $logical): void
     {
-        foreach ($childInfo->foreignKeys as $fk) {
+        foreach ($this->fkChildCheckPlan($childInfo) as $plan) {
             $childVals = [];
             $anyNull = false;
-            foreach ($fk->columns as $cname) {
-                $pos = $childInfo->columnPos($cname);
-                if ($pos === null) {
-                    throw SqlException::constraint(
-                        "foreign key mismatch - \"{$childInfo->name}\" referencing \"{$fk->refTable}\"",
-                    );
-                }
+            foreach ($plan['childPositions'] as $pos) {
                 $v = $logical[$pos] ?? null;
                 if ($v === null) {
                     $anyNull = true;
@@ -4892,6 +4889,33 @@ final class Executor
             if ($anyNull) {
                 continue;
             }
+            if (!$this->fkParentKeyExists($plan['parent'], $plan['refPositions'], $childVals, $plan['index'])) {
+                throw SqlException::constraint('FOREIGN KEY constraint failed');
+            }
+        }
+    }
+
+    /** @return list<array{childPositions:list<int>,parent:TableInfo,refPositions:list<int>,index:?IndexInfo}> */
+    private function fkChildCheckPlan(TableInfo $childInfo): array
+    {
+        $cookie = $this->db->pager()->schemaCookie();
+        $cached = $this->fkChildCheckPlans[$childInfo] ?? null;
+        if ($cached !== null && $cached['cookie'] === $cookie) {
+            return $cached['plans'];
+        }
+
+        $plans = [];
+        foreach ($childInfo->foreignKeys as $fk) {
+            $childPositions = [];
+            foreach ($fk->columns as $cname) {
+                $pos = $childInfo->columnPos($cname);
+                if ($pos === null) {
+                    throw SqlException::constraint(
+                        "foreign key mismatch - \"{$childInfo->name}\" referencing \"{$fk->refTable}\"",
+                    );
+                }
+                $childPositions[] = $pos;
+            }
             $parent = $this->db->schema()->getTable($fk->refTable);
             if ($parent === null) {
                 throw SqlException::constraint(
@@ -4899,15 +4923,21 @@ final class Executor
                 );
             }
             $refPositions = $this->fkParentPositions($parent, $fk);
-            if (\count($refPositions) !== \count($childVals)) {
+            if (\count($refPositions) !== \count($childPositions)) {
                 throw SqlException::constraint(
                     "foreign key mismatch - \"{$childInfo->name}\" referencing \"{$fk->refTable}\"",
                 );
             }
-            if (!$this->fkParentKeyExists($parent, $refPositions, $childVals)) {
-                throw SqlException::constraint('FOREIGN KEY constraint failed');
-            }
+            $plans[] = [
+                'childPositions' => $childPositions,
+                'parent' => $parent,
+                'refPositions' => $refPositions,
+                'index' => $this->fkIndexOnPositions($parent, $refPositions),
+            ];
         }
+
+        $this->fkChildCheckPlans[$childInfo] = ['cookie' => $cookie, 'plans' => $plans];
+        return $plans;
     }
 
     /**
