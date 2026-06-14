@@ -50,8 +50,20 @@ function runSuite(object $db, int $rows, int $lookups, bool $withIndex): array
         $db->commit();
     });
 
+    // Secondary table for join / correlated-subquery workloads: ~one post per
+    // user, foreign key user_id. Setup only (not part of the insert metric).
+    $db->exec('CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, body TEXT)');
+    $db->beginTransaction();
+    $pstmt = $db->prepare('INSERT INTO posts (id, user_id, body) VALUES (?,?,?)');
+    for ($i = 1; $i <= $rows; $i++) {
+        $pstmt->execute([$i, (($i * 31) % $rows) + 1, 'post' . $i]);
+    }
+    $db->commit();
+
     if ($withIndex) {
-        $r['create_index'] = timeit(fn () => $db->exec('CREATE INDEX idx_city ON users(city)') + $db->exec('CREATE INDEX idx_age ON users(age)'));
+        $r['create_index'] = timeit(fn () => $db->exec('CREATE INDEX idx_city ON users(city)')
+            + $db->exec('CREATE INDEX idx_age ON users(age)')
+            + $db->exec('CREATE INDEX idx_posts_user ON posts(user_id)'));
     }
 
     // 2. Point lookups by primary key (rowid).
@@ -98,6 +110,21 @@ function runSuite(object $db, int $rows, int $lookups, bool $withIndex): array
         $db->commit();
     });
 
+    // 7. Join (users ⋈ posts on user_id). With the posts.user_id index this is
+    //    an index nested-loop seek; without it, a full inner scan per outer row.
+    //    The driving side is bounded so the unindexed cost stays measurable.
+    $r['join'] = timeit(function () use ($db) {
+        for ($i = 0; $i < 3; $i++) {
+            $db->query('SELECT COUNT(*) FROM users u JOIN posts p ON p.user_id = u.id WHERE u.id <= 100')->fetch();
+        }
+    });
+
+    // 8. Correlated subquery: per outer user, count their posts. (Currently the
+    //    inner lookup scans — a natural next index-acceleration target.)
+    $r['correlated'] = timeit(function () use ($db) {
+        $db->query('SELECT u.id, (SELECT COUNT(*) FROM posts p WHERE p.user_id = u.id) FROM users u WHERE u.id <= 100')->fetchAll();
+    });
+
     return $r;
 }
 
@@ -129,6 +156,8 @@ $labels = [
     'range' => 'range query (×200)',
     'aggregate' => 'group-by aggregate (×50)',
     'update' => 'PK updates (×1000)',
+    'join' => 'join users⋈posts (×3, ≤100)',
+    'correlated' => 'correlated subquery (≤100)',
 ];
 
 \printf("%-28s %12s %12s %12s %9s\n", 'workload', 'SQLite', 'YetiSQL+idx', 'YetiSQL scan', 'vs SQLite');
@@ -142,4 +171,6 @@ foreach ($labels as $key => $label) {
 }
 echo \str_repeat('-', 78) . "\n";
 echo "'YetiSQL+idx' uses indexes; 'YetiSQL scan' has no secondary indexes.\n";
-echo "The gap between those two columns is what index-based planning buys.\n";
+echo "The gap between those two columns is what index-based planning buys —\n";
+echo "see 'join' (index nested-loop seek vs full inner scan). 'correlated' shows\n";
+echo "no gap yet: correlated subqueries still scan the inner table per outer row.\n";
