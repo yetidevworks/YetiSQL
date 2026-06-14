@@ -72,4 +72,53 @@ final class CteDifferentialTest extends TestCase
             $sql,
         );
     }
+
+    /**
+     * Flattening a CTE into its base table must preserve the CTE's output column
+     * names (FETCH_NUM cannot see a wrong name), so assert associatively.
+     *
+     * @return iterable<string,array{0:string}>
+     */
+    public static function namedQueries(): iterable
+    {
+        $cases = [
+            'WITH c(x, y) AS (SELECT name, sal FROM emp) SELECT x, y FROM c WHERE y > 200 ORDER BY y',
+            "WITH c AS (SELECT name AS who, dept FROM emp) SELECT who FROM c WHERE dept = 'eng' ORDER BY who",
+            'WITH c AS (SELECT id, sal FROM emp) SELECT sal FROM c WHERE id <= 3 ORDER BY id',
+        ];
+        foreach ($cases as $sql) {
+            yield $sql => [$sql];
+        }
+    }
+
+    #[DataProvider('namedQueries')]
+    public function testFlattenedNamesMatchSqlite(string $sql): void
+    {
+        $yeti = new YetiPDO('yetisql::memory:');
+        $real = new RealPDO('sqlite::memory:');
+        $real->setAttribute(RealPDO::ATTR_ERRMODE, RealPDO::ERRMODE_EXCEPTION);
+        foreach (self::SETUP as $ddl) {
+            $yeti->exec($ddl);
+            $real->exec($ddl);
+        }
+
+        self::assertSame(
+            $real->query($sql)->fetchAll(RealPDO::FETCH_ASSOC),
+            $yeti->query($sql)->fetchAll(YetiPDO::FETCH_ASSOC),
+            $sql,
+        );
+    }
+
+    public function testCteCannotReferenceHiddenBaseColumn(): void
+    {
+        // The CTE only exposes `name`; referencing the base table's `sal` must
+        // error the same way SQLite does, not silently resolve after flattening.
+        $yeti = new YetiPDO('yetisql::memory:');
+        foreach (self::SETUP as $ddl) {
+            $yeti->exec($ddl);
+        }
+
+        $this->expectExceptionMessageMatches('/no such column|sal/i');
+        $yeti->query('WITH c AS (SELECT name FROM emp) SELECT name FROM c WHERE sal > 200');
+    }
 }

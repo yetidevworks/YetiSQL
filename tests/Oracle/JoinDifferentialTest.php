@@ -109,4 +109,37 @@ final class JoinDifferentialTest extends TestCase
             );
         }
     }
+
+    public function testUnindexedHashJoinMatchesAcrossNumericAffinities(): void
+    {
+        // The transient hash join keys the inner column by value. For a NONE/
+        // BLOB-affinity key column the same number can be stored as int or float,
+        // and SQLite's `=` treats 5 and 5.0 as equal, so both must collide.
+        $setup = [
+            'CREATE TABLE u (id)',
+            'CREATE TABLE p (user_id BLOB, tag TEXT)',
+            'INSERT INTO u (id) VALUES (5), (5.0), (6)',
+            "INSERT INTO p (user_id, tag) VALUES (5.0,'a'), (5,'b'), (5.0,'c'), (6,'d')",
+        ];
+        $queries = [
+            'SELECT u.id, p.tag FROM u JOIN p ON p.user_id = u.id ORDER BY u.id, p.tag',
+            'SELECT u.id, p.tag FROM u LEFT JOIN p ON p.user_id = u.id ORDER BY u.id, p.tag',
+        ];
+
+        foreach ($queries as $sql) {
+            $yeti = new YetiPDO('yetisql::memory:');
+            $real = new RealPDO('sqlite::memory:');
+            $real->setAttribute(RealPDO::ATTR_ERRMODE, RealPDO::ERRMODE_EXCEPTION);
+            foreach ($setup as $ddl) {
+                $yeti->exec($ddl);
+                $real->exec($ddl);
+            }
+
+            self::assertSame(
+                $real->query($sql)->fetchAll(RealPDO::FETCH_NUM),
+                $yeti->query($sql)->fetchAll(YetiPDO::FETCH_NUM),
+                $sql,
+            );
+        }
+    }
 }

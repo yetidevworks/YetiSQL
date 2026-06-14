@@ -121,4 +121,27 @@ final class CorrelatedIndexTest extends TestCase
             'uncached correlated counts with NOCASE collation',
         );
     }
+
+    public function testCorrelatedUnindexedCountMatchesAcrossNumericAffinities(): void
+    {
+        // A NONE/BLOB-affinity join column may store the same number as either an
+        // integer or a float; SQLite's `=` treats 5 and 5.0 as equal, so the
+        // transient count map must hash them to the same bucket.
+        $yeti = new YetiPDO('yetisql::memory:');
+        $real = new RealPDO('sqlite::memory:');
+        $real->setAttribute(RealPDO::ATTR_ERRMODE, RealPDO::ERRMODE_EXCEPTION);
+        foreach ([$yeti, $real] as $db) {
+            $db->exec('CREATE TABLE users (id)');
+            $db->exec('CREATE TABLE posts (user_id BLOB)');
+            $db->exec('INSERT INTO users (id) VALUES (5), (5.0), (6)');
+            $db->exec('INSERT INTO posts (user_id) VALUES (5.0), (5), (5.0), (6)');
+        }
+
+        $sql = 'SELECT u.id, (SELECT COUNT(*) FROM posts p WHERE p.user_id = u.id) c FROM users u ORDER BY u.id, c';
+        self::assertSame(
+            $real->query($sql)->fetchAll(RealPDO::FETCH_NUM),
+            $yeti->query($sql)->fetchAll(YetiPDO::FETCH_NUM),
+            'correlated count across int/float affinities',
+        );
+    }
 }

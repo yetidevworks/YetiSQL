@@ -44,6 +44,13 @@ final class DifferentialTest extends TestCase
             'SELECT id, name FROM t WHERE age > 28 ORDER BY id',
             'SELECT id FROM t WHERE age IS NULL ORDER BY id',
             'SELECT id FROM t WHERE score IS NOT NULL ORDER BY id',
+            // `IS` / `IS NOT` are NULL-safe `=`/`<>` and apply the same comparison
+            // affinity: a TEXT column vs an integer, an INTEGER column vs a real.
+            "SELECT id FROM t WHERE name IS '30' ORDER BY id",
+            'SELECT id FROM t WHERE age IS 30.0 ORDER BY id',
+            'SELECT id FROM t WHERE score IS 5 ORDER BY id',
+            'SELECT id FROM t WHERE age IS NOT 25 ORDER BY id',
+            'SELECT id, age IS NULL, score IS NOT NULL FROM t ORDER BY id',
             "SELECT id FROM t WHERE name LIKE '%a%' ORDER BY id",
             "SELECT id FROM t WHERE name GLOB '*a*' ORDER BY id",
             'SELECT id FROM t WHERE age BETWEEN 26 AND 36 ORDER BY id',

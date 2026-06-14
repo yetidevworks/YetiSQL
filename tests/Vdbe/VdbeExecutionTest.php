@@ -52,6 +52,11 @@ final class VdbeExecutionTest extends TestCase
             'SELECT id, -age, age FROM t WHERE age IS NOT NULL',
             'SELECT id, name || \'!\' FROM t WHERE id <= 2',
             'SELECT id FROM t WHERE age = 40 AND nick IS NULL',
+            // `IS` applies comparison affinity just like `=`: a TEXT column
+            // against an integer, an INTEGER column against a real.
+            'SELECT id FROM t WHERE name IS 40',
+            'SELECT id FROM t WHERE age IS 40.0',
+            'SELECT id, nick IS NOT NULL FROM t',
             'SELECT id, age / 0 FROM t WHERE id = 1',
         ];
         foreach ($cases as $sql) {
@@ -66,6 +71,36 @@ final class VdbeExecutionTest extends TestCase
         $real = new RealPDO('sqlite::memory:');
         $real->setAttribute(RealPDO::ATTR_ERRMODE, RealPDO::ERRMODE_EXCEPTION);
         foreach (self::SETUP as $stmt) {
+            $yeti->exec($stmt);
+            $real->exec($stmt);
+        }
+        $yeti->exec('PRAGMA vdbe=on');
+
+        self::assertSame(
+            $real->query($sql)->fetchAll(RealPDO::FETCH_NUM),
+            $yeti->query($sql)->fetchAll(YetiPDO::FETCH_NUM),
+            $sql,
+        );
+    }
+
+    public function testVdbeServesAlterAddedColumnDefaults(): void
+    {
+        // Rows written before ALTER TABLE ADD COLUMN have no slot for the new
+        // column; reading it through the VM must serve the declared default
+        // (not NULL) and still distinguish a genuinely NULL stored value.
+        $setup = [
+            'CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)',
+            'INSERT INTO t (id, a) VALUES (1, 10), (2, 20), (3, 30)',
+            'ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 99',
+            'ALTER TABLE t ADD COLUMN c TEXT',
+            'INSERT INTO t (id, a, b, c) VALUES (4, 40, 7, \'set\')',
+        ];
+        $sql = 'SELECT id, a, b, c FROM t WHERE a > 0';
+
+        $yeti = new YetiPDO('yetisql::memory:');
+        $real = new RealPDO('sqlite::memory:');
+        $real->setAttribute(RealPDO::ATTR_ERRMODE, RealPDO::ERRMODE_EXCEPTION);
+        foreach ($setup as $stmt) {
             $yeti->exec($stmt);
             $real->exec($stmt);
         }

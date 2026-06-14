@@ -800,7 +800,7 @@ final class Executor
                 $scan = [];
             } else {
                 $key = $this->joinHashValue($src['info'], $acc['pos'], $key);
-                $scan = $key === null ? [] : ($acc['rowsByKey'][$this->valueKey($key)] ?? []);
+                $scan = $key === null ? [] : ($acc['rowsByKey'][$this->comparisonKey($key)] ?? []);
             }
         } elseif (isset($src['scanner'])) {
             $scan = ($src['scanner'])();
@@ -1006,6 +1006,19 @@ final class Executor
         }
 
         $sourceAlias = $ref->alias ?? $ref->name;
+        // The view/CTE only exposes its projected columns. If the outer query
+        // references a name the projection doesn't provide (e.g. a base-table
+        // column the view hides), flattening would wrongly resolve it against
+        // the underlying table. Bail so the derived-table path reports the same
+        // "no such column" error SQLite does.
+        foreach ($select->columns as $column) {
+            if ($column->expr !== null && !$this->outerRefsResolvable($column->expr, $sourceAlias, $map)) {
+                return null;
+            }
+        }
+        if ($select->where !== null && !$this->outerRefsResolvable($select->where, $sourceAlias, $map)) {
+            return null;
+        }
         $flat = clone $select;
         $flat->from = clone $source->from;
         $flat->with = [];
@@ -1076,14 +1089,56 @@ final class Executor
     {
         $out = [];
         foreach ($columns as $column) {
+            // Rewriting `x` (a renamed view/CTE column) to its underlying base
+            // column `a` would otherwise change the result column name from `x`
+            // to `a`. Pin the original output name as an explicit alias so the
+            // flattened query reports the same names as the unflattened one.
+            $alias = $column->alias;
+            if ($alias === null && $column->expr !== null && !$column->star && $column->tableStar === null) {
+                $alias = $this->exprLabel($column->expr);
+            }
             $out[] = new ResultColumn(
                 expr: $column->expr !== null ? $this->rewriteSourceExpr($column->expr, $sourceAlias, $map) : null,
                 star: $column->star,
                 tableStar: $column->tableStar,
-                alias: $column->alias,
+                alias: $alias,
             );
         }
         return $out;
+    }
+
+    /**
+     * Whether every column reference in an outer expression resolves to a
+     * projected column of the flattened source. A reference to the source alias
+     * (or unqualified) must name a mapped column; a reference qualified with any
+     * other table cannot be satisfied by the single flattened source.
+     *
+     * @param array<string,Expr> $map
+     */
+    private function outerRefsResolvable(Expr $expr, string $sourceAlias, array $map): bool
+    {
+        if ($expr->kind === Expr::COL) {
+            if ($expr->table !== null && \strcasecmp($expr->table, $sourceAlias) !== 0) {
+                return false;
+            }
+            return isset($map[\strtolower((string) $expr->name)]);
+        }
+        foreach ([$expr->left, $expr->right, $expr->operand, $expr->subject, $expr->elseExpr, $expr->low, $expr->high, $expr->escape] as $child) {
+            if ($child !== null && !$this->outerRefsResolvable($child, $sourceAlias, $map)) {
+                return false;
+            }
+        }
+        foreach (\array_merge($expr->args, $expr->list) as $child) {
+            if (!$this->outerRefsResolvable($child, $sourceAlias, $map)) {
+                return false;
+            }
+        }
+        foreach ($expr->whens as [$w, $t]) {
+            if (!$this->outerRefsResolvable($w, $sourceAlias, $map) || !$this->outerRefsResolvable($t, $sourceAlias, $map)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** @param array<string,Expr> $map */
@@ -2532,7 +2587,7 @@ final class Executor
             $this->correlatedCountCache[$cacheId] = $cached;
         }
 
-        return $cached['map'][$this->valueKey($value)] ?? 0;
+        return $cached['map'][$this->comparisonKey($value)] ?? 0;
     }
 
     /** @return array<string,int> */
@@ -2549,7 +2604,7 @@ final class Executor
             if ($value === null) {
                 continue;
             }
-            $key = $this->valueKey($value);
+            $key = $this->comparisonKey($value);
             $counts[$key] = ($counts[$key] ?? 0) + 1;
         }
         return $counts;
@@ -2962,6 +3017,21 @@ final class Executor
             $v instanceof Blob => 'b' . $v->bytes,
             default => 't' . $v,
         };
+    }
+
+    /**
+     * Like valueKey, but collapses an integral float onto the matching integer
+     * key so that values which Value::compare treats as equal (5 and 5.0) hash
+     * to the same bucket. Required wherever a hash/count map stands in for an
+     * `=` comparison; plain valueKey would split 5 ("i5") from 5.0 ("f5") and
+     * silently miss matches for NONE/BLOB-affinity columns.
+     */
+    public function comparisonKey(null|int|float|string|Blob $v): string
+    {
+        if (\is_float($v) && \is_finite($v) && (float) (int) $v === $v) {
+            return self::valueKeyStatic((int) $v);
+        }
+        return self::valueKeyStatic($v);
     }
 
     private function decodeRow(TableInfo $info, int $rowid, string $payload): array
@@ -3441,16 +3511,43 @@ final class Executor
 
         $prefixCols = \array_slice($index->columnPositions, 0, \count($prefix));
         $rangePos = $range !== null ? ($index->columnPositions[\count($prefix)] ?? null) : null;
+
+        // The covered count trusts the index seek without a residual filter, so
+        // every conjunct must be faithfully enforced by the access path. The
+        // path enforces each prefix column with exactly one `=` value and the
+        // range column with at most one lower and one upper bound. A column with
+        // a duplicated `=`, a range op on a pinned prefix column, or two bounds
+        // in the same direction is NOT faithfully represented (the range merge
+        // keeps only the last bound per direction), so bail to the residual path.
+        $eqCount = [];
+        $rangeLow = 0;
+        $rangeHigh = 0;
         foreach ($parsed as $term) {
             if (\in_array($term['pos'], $prefixCols, true)) {
+                if ($term['op'] !== '=') {
+                    return false;
+                }
+                $eqCount[$term['pos']] = ($eqCount[$term['pos']] ?? 0) + 1;
                 continue;
             }
-            if ($rangePos !== null && $term['pos'] === $rangePos && $term['op'] !== '=') {
-                continue;
+            if ($rangePos !== null && $term['pos'] === $rangePos) {
+                if ($term['op'] === '>' || $term['op'] === '>=') {
+                    $rangeLow++;
+                    continue;
+                }
+                if ($term['op'] === '<' || $term['op'] === '<=') {
+                    $rangeHigh++;
+                    continue;
+                }
             }
             return false;
         }
-        return true;
+        foreach ($prefixCols as $pc) {
+            if (($eqCount[$pc] ?? 0) !== 1) {
+                return false;
+            }
+        }
+        return $rangeLow <= 1 && $rangeHigh <= 1;
     }
 
     /**
@@ -3619,7 +3716,7 @@ final class Executor
             if ($value === null) {
                 continue;
             }
-            $rows[$this->valueKey($value)][] = [$rowid, $payload];
+            $rows[$this->comparisonKey($value)][] = [$rowid, $payload];
         }
         return $rows;
     }

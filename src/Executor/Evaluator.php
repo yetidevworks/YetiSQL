@@ -293,17 +293,7 @@ final class Evaluator
                 return ($l === null || $r === null) ? null : 0;
             };
         }
-        if ($op === 'IS' || $op === 'IS NOT') {
-            $isOp = $op === 'IS';
-            return static function (RowEnv $env, Evaluator $ev) use ($lc, $rc, $isOp): int {
-                $l = $lc($env, $ev);
-                $r = $rc($env, $ev);
-                $eq = ($l === null && $r === null) || ($l !== null && $r !== null && Value::compare($l, $r) === 0);
-                return ($eq === $isOp) ? 1 : 0;
-            };
-        }
-
-        if (\in_array($op, ['=', '<>', '<', '<=', '>', '>='], true)) {
+        if (\in_array($op, ['=', '<>', '<', '<=', '>', '>=', 'IS', 'IS NOT'], true)) {
             return $this->compileComparison($e, $op, $lc, $rc, $info, $alias);
         }
 
@@ -401,6 +391,11 @@ final class Evaluator
             $l = $lc($env, $ev);
             $r = $rc($env, $ev);
             if ($l === null || $r === null) {
+                // `IS`/`IS NOT` are NULL-safe and never yield NULL; the other
+                // comparisons propagate NULL.
+                if ($op === 'IS' || $op === 'IS NOT') {
+                    return (($l === null && $r === null) === ($op === 'IS')) ? 1 : 0;
+                }
                 return null;
             }
             if ($coerceR) {
@@ -414,8 +409,8 @@ final class Evaluator
             }
             $cmp = Value::compare($l, $r, $coll);
             return match ($op) {
-                '=' => $cmp === 0 ? 1 : 0,
-                '<>' => $cmp !== 0 ? 1 : 0,
+                '=', 'IS' => $cmp === 0 ? 1 : 0,
+                '<>', 'IS NOT' => $cmp !== 0 ? 1 : 0,
                 '<' => $cmp < 0 ? 1 : 0,
                 '<=' => $cmp <= 0 ? 1 : 0,
                 '>' => $cmp > 0 ? 1 : 0,
@@ -718,8 +713,7 @@ final class Evaluator
         if ($op === 'IS' || $op === 'IS NOT') {
             $l = $this->evaluate($e->left, $env);
             $r = $this->evaluate($e->right, $env);
-            $eq = ($l === null && $r === null) || ($l !== null && $r !== null && Value::compare($l, $r) === 0);
-            return ($eq === ($op === 'IS')) ? 1 : 0;
+            return ($this->isEqual($l, $r, $e, $env) === ($op === 'IS')) ? 1 : 0;
         }
 
         $l = $this->evaluate($e->left, $env);
@@ -814,8 +808,7 @@ final class Evaluator
             return ($l === null || $r === null) ? null : 0;
         }
         if ($op === 'IS' || $op === 'IS NOT') {
-            $eq = ($l === null && $r === null) || ($l !== null && $r !== null && Value::compare($l, $r) === 0);
-            return ($eq === ($op === 'IS')) ? 1 : 0;
+            return ($this->isEqual($l, $r, $e, $env) === ($op === 'IS')) ? 1 : 0;
         }
         if (\in_array($op, ['=', '<>', '<', '<=', '>', '>='], true)) {
             if ($l === null || $r === null) {
@@ -861,6 +854,19 @@ final class Evaluator
             '~' => ~((int) Value::toNumber($v)),
             default => throw new SqlException("bad unary op $op"),
         };
+    }
+
+    /**
+     * SQLite `IS` equality: identical to `=` (same comparison affinity and
+     * collation), but NULL-safe — two NULLs are equal and a NULL never equals a
+     * non-NULL. Never yields NULL.
+     */
+    private function isEqual(mixed $l, mixed $r, Expr $e, ?RowEnv $env): bool
+    {
+        if ($l === null || $r === null) {
+            return $l === null && $r === null;
+        }
+        return $this->compareOp('=', $l, $r, $e, $env);
     }
 
     private function compareOp(string $op, mixed $l, mixed $r, Expr $e, ?RowEnv $env): bool

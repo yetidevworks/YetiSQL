@@ -37,6 +37,7 @@ final class Vm
         $rowid = 0;
         $payload = null;
         $decoded = [];
+        $offsets = null;
 
         $limit = $program->limit;
         $offset = $program->offset ?? 0;
@@ -61,6 +62,7 @@ final class Vm
                     [$rowid, $payload] = $gen->current();
                     $env = null;
                     $decoded = [];
+                    $offsets = null;
                     $pc++;
                     break;
 
@@ -70,6 +72,7 @@ final class Vm
                         [$rowid, $payload] = $gen->current();
                         $env = null;
                         $decoded = [];
+                        $offsets = null;
                         $pc = $p2;
                         break;
                     }
@@ -78,7 +81,16 @@ final class Vm
 
                 case Opcode::COLUMN:
                     if (!\array_key_exists($p1, $decoded)) {
-                        $decoded[$p1] = RecordCodec::decodeColumn($payload, $p1);
+                        $offsets ??= RecordCodec::columnOffsets($payload);
+                        if (isset($offsets[$p1])) {
+                            [$serialType, $bodyOff] = $offsets[$p1];
+                            $decoded[$p1] = RecordCodec::decodeAt($payload, $serialType, $bodyOff);
+                        } else {
+                            // Column absent from this record: added via ALTER TABLE
+                            // ADD COLUMN after the row was written, so serve its
+                            // declared default (matching RowEnv::valueAt).
+                            $decoded[$p1] = $info->columns[$p1]->defaultValue;
+                        }
                     }
                     $reg[$p2] = $decoded[$p1];
                     $pc++;
@@ -193,7 +205,14 @@ final class Vm
             return ($l === null || $r === null) ? null : 0;
         }
         if ($op === 'IS' || $op === 'IS NOT') {
-            $eq = ($l === null && $r === null) || ($l !== null && $r !== null && Value::compare($l, $r) === 0);
+            // NULL-safe equality, otherwise identical to `=` (same comparison
+            // affinity and collation).
+            if ($l === null || $r === null) {
+                $eq = $l === null && $r === null;
+            } else {
+                [$l, $r] = $this->applyComparisonAffinity($l, $r, $la, $ra);
+                $eq = Value::compare($l, $r, $collation) === 0;
+            }
             return ($eq === ($op === 'IS')) ? 1 : 0;
         }
         if (!\in_array($op, ['=', '<>', '<', '<=', '>', '>='], true)) {
