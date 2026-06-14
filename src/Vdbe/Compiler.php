@@ -47,6 +47,12 @@ final class Compiler
         if ($select->offset !== null && $offset === null) {
             return null;
         }
+        if ($limit !== null && $limit < 0) {
+            $limit = null;
+        }
+        if ($offset !== null && $offset < 0) {
+            $offset = 0;
+        }
 
         $c = new self($info, $alias);
 
@@ -235,6 +241,13 @@ final class Compiler
         }
         if ($e->kind === Expr::LIT && (\is_int($e->value) || \is_float($e->value))) {
             return (int) $e->value;
+        }
+        if ($e->kind === Expr::UNARY
+            && ($e->op === '-' || $e->op === '+')
+            && $e->operand?->kind === Expr::LIT
+            && (\is_int($e->operand->value) || \is_float($e->operand->value))) {
+            $value = (int) $e->operand->value;
+            return $e->op === '-' ? -$value : $value;
         }
         return null;
     }

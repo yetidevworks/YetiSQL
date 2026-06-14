@@ -47,6 +47,8 @@ final class VdbeExecutionTest extends TestCase
             'SELECT id, CAST(score AS INTEGER) FROM t',
             'SELECT id, age FROM t WHERE age > 20 LIMIT 3',
             'SELECT id, age FROM t WHERE age > 20 LIMIT 2 OFFSET 1',
+            'SELECT id, age FROM t WHERE age > 20 LIMIT -1',
+            'SELECT id, age FROM t WHERE age > 20 LIMIT 2 OFFSET -3',
             'SELECT id, -age, age FROM t WHERE age IS NOT NULL',
             'SELECT id, name || \'!\' FROM t WHERE id <= 2',
             'SELECT id FROM t WHERE age = 40 AND nick IS NULL',

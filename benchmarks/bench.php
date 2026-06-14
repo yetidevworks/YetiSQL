@@ -111,8 +111,9 @@ function runSuite(object $db, int $rows, int $lookups, bool $withIndex): array
     });
 
     // 7. Join (users ⋈ posts on user_id). With the posts.user_id index this is
-    //    an index nested-loop seek; without it, a full inner scan per outer row.
-    //    The driving side is bounded so the unindexed cost stays measurable.
+    //    an index nested-loop seek; without it, the executor builds a transient
+    //    hash table for the equality join instead of rescanning the inner table.
+    //    The driving side is bounded so both paths stay measurable.
     $r['join'] = timeit(function () use ($db) {
         for ($i = 0; $i < 3; $i++) {
             $db->query('SELECT COUNT(*) FROM users u JOIN posts p ON p.user_id = u.id WHERE u.id <= 100')->fetch();
@@ -221,9 +222,9 @@ foreach ($labels as $key => $label) {
 }
 echo \str_repeat('-', 78) . "\n";
 echo "'YetiSQL+idx' uses indexes; 'YetiSQL scan' has no secondary indexes.\n";
-echo "The gap between those two columns is what index-based planning buys — see\n";
-echo "'join' (index nested-loop seek) and 'correlated' (the outer column drives an\n";
-echo "index seek in the subquery), both vs a full inner scan per outer row.\n";
+echo "The gap between those columns is what persistent indexes buy. Equality joins\n";
+echo "without indexes can still use a transient hash table; correlated subqueries\n";
+echo "without indexes still scan the inner table per outer row.\n";
 
 // --- WAL vs rollback journal (file-backed durability) ---------------------
 $WAL_OPS = 2000;

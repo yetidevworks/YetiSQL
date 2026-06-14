@@ -698,6 +698,13 @@ final class Executor
             $key = $this->joinAccessKey($join, $src['alias'], $src['info'], $indexes);
             if ($key !== null) {
                 $sources[$j + 1]['joinAccess'] = $key + ['indexes' => $indexes];
+                continue;
+            }
+            $hashKey = $this->joinHashKey($join, $src['alias'], $src['info']);
+            if ($hashKey !== null) {
+                $sources[$j + 1]['hashAccess'] = $hashKey + [
+                    'rowsByKey' => $this->buildJoinHash($src['tree'], $src['info'], $hashKey['pos']),
+                ];
             }
         }
 
@@ -777,6 +784,15 @@ final class Executor
                 $scan = $plan !== null
                     ? $this->joinSeekRows($src['tree'], $plan)
                     : $src['tree']->scan();
+            }
+        } elseif (isset($src['hashAccess'])) {
+            $acc = $src['hashAccess'];
+            $key = $eval->evaluate($acc['keyExpr'], $env);
+            if ($key === null) {
+                $scan = [];
+            } else {
+                $key = $this->joinHashValue($src['info'], $acc['pos'], $key);
+                $scan = $key === null ? [] : ($acc['rowsByKey'][$this->valueKey($key)] ?? []);
             }
         } elseif (isset($src['scanner'])) {
             $scan = ($src['scanner'])();
@@ -2488,9 +2504,15 @@ final class Executor
         $offset = $select->offset !== null
             ? (int) Value::toNumber((new Evaluator($this, $params))->evaluate($select->offset, null))
             : 0;
+        if ($limit !== null && $limit < 0) {
+            $limit = null;
+        }
+        if ($offset < 0) {
+            $offset = 0;
+        }
 
         if ($offset > 0 || $limit !== null) {
-            $rows = \array_values(\array_slice($rows, \max(0, $offset), $limit === null ? null : \max(0, $limit)));
+            $rows = \array_values(\array_slice($rows, $offset, $limit));
         }
     }
 
@@ -3101,6 +3123,89 @@ final class Executor
             }
         }
         return null;
+    }
+
+    /**
+     * Find a safe transient hash-join key for an unindexed inner table. This is
+     * deliberately narrower than the persistent index path: only a BINARY
+     * collated inner column (or rowid) is hashed, and the full ON predicate is
+     * still evaluated for every candidate row.
+     *
+     * @return array{pos:int,keyExpr:Expr}|null
+     */
+    private function joinHashKey(JoinClause $join, ?string $innerAlias, TableInfo $innerInfo): ?array
+    {
+        if ($join->on === null) {
+            return null;
+        }
+        foreach ($this->splitAnd($join->on) as $conj) {
+            if ($conj->kind !== Expr::BIN || $conj->op !== '=') {
+                continue;
+            }
+            $key = $this->hashKeyFrom($conj->left, $conj->right, $innerAlias, $innerInfo)
+                ?? $this->hashKeyFrom($conj->right, $conj->left, $innerAlias, $innerInfo);
+            if ($key !== null) {
+                return $key;
+            }
+        }
+        return null;
+    }
+
+    /** @return array{pos:int,keyExpr:Expr}|null */
+    private function hashKeyFrom(Expr $innerSide, Expr $outerSide, ?string $innerAlias, TableInfo $innerInfo): ?array
+    {
+        $pos = $this->colPositionOf($innerSide, $innerAlias, $innerInfo);
+        if ($pos === null || $this->exprReferencesTable($outerSide, $innerAlias, $innerInfo)) {
+            return null;
+        }
+        if ($pos >= 0 && $pos !== $innerInfo->rowidAlias
+            && \strcasecmp($innerInfo->columns[$pos]->collation, 'BINARY') !== 0) {
+            return null;
+        }
+        return ['pos' => $pos, 'keyExpr' => $outerSide];
+    }
+
+    /**
+     * @return array<string,list<array{0:int,1:string}>>
+     */
+    private function buildJoinHash(TableBTree $tree, TableInfo $info, int $pos): array
+    {
+        $rows = [];
+        foreach ($tree->scan() as [$rowid, $payload]) {
+            if ($pos < 0 || $pos === $info->rowidAlias) {
+                $value = $rowid;
+            } else {
+                $value = RecordCodec::decodeColumn($payload, $pos);
+            }
+            if ($value === null) {
+                continue;
+            }
+            $rows[$this->valueKey($value)][] = [$rowid, $payload];
+        }
+        return $rows;
+    }
+
+    private function joinHashValue(TableInfo $info, int $pos, null|int|float|string|Blob $value): null|int|float|string|Blob
+    {
+        if ($value === null) {
+            return null;
+        }
+        if ($pos < 0 || $pos === $info->rowidAlias) {
+            if (\is_int($value)) {
+                return $value;
+            }
+            if (\is_float($value) && (float) (int) $value === $value) {
+                return (int) $value;
+            }
+            if (\is_string($value) && Value::looksNumeric($value)) {
+                $n = Value::parseNumber($value);
+                if (\is_int($n) || (\is_float($n) && (float) (int) $n === $n)) {
+                    return (int) $n;
+                }
+            }
+            return null;
+        }
+        return $this->affine($info, $pos, $value);
     }
 
     /**

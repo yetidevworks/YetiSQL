@@ -56,6 +56,8 @@ final class DifferentialTest extends TestCase
             'SELECT name FROM t ORDER BY age DESC',
             'SELECT name FROM t ORDER BY score',
             'SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1',
+            'SELECT id FROM t ORDER BY id LIMIT -1',
+            'SELECT id FROM t ORDER BY id LIMIT 2 OFFSET -3',
             'SELECT DISTINCT city FROM t ORDER BY city',
             // aggregates
             'SELECT COUNT(*), COUNT(age), SUM(age), AVG(age), MIN(age), MAX(age) FROM t',

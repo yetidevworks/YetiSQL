@@ -78,4 +78,35 @@ final class JoinDifferentialTest extends TestCase
             $sql,
         );
     }
+
+    public function testUnindexedEquiJoinMatchesSqlite(): void
+    {
+        $setup = \array_values(\array_filter(
+            self::SETUP,
+            static fn (string $sql): bool => !\str_starts_with($sql, 'CREATE INDEX'),
+        ));
+        $queries = [
+            'SELECT a.name, b.title FROM authors a JOIN books b ON b.author_id = a.id ORDER BY a.id, b.id',
+            'SELECT a.name, b.title FROM authors a JOIN books b ON b.author_id = a.id AND b.year > 1950 ORDER BY a.id, b.id',
+            'SELECT a.name, b.title FROM authors a LEFT JOIN books b ON b.author_id = a.id ORDER BY a.id, b.title',
+            'SELECT a.name, b.title, s.qty FROM authors a JOIN books b ON b.author_id = a.id '
+                . 'JOIN sales s ON s.book_id = b.id ORDER BY a.id, b.id, s.qty',
+        ];
+
+        foreach ($queries as $sql) {
+            $yeti = new YetiPDO('yetisql::memory:');
+            $real = new RealPDO('sqlite::memory:');
+            $real->setAttribute(RealPDO::ATTR_ERRMODE, RealPDO::ERRMODE_EXCEPTION);
+            foreach ($setup as $ddl) {
+                $yeti->exec($ddl);
+                $real->exec($ddl);
+            }
+
+            self::assertSame(
+                $real->query($sql)->fetchAll(RealPDO::FETCH_NUM),
+                $yeti->query($sql)->fetchAll(YetiPDO::FETCH_NUM),
+                $sql,
+            );
+        }
+    }
 }

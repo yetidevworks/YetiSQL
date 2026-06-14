@@ -195,7 +195,7 @@ city COUNT (×200, ~20% rows)       2.9 ms      8.7 ms      84.8 ms          3x
 range query (×200)                 1.8 ms      4.0 ms      19.0 ms          2x
 group-by aggregate (×50)          31.0 ms     25.8 ms      25.2 ms          1x
 PK updates (×1000)                 0.5 ms     39.1 ms      35.9 ms         78x
-join users⋈posts (×3, ≤100)        0.0 ms     50.1 ms      9.24 s       1259x
+join users⋈posts (×3, ≤100)        0.0 ms     48.8 ms      41.8 ms      1888x
 correlated subquery (≤100)         0.0 ms     12.6 ms      1.41 s        369x
 ```
 
@@ -205,11 +205,13 @@ php benchmarks/bench.php [rows]    # default 5000
 
 Takeaways:
 - **Index planning is the headline.** The `YetiSQL+idx` vs `YetiSQL scan` gap is
-  what indexes buy: selective `COUNT` is ~10×, range queries ~5×, **index
-  nested-loop joins ~180×**, and **index-accelerated correlated subqueries ~110×**
-  faster than the equivalent full-scan-per-row. Covered `COUNT(*)` over full
-  tables, rowid ranges, and leading-column index predicates count B-tree cells
-  directly without fetching rows, and `UPDATE` only re-indexes columns that change.
+  what persistent indexes buy: selective `COUNT` is ~10×, range queries ~5×,
+  and **index-accelerated correlated subqueries ~110×** faster than the
+  equivalent full-scan-per-row. Equality joins without a persistent index can
+  still use a transient hash table, so the no-index join case avoids the old
+  full-inner-scan cost. Covered `COUNT(*)` over full tables, rowid ranges, and
+  leading-column index predicates count B-tree cells directly without fetching
+  rows, and `UPDATE` only re-indexes columns that change.
 - **For indexed, set-oriented work YetiSQL is competitive with SQLite** in this
   in-memory harness — the group-by aggregate and indexed COUNT/range rows are
   within single-digit multiples (sometimes faster, since there's no driver/IPC
@@ -233,7 +235,8 @@ Hot-path optimisations already in place: an LRU page cache, a parsed-page cache
 (so repeated reads skip re-decoding), single-pass page encoding, binary-search
 rowid lookups, lazy/early-stop index scans, multi-column index prefix seeks,
 index-driven joins and correlated subqueries, covered table/index counts, and a
-compiled-closure plan cache for the per-row hot loop.
+transient hash table for unindexed equality joins, plus a compiled-closure plan
+cache for the per-row hot loop.
 
 ### VDBE & EXPLAIN
 
