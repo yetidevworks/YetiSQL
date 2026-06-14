@@ -91,6 +91,22 @@ final class AggregateAndFormatTest extends TestCase
         }
     }
 
+    public function testSelectMetadataCacheKeepsQueriesDistinct(): void
+    {
+        $db = new PDO('yetisql::memory:');
+        $this->seed($db);
+
+        for ($r = 0; $r < 20; $r++) {
+            $byDept = $db->query('SELECT dept, COUNT(*) c FROM t GROUP BY dept ORDER BY dept')->fetchAll(\PDO::FETCH_NUM);
+            self::assertSame([['eng', 30], ['hr', 30], ['sales', 30]], $byDept);
+
+            $byAge = $db->query('SELECT age, SUM(sal) s FROM t GROUP BY age ORDER BY age')->fetchAll(\PDO::FETCH_NUM);
+            self::assertCount(10, $byAge);
+            self::assertSame([0, 900.0], $byAge[0]);
+            self::assertSame([9, 936.0], $byAge[9]);
+        }
+    }
+
     public function testOpenRejectsIncompatibleSchemaFormat(): void
     {
         $db = new PDO($this->path);

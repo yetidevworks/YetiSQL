@@ -38,7 +38,7 @@ final class Executor
      * (or repeated) query skips output-column resolution, aggregate collection
      * and order planning — the work is identical run to run.
      *
-     * @var array<int,array{cookie:int,cols:list<array<string,mixed>>,names:list<string>,order:list<array<string,mixed>>,aggs:array<int,Expr>,isAgg:bool}>
+     * @var array<int,array{cookie:int,sig:string,cols:list<array<string,mixed>>,names:list<string>,order:list<array<string,mixed>>,aggs:array<int,Expr>,isAgg:bool}>
      */
     private array $selectMeta = [];
     private const SELECT_META_MAX = 1024;
@@ -47,9 +47,12 @@ final class Executor
     private const COVERED_COUNT_CACHE_MAX = 1024;
     /** @var array<int,array{cookie:int,changes:int,root:int,rows:list<list<null|int|float|string|Blob>>}> */
     private array $groupedAggregateCache = [];
+    /** @var \WeakMap<SelectStatement,string> */
+    private \WeakMap $selectSignatures;
 
     public function __construct(private readonly Database $db)
     {
+        $this->selectSignatures = new \WeakMap();
     }
 
     public function lastInsertId(): int
@@ -265,14 +268,15 @@ final class Executor
      * output columns, their names, the ORDER BY plan, aggregate nodes, and
      * whether the query aggregates. Invalidated when the schema cookie changes.
      *
-     * @return array{cookie:int,cols:list<array<string,mixed>>,names:list<string>,order:list<array<string,mixed>>,aggs:array<int,Expr>,isAgg:bool,cWhere:?\Closure,cProject:?list<?\Closure>}
+     * @return array{cookie:int,sig:string,cols:list<array<string,mixed>>,names:list<string>,order:list<array<string,mixed>>,aggs:array<int,Expr>,isAgg:bool,cWhere:?\Closure,cProject:?list<?\Closure>}
      */
     private function compileSelect(SelectStatement $select, Evaluator $eval): array
     {
         $id = \spl_object_id($select);
         $cookie = $this->db->pager()->schemaCookie();
+        $sig = $this->selectSignature($select);
         $cached = $this->selectMeta[$id] ?? null;
-        if ($cached !== null && $cached['cookie'] === $cookie) {
+        if ($cached !== null && $cached['cookie'] === $cookie && $cached['sig'] === $sig) {
             return $cached;
         }
 
@@ -345,6 +349,7 @@ final class Executor
 
         $meta = [
             'cookie' => $cookie,
+            'sig' => $sig,
             'cols' => $outputCols,
             'names' => $colNames,
             'order' => $orderPlan,
@@ -359,6 +364,11 @@ final class Executor
             $this->selectMeta = [];
         }
         return $this->selectMeta[$id] = $meta;
+    }
+
+    private function selectSignature(SelectStatement $select): string
+    {
+        return $this->selectSignatures[$select] ??= \sha1(\serialize($select));
     }
 
     /** @return array{0:TableInfo,1:string}|null [info, alias] for a single base-table query */
