@@ -1264,6 +1264,18 @@ final class Executor
 
         $pos = $plan['pos'];
         $coll = $pos >= 0 ? $info->columns[$pos]->collation : 'BINARY';
+        $keyParts = [(string) $pos, (string) $plan['op']];
+        if ($plan['op'] === 'between') {
+            $keyParts[] = $this->valueKey($plan['low']);
+            $keyParts[] = $this->valueKey($plan['high']);
+        } else {
+            $keyParts[] = $this->valueKey($plan['value']);
+        }
+        $key = $this->coveredCountCacheKey($info->rootPage, 'scan_count', $keyParts);
+        $cached = $this->coveredCountCache[$key] ?? null;
+        if ($cached !== null) {
+            return [[$cached]];
+        }
 
         $count = 0;
         $tree = new TableBTree($this->db->pager(), $info->rootPage);
@@ -1281,6 +1293,7 @@ final class Executor
             }
         }
 
+        $this->rememberCoveredCount($key, $count);
         return [[$count]];
     }
 

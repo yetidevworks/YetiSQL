@@ -126,6 +126,19 @@ final class IndexPlanningTest extends TestCase
         self::assertSame(61, (int) $db->query("SELECT COUNT(*) FROM t WHERE city='SF'")->fetchColumn());
     }
 
+    public function testScanCountCacheInvalidatesAfterWrite(): void
+    {
+        $db = new PDO('yetisql::memory:');
+        $this->seed($db, withIndexes: false);
+
+        self::assertSame(60, (int) $db->query("SELECT COUNT(*) FROM t WHERE city='SF'")->fetchColumn());
+        self::assertSame(60, (int) $db->query("SELECT COUNT(*) FROM t WHERE city='SF'")->fetchColumn());
+
+        $db->exec("INSERT INTO t (id, name, age, city) VALUES (1000, 'new', 42, 'SF')");
+
+        self::assertSame(61, (int) $db->query("SELECT COUNT(*) FROM t WHERE city='SF'")->fetchColumn());
+    }
+
     public function testIndexPersistsAcrossReopen(): void
     {
         $db = new PDO('yetisql:' . $this->path);
