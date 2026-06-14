@@ -12,6 +12,7 @@ use YetiDevWorks\YetiSQL\Sql\Ast\CreateIndexStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateTableStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateTriggerStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateViewStatement;
+use YetiDevWorks\YetiSQL\Sql\Ast\ExplainStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DeleteStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DropStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\Expr;
@@ -77,8 +78,12 @@ final class Parser
     {
         if ($this->peek()->isKeyword('EXPLAIN')) {
             $this->advance();
-            $this->accept(Token::KEYWORD, 'QUERY');
-            $this->accept(Token::KEYWORD, 'PLAN');
+            $queryPlan = false;
+            if ($this->accept(Token::KEYWORD, 'QUERY')) {
+                $this->accept(Token::KEYWORD, 'PLAN');
+                $queryPlan = true;
+            }
+            return new ExplainStatement($this->statement(), $queryPlan);
         }
 
         $t = $this->peek();

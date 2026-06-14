@@ -22,6 +22,9 @@
         <testsuite name="eloquent">
             <directory>tests/Eloquent</directory>
         </testsuite>
+        <testsuite name="vdbe">
+            <directory>tests/Vdbe</directory>
+        </testsuite>
     </testsuites>
     <source>
         <include>

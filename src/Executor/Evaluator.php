@@ -648,7 +648,7 @@ final class Evaluator
         }
     }
 
-    private function resolveParam(string $marker): null|int|float|string|Blob
+    public function resolveParam(string $marker): null|int|float|string|Blob
     {
         // Positional params arrive pre-numbered as "?N" from the parser, so
         // resolution is order-independent (binding key is the 1-based ordinal).
@@ -786,6 +786,83 @@ final class Evaluator
         return $a % $b;
     }
 
+    /**
+     * Combine two already-evaluated operands under a binary operator. The VDBE
+     * VM uses this so its bytecode shares the interpreter's exact NULL,
+     * comparison-affinity, and collation semantics. (The tree-walker keeps its
+     * own short-circuiting AND/OR in {@see binary()}; combining both evaluated
+     * operands here yields the identical three-valued result.)
+     */
+    public function combineBinary(string $op, mixed $l, mixed $r, Expr $e, ?RowEnv $env): null|int|float|string|Blob
+    {
+        if ($op === 'AND') {
+            if ($l !== null && !Value::isTrue($l)) {
+                return 0;
+            }
+            if ($r !== null && !Value::isTrue($r)) {
+                return 0;
+            }
+            return ($l === null || $r === null) ? null : 1;
+        }
+        if ($op === 'OR') {
+            if ($l !== null && Value::isTrue($l)) {
+                return 1;
+            }
+            if ($r !== null && Value::isTrue($r)) {
+                return 1;
+            }
+            return ($l === null || $r === null) ? null : 0;
+        }
+        if ($op === 'IS' || $op === 'IS NOT') {
+            $eq = ($l === null && $r === null) || ($l !== null && $r !== null && Value::compare($l, $r) === 0);
+            return ($eq === ($op === 'IS')) ? 1 : 0;
+        }
+        if (\in_array($op, ['=', '<>', '<', '<=', '>', '>='], true)) {
+            if ($l === null || $r === null) {
+                return null;
+            }
+            return $this->compareOp($op, $l, $r, $e, $env) ? 1 : 0;
+        }
+        if ($op === '||') {
+            if ($l === null || $r === null) {
+                return null;
+            }
+            return (string) Value::toText($l) . (string) Value::toText($r);
+        }
+        if ($l === null || $r === null) {
+            return null;
+        }
+        return match ($op) {
+            '+' => $this->arith($l, $r, static fn ($a, $b) => $a + $b),
+            '-' => $this->arith($l, $r, static fn ($a, $b) => $a - $b),
+            '*' => $this->arith($l, $r, static fn ($a, $b) => $a * $b),
+            '/' => $this->divide($l, $r),
+            '%' => $this->modulo($l, $r),
+            '&' => (int) Value::toNumber($l) & (int) Value::toNumber($r),
+            '|' => (int) Value::toNumber($l) | (int) Value::toNumber($r),
+            '<<' => (int) Value::toNumber($l) << (int) Value::toNumber($r),
+            '>>' => (int) Value::toNumber($l) >> (int) Value::toNumber($r),
+            default => throw new SqlException("bad operator $op"),
+        };
+    }
+
+    /** Apply a unary operator to an already-evaluated operand (for the VDBE VM). */
+    public function combineUnary(string $op, mixed $v): null|int|float|string|Blob
+    {
+        if ($op === 'NOT') {
+            return $v === null ? null : (Value::isTrue($v) ? 0 : 1);
+        }
+        if ($v === null) {
+            return null;
+        }
+        return match ($op) {
+            '-' => self::negate(Value::toNumber($v)),
+            '+' => Value::toNumber($v),
+            '~' => ~((int) Value::toNumber($v)),
+            default => throw new SqlException("bad unary op $op"),
+        };
+    }
+
     private function compareOp(string $op, mixed $l, mixed $r, Expr $e, ?RowEnv $env): bool
     {
         [$l, $r] = $this->applyComparisonAffinity($l, $r, $e, $env);
@@ -917,7 +994,7 @@ final class Evaluator
         return $out;
     }
 
-    private function cast(null|int|float|string|Blob $v, string $type): null|int|float|string|Blob
+    public function cast(null|int|float|string|Blob $v, string $type): null|int|float|string|Blob
     {
         $aff = Affinity::fromDeclaredType($type);
         if ($v === null) {

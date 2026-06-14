@@ -39,9 +39,22 @@ final class Database
         $this->executor = new Executor($this);
     }
 
+    /** When true, single-table SELECTs that compile are run through the VDBE VM. */
+    private bool $vdbeEnabled = false;
+
     public function pager(): Pager
     {
         return $this->pager;
+    }
+
+    public function vdbeEnabled(): bool
+    {
+        return $this->vdbeEnabled;
+    }
+
+    public function setVdbeEnabled(bool $on): void
+    {
+        $this->vdbeEnabled = $on;
     }
 
     public function schema(): Schema

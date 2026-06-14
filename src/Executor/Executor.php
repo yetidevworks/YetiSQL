@@ -24,7 +24,10 @@ use YetiDevWorks\YetiSQL\Sql\Ast\Expr;
 use YetiDevWorks\YetiSQL\Sql\Ast\InsertStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\JoinClause;
 use YetiDevWorks\YetiSQL\Sql\Ast\PragmaStatement;
+use YetiDevWorks\YetiSQL\Sql\Ast\ExplainStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\SelectStatement;
+use YetiDevWorks\YetiSQL\Vdbe\Compiler as VdbeCompiler;
+use YetiDevWorks\YetiSQL\Vdbe\Vm as VdbeVm;
 use YetiDevWorks\YetiSQL\Sql\Ast\Statement;
 use YetiDevWorks\YetiSQL\Sql\Ast\UpdateStatement;
 use YetiDevWorks\YetiSQL\Types\Value;
@@ -137,6 +140,7 @@ final class Executor
             $stmt instanceof DropStatement => $this->execDrop($stmt),
             $stmt instanceof CreateIndexStatement => $this->execCreateIndex($stmt),
             $stmt instanceof PragmaStatement => $this->execPragma($stmt),
+            $stmt instanceof ExplainStatement => $this->execExplain($stmt),
             default => throw new SqlException('statement type not supported: ' . $stmt::class),
         };
     }
@@ -159,6 +163,13 @@ final class Executor
 
     private function execSelectInner(SelectStatement $select, array $params): Result
     {
+        if ($this->db->vdbeEnabled()) {
+            $viaVdbe = $this->tryVdbeSelect($select, $params);
+            if ($viaVdbe !== null) {
+                return $viaVdbe;
+            }
+        }
+
         $streamed = $this->tryStreamSelect($select, $params);
         if ($streamed !== null) {
             return $streamed;
@@ -182,6 +193,97 @@ final class Executor
         $this->applyLimit($select, $rows, $params);
 
         return new Result(columns: $columns, rows: \array_values($rows), rowCount: \count($rows));
+    }
+
+    // === VDBE bytecode ===================================================
+
+    /** Compile a single-table SELECT to a VDBE program, or null if unsupported. */
+    private function vdbeProgram(SelectStatement $select): ?\YetiDevWorks\YetiSQL\Vdbe\Program
+    {
+        if ($select->with !== [] || $this->cteScope !== []) {
+            return null;
+        }
+        $single = $this->singleTableForCompile($select);
+        if ($single === null) {
+            return null;
+        }
+        [$info, $alias] = $single;
+        $outputCols = $this->resolveOutputColumns($select);
+        // Aggregates are not modelled by the scan VM.
+        foreach ($outputCols as $oc) {
+            if ($oc['expr'] instanceof Expr && $this->exprHasAggregate($oc['expr'])) {
+                return null;
+            }
+        }
+        return VdbeCompiler::compile($select, $info, $alias, $outputCols);
+    }
+
+    /** Run a SELECT through the VDBE VM when it compiles, else null to fall back. */
+    private function tryVdbeSelect(SelectStatement $select, array $params): ?Result
+    {
+        $program = $this->vdbeProgram($select);
+        if ($program === null) {
+            return null;
+        }
+        [$info, $alias] = $this->singleTableForCompile($select);
+        $eval = new Evaluator($this, $params);
+        [$columns, $rows] = (new VdbeVm())->run($program, $info, $alias, $this->db->pager(), $eval);
+        return new Result(columns: $columns, rows: $rows, rowCount: \count($rows));
+    }
+
+    /** Whether an expression contains an aggregate function call. */
+    private function exprHasAggregate(Expr $e): bool
+    {
+        if ($e->kind === Expr::FUNC && $e->window === null
+            && \YetiDevWorks\YetiSQL\Functions\Aggregates::isAggregate(\strtolower((string) $e->name))) {
+            return true;
+        }
+        foreach ([$e->left, $e->right, $e->operand, $e->subject, $e->elseExpr, $e->low, $e->high, $e->escape] as $c) {
+            if ($c instanceof Expr && $this->exprHasAggregate($c)) {
+                return true;
+            }
+        }
+        foreach ([...$e->args, ...$e->list] as $c) {
+            if ($this->exprHasAggregate($c)) {
+                return true;
+            }
+        }
+        foreach ($e->whens as [$w, $t]) {
+            if ($this->exprHasAggregate($w) || $this->exprHasAggregate($t)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function execExplain(ExplainStatement $stmt): Result
+    {
+        if ($stmt->queryPlan) {
+            $summary = $stmt->inner instanceof SelectStatement
+                ? ($this->vdbeProgram($stmt->inner)?->planSummary ?? $this->planFallbackSummary($stmt->inner))
+                : 'EXPLAIN QUERY PLAN supports SELECT';
+            return new Result(['id', 'parent', 'notused', 'detail'], [[0, 0, 0, $summary]], 1);
+        }
+
+        $program = $stmt->inner instanceof SelectStatement ? $this->vdbeProgram($stmt->inner) : null;
+        if ($program === null) {
+            return new Result(
+                ['addr', 'opcode', 'p1', 'p2', 'p3', 'p4', 'comment'],
+                [[0, 'Explain', 0, 0, 0, '', 'statement is not VDBE-compilable; executed by the tree-walker']],
+                1,
+            );
+        }
+        return new Result(
+            ['addr', 'opcode', 'p1', 'p2', 'p3', 'p4', 'comment'],
+            $program->explainRows(),
+            \count($program->instructions),
+        );
+    }
+
+    private function planFallbackSummary(SelectStatement $select): string
+    {
+        $single = $this->singleTableForCompile($select);
+        return $single !== null ? 'SCAN ' . $single[0]->name : 'COMPOUND/JOIN QUERY';
     }
 
     /** @param array<string,null|int|float|string|Blob> $params */
@@ -4014,6 +4116,15 @@ final class Executor
                 $pager->disableWal();
             }
             return new Result(['journal_mode'], [[$pager->journalMode()]], 1);
+        }
+        if ($name === 'vdbe') {
+            // Non-standard: route compilable single-table SELECTs through the
+            // VDBE VM instead of the tree-walker. Off by default.
+            if ($stmt->value !== null) {
+                $arg = \strtolower($this->pragmaArg($stmt));
+                $this->db->setVdbeEnabled(\in_array($arg, ['1', 'on', 'true', 'yes'], true));
+            }
+            return new Result(['vdbe'], [[$this->db->vdbeEnabled() ? 1 : 0]], 1);
         }
         if ($name === 'wal_checkpoint') {
             $this->db->pager()->checkpoint();
