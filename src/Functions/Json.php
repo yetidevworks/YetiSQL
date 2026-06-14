@@ -100,6 +100,24 @@ final class Json
      */
     public static function parsePath(string $path): array
     {
+        /** @var array<string,list<array{kind:string,name?:string,index?:int,fromEnd?:bool}>> $cache */
+        static $cache = [];
+        if (isset($cache[$path])) {
+            return $cache[$path];
+        }
+        $segments = self::parsePathUncached($path);
+        if (\count($cache) >= 256) {
+            $cache = [];
+        }
+        $cache[$path] = $segments;
+        return $segments;
+    }
+
+    /**
+     * @return list<array{kind:string,name?:string,index?:int,fromEnd?:bool}>
+     */
+    private static function parsePathUncached(string $path): array
+    {
         if ($path === '' || $path[0] !== '$') {
             throw new SqlException('JSON path error');
         }
