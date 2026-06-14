@@ -560,6 +560,16 @@ final class Evaluator
                 return $e->value;
 
             case Expr::COL:
+                // NEW./OLD. references inside a trigger body or WHEN clause.
+                if ($e->table !== null) {
+                    $tl = \strtolower($e->table);
+                    if ($tl === 'new' || $tl === 'old') {
+                        $tenv = $this->executor->currentTriggerEnv();
+                        if ($tenv !== null && $tenv->hasColumn($e->table, (string) $e->name)) {
+                            return $tenv->resolveColumn($e->table, (string) $e->name);
+                        }
+                    }
+                }
                 if ($env !== null) {
                     // Fast path: a memoized concrete slot, resolved once per query.
                     $id = \spl_object_id($e);

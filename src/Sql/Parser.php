@@ -10,6 +10,7 @@ use YetiDevWorks\YetiSQL\Sql\Ast\ColumnDef;
 use YetiDevWorks\YetiSQL\Sql\Ast\AlterTableStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateIndexStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateTableStatement;
+use YetiDevWorks\YetiSQL\Sql\Ast\CreateTriggerStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateViewStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DeleteStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DropStatement;
@@ -382,6 +383,9 @@ final class Parser
         $temporary = $this->accept(Token::KEYWORD, 'TEMP')
             || $this->accept(Token::KEYWORD, 'TEMPORARY');
 
+        if ($this->accept(Token::KEYWORD, 'TRIGGER')) {
+            return $this->createTriggerBody($start);
+        }
         $unique = $this->accept(Token::KEYWORD, 'UNIQUE');
         if ($this->accept(Token::KEYWORD, 'INDEX')) {
             return $this->createIndexBody($unique, $start);
@@ -391,6 +395,79 @@ final class Parser
         }
         $this->expect(Token::KEYWORD, 'TABLE');
         return $this->createTableBody($start);
+    }
+
+    private function createTriggerBody(int $start): CreateTriggerStatement
+    {
+        $ifNotExists = false;
+        if ($this->accept(Token::KEYWORD, 'IF')) {
+            $this->expect(Token::KEYWORD, 'NOT');
+            $this->expect(Token::KEYWORD, 'EXISTS');
+            $ifNotExists = true;
+        }
+        $name = $this->qualifiedName();
+
+        // Timing: BEFORE | AFTER | INSTEAD OF (defaults to BEFORE when omitted).
+        $timing = CreateTriggerStatement::BEFORE;
+        if ($this->accept(Token::KEYWORD, 'BEFORE')) {
+            $timing = CreateTriggerStatement::BEFORE;
+        } elseif ($this->accept(Token::KEYWORD, 'AFTER')) {
+            $timing = CreateTriggerStatement::AFTER;
+        } elseif ($this->accept(Token::KEYWORD, 'INSTEAD')) {
+            $this->expect(Token::KEYWORD, 'OF');
+            $timing = CreateTriggerStatement::INSTEAD_OF;
+        }
+
+        // Event: DELETE | INSERT | UPDATE [OF col, ...].
+        $updateOf = [];
+        if ($this->accept(Token::KEYWORD, 'DELETE')) {
+            $event = CreateTriggerStatement::DELETE;
+        } elseif ($this->accept(Token::KEYWORD, 'INSERT')) {
+            $event = CreateTriggerStatement::INSERT;
+        } elseif ($this->accept(Token::KEYWORD, 'UPDATE')) {
+            $event = CreateTriggerStatement::UPDATE;
+            if ($this->accept(Token::KEYWORD, 'OF')) {
+                do {
+                    $updateOf[] = $this->name();
+                } while ($this->accept(Token::PUNCT, ','));
+            }
+        } else {
+            throw SqlException::parse('expected DELETE, INSERT or UPDATE in CREATE TRIGGER');
+        }
+
+        $this->expect(Token::KEYWORD, 'ON');
+        $table = $this->qualifiedName();
+
+        if ($this->accept(Token::KEYWORD, 'FOR')) {
+            $this->expect(Token::KEYWORD, 'EACH');
+            $this->expect(Token::KEYWORD, 'ROW');
+        }
+
+        $when = null;
+        if ($this->accept(Token::KEYWORD, 'WHEN')) {
+            $when = $this->expression();
+        }
+
+        $this->expect(Token::KEYWORD, 'BEGIN');
+        $body = [];
+        while (!$this->peek()->isKeyword('END') && !$this->peek()->is(Token::EOF)) {
+            $body[] = $this->statement();
+            $this->accept(Token::PUNCT, ';');
+        }
+        $this->expect(Token::KEYWORD, 'END');
+
+        $sql = \rtrim(\substr($this->sql, $start, $this->peek()->pos - $start));
+        return new CreateTriggerStatement(
+            $name,
+            $timing,
+            $event,
+            $table,
+            $updateOf,
+            $when,
+            $body,
+            $ifNotExists,
+            $sql,
+        );
     }
 
     private function createViewBody(int $start, bool $temporary): CreateViewStatement
@@ -768,7 +845,8 @@ final class Parser
             $this->accept(Token::KEYWORD, 'TABLE') => DropStatement::TABLE,
             $this->accept(Token::KEYWORD, 'INDEX') => DropStatement::INDEX,
             $this->accept(Token::KEYWORD, 'VIEW') => DropStatement::VIEW,
-            default => throw SqlException::parse('expected TABLE, INDEX or VIEW after DROP'),
+            $this->accept(Token::KEYWORD, 'TRIGGER') => DropStatement::TRIGGER,
+            default => throw SqlException::parse('expected TABLE, INDEX, VIEW or TRIGGER after DROP'),
         };
         $ifExists = false;
         if ($this->accept(Token::KEYWORD, 'IF')) {

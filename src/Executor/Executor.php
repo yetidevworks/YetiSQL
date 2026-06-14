@@ -6,6 +6,7 @@ namespace YetiDevWorks\YetiSQL\Executor;
 
 use Generator;
 use YetiDevWorks\YetiSQL\Engine\Blob;
+use YetiDevWorks\YetiSQL\Engine\ColumnInfo;
 use YetiDevWorks\YetiSQL\Engine\Database;
 use YetiDevWorks\YetiSQL\Engine\RecordCodec;
 use YetiDevWorks\YetiSQL\Engine\TableBTree;
@@ -15,6 +16,7 @@ use YetiDevWorks\YetiSQL\Functions\Aggregates;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateIndexStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\AlterTableStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateTableStatement;
+use YetiDevWorks\YetiSQL\Sql\Ast\CreateTriggerStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateViewStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DeleteStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DropStatement;
@@ -64,6 +66,12 @@ final class Executor
     /** @var array<string,true> views currently being expanded (circular-reference guard) */
     private array $viewStack = [];
 
+    /** @var list<RowEnv> NEW/OLD row contexts for triggers currently firing (innermost last). */
+    private array $triggerEnvStack = [];
+
+    /** @var array<string,true> trigger names currently on the firing stack (non-recursive guard). */
+    private array $activeTriggers = [];
+
     public function __construct(private readonly Database $db)
     {
         $this->selectSignatures = new \WeakMap();
@@ -109,6 +117,7 @@ final class Executor
             || $stmt instanceof CreateTableStatement
             || $stmt instanceof CreateIndexStatement
             || $stmt instanceof CreateViewStatement
+            || $stmt instanceof CreateTriggerStatement
             || $stmt instanceof AlterTableStatement
             || $stmt instanceof DropStatement;
     }
@@ -123,6 +132,7 @@ final class Executor
             $stmt instanceof DeleteStatement => $this->execDelete($stmt, $params),
             $stmt instanceof CreateTableStatement => $this->execCreateTable($stmt),
             $stmt instanceof CreateViewStatement => $this->execCreateView($stmt),
+            $stmt instanceof CreateTriggerStatement => $this->execCreateTrigger($stmt),
             $stmt instanceof AlterTableStatement => $this->execAlter($stmt),
             $stmt instanceof DropStatement => $this->execDrop($stmt),
             $stmt instanceof CreateIndexStatement => $this->execCreateIndex($stmt),
@@ -3362,6 +3372,9 @@ final class Executor
     /** @param array<string,null|int|float|string|Blob> $params */
     private function execInsert(InsertStatement $stmt, array $params): Result
     {
+        if ($this->db->schema()->hasView($stmt->table)) {
+            return $this->execInsertView($stmt, $params);
+        }
         $info = $this->requireTable($stmt->table);
         $tree = new TableBTree($this->db->pager(), $info->rootPage);
         $eval = new Evaluator($this, $params);
@@ -3386,10 +3399,11 @@ final class Executor
             }
         }
 
+        $fireTrig = $this->db->schema()->hasTriggersOn($info->name);
         $count = 0;
         $lastId = 0;
         foreach ($rowsData as $data) {
-            $lastId = $this->insertOneRow($info, $tree, $targetCols, $data, $stmt, $eval);
+            $lastId = $this->insertOneRow($info, $tree, $targetCols, $data, $stmt, $eval, $fireTrig);
             $count++;
         }
         return Result::affected($count, $lastId);
@@ -3399,7 +3413,7 @@ final class Executor
      * @param list<string> $targetCols
      * @param list<null|int|float|string|Blob> $data
      */
-    private function insertOneRow(TableInfo $info, TableBTree $tree, array $targetCols, array $data, InsertStatement $stmt, Evaluator $eval): int
+    private function insertOneRow(TableInfo $info, TableBTree $tree, array $targetCols, array $data, InsertStatement $stmt, Evaluator $eval, bool $fireTrig = false): int
     {
         // Map supplied values onto a full column vector.
         $byPos = \array_fill(0, $info->columnCount(), null);
@@ -3451,6 +3465,16 @@ final class Executor
 
         $payload = RecordCodec::encode(\array_values($record));
 
+        $logical = $record;
+        if ($info->hasRowidAlias()) {
+            $logical[$info->rowidAlias] = $rowid;
+        }
+        $logical = \array_values($logical);
+
+        if ($fireTrig) {
+            $this->fireTriggers($info, CreateTriggerStatement::INSERT, CreateTriggerStatement::BEFORE, null, $logical, $rowid, $rowid);
+        }
+
         if ($stmt->orReplace) {
             if ($tree->exists($rowid)) {
                 $old = $this->decodeRow($info, $rowid, (string) $tree->get($rowid));
@@ -3467,11 +3491,11 @@ final class Executor
             throw SqlException::constraint("UNIQUE constraint failed: {$info->name} rowid $rowid");
         }
 
-        $logical = $record;
-        if ($info->hasRowidAlias()) {
-            $logical[$info->rowidAlias] = $rowid;
+        $this->insertIndexEntries($info, $rowid, $logical);
+
+        if ($fireTrig) {
+            $this->fireTriggers($info, CreateTriggerStatement::INSERT, CreateTriggerStatement::AFTER, null, $logical, $rowid, $rowid);
         }
-        $this->insertIndexEntries($info, $rowid, \array_values($logical));
         return $rowid;
     }
 
@@ -3480,6 +3504,9 @@ final class Executor
     /** @param array<string,null|int|float|string|Blob> $params */
     private function execUpdate(UpdateStatement $stmt, array $params): Result
     {
+        if ($this->db->schema()->hasView($stmt->table)) {
+            return $this->execModifyView($stmt->table, CreateTriggerStatement::UPDATE, $stmt->where, $stmt->set, $params);
+        }
         $info = $this->requireTable($stmt->table);
         $tree = new TableBTree($this->db->pager(), $info->rootPage);
         $eval = new Evaluator($this, $params);
@@ -3500,6 +3527,7 @@ final class Executor
             $targets[] = [$rowid, $values];
         }
 
+        $fireTrig = $this->db->schema()->hasTriggersOn($info->name);
         $count = 0;
         foreach ($targets as [$rowid, $values]) {
             $env = new RowEnv();
@@ -3526,6 +3554,10 @@ final class Executor
                 $changed[$pos] = true;
             }
 
+            if ($fireTrig) {
+                $this->fireTriggers($info, CreateTriggerStatement::UPDATE, CreateTriggerStatement::BEFORE, $values, $newValues, $rowid, $newRowid, $changed);
+            }
+
             $record = $this->buildRecord($info, $newValues);
             if ($newRowid !== $rowid) {
                 $tree->delete($rowid);
@@ -3533,6 +3565,10 @@ final class Executor
             $tree->put($newRowid, RecordCodec::encode($record));
             // Maintain only indexes whose columns (or the rowid) actually changed.
             $this->maintainIndexesForUpdate($info, $rowid, $values, $newRowid, $newValues, $changed);
+
+            if ($fireTrig) {
+                $this->fireTriggers($info, CreateTriggerStatement::UPDATE, CreateTriggerStatement::AFTER, $values, $newValues, $rowid, $newRowid, $changed);
+            }
             $count++;
         }
         return Result::affected($count);
@@ -3543,6 +3579,9 @@ final class Executor
     /** @param array<string,null|int|float|string|Blob> $params */
     private function execDelete(DeleteStatement $stmt, array $params): Result
     {
+        if ($this->db->schema()->hasView($stmt->table)) {
+            return $this->execModifyView($stmt->table, CreateTriggerStatement::DELETE, $stmt->where, null, $params);
+        }
         $info = $this->requireTable($stmt->table);
         $tree = new TableBTree($this->db->pager(), $info->rootPage);
         $eval = new Evaluator($this, $params);
@@ -3561,9 +3600,16 @@ final class Executor
             }
             $targets[] = [$rowid, $values];
         }
+        $fireTrig = $this->db->schema()->hasTriggersOn($info->name);
         foreach ($targets as [$rowid, $values]) {
+            if ($fireTrig) {
+                $this->fireTriggers($info, CreateTriggerStatement::DELETE, CreateTriggerStatement::BEFORE, $values, null, $rowid, $rowid);
+            }
             $this->deleteIndexEntries($info, $rowid, $values);
             $tree->delete($rowid);
+            if ($fireTrig) {
+                $this->fireTriggers($info, CreateTriggerStatement::DELETE, CreateTriggerStatement::AFTER, $values, null, $rowid, $rowid);
+            }
         }
         return Result::affected(\count($targets));
     }
@@ -3590,6 +3636,187 @@ final class Executor
     {
         $this->db->schema()->createView($stmt);
         return Result::affected(0);
+    }
+
+    private function execCreateTrigger(CreateTriggerStatement $stmt): Result
+    {
+        $schema = $this->db->schema();
+        $onView = $schema->hasView($stmt->table);
+        if ($stmt->timing === CreateTriggerStatement::INSTEAD_OF && !$onView) {
+            throw new SqlException("cannot create INSTEAD OF trigger on table: {$stmt->table}");
+        }
+        if ($stmt->timing !== CreateTriggerStatement::INSTEAD_OF && $onView) {
+            throw new SqlException("cannot create {$stmt->timing} trigger on view: {$stmt->table}");
+        }
+        if (!$onView && $schema->getTable($stmt->table) === null) {
+            throw new SqlException("no such table: {$stmt->table}");
+        }
+        $schema->createTrigger($stmt);
+        return Result::affected(0);
+    }
+
+    // === triggers =========================================================
+
+    /** The innermost NEW/OLD row context, consulted by the evaluator for NEW./OLD. refs. */
+    public function currentTriggerEnv(): ?RowEnv
+    {
+        $n = \count($this->triggerEnvStack);
+        return $n > 0 ? $this->triggerEnvStack[$n - 1] : null;
+    }
+
+    /**
+     * Fire every row trigger matching (table, event, timing). OLD/NEW are full
+     * logical column vectors (NEW null for DELETE, OLD null for INSERT).
+     *
+     * @param ?list<null|int|float|string|Blob> $oldValues
+     * @param ?list<null|int|float|string|Blob> $newValues
+     * @param ?array<int,true> $changedCols positions changed (UPDATE only), for UPDATE OF gating
+     */
+    private function fireTriggers(
+        TableInfo $info,
+        string $event,
+        string $timing,
+        ?array $oldValues,
+        ?array $newValues,
+        int $oldRowid,
+        int $newRowid,
+        ?array $changedCols = null,
+    ): void {
+        $triggers = $this->db->schema()->triggersFor($info->name, $event, $timing);
+        if ($triggers === []) {
+            return;
+        }
+        foreach ($triggers as $trg) {
+            if (isset($this->activeTriggers[\strtolower($trg->name)])) {
+                continue; // recursive_triggers is OFF: never re-enter a running trigger
+            }
+            if ($trg->updateOfColumns !== [] && !$this->updateTouchesColumns($info, $trg->updateOfColumns, $changedCols)) {
+                continue;
+            }
+
+            $env = new RowEnv();
+            if ($oldValues !== null) {
+                $env->addFrame('old', $info, $oldValues, $oldRowid);
+            }
+            if ($newValues !== null) {
+                $env->addFrame('new', $info, $newValues, $newRowid);
+            }
+
+            $this->triggerEnvStack[] = $env;
+            $this->activeTriggers[\strtolower($trg->name)] = true;
+            try {
+                if ($trg->when !== null) {
+                    $eval = new Evaluator($this, []);
+                    if (!Value::isTrue((int) ($eval->evaluate($trg->when, null) ?? 0))) {
+                        continue;
+                    }
+                }
+                foreach ($trg->body as $bodyStmt) {
+                    $this->execute($bodyStmt, []);
+                }
+            } finally {
+                \array_pop($this->triggerEnvStack);
+                unset($this->activeTriggers[\strtolower($trg->name)]);
+            }
+        }
+    }
+
+    /** A synthetic TableInfo for a view, so NEW/OLD frames resolve columns by name. */
+    private function viewTableInfo(string $name): TableInfo
+    {
+        $view = $this->db->schema()->getView($name);
+        $cols = $view['columns'] !== [] ? $view['columns'] : $this->selectOutputNames($view['select']);
+        return $this->derivedTableInfo($name, $cols);
+    }
+
+    /** INSTEAD OF INSERT on a view: fire its triggers per row; no base storage. */
+    private function execInsertView(InsertStatement $stmt, array $params): Result
+    {
+        $triggers = $this->db->schema()->triggersFor($stmt->table, CreateTriggerStatement::INSERT, CreateTriggerStatement::INSTEAD_OF);
+        if ($triggers === []) {
+            throw new SqlException("cannot modify {$stmt->table} because it is a view");
+        }
+        $info = $this->viewTableInfo($stmt->table);
+        $eval = new Evaluator($this, $params);
+        $targetCols = $stmt->columns ?? \array_map(static fn (ColumnInfo $c): string => $c->name, $info->columns);
+
+        $rowsData = [];
+        if ($stmt->select !== null) {
+            foreach ($this->runSubquerySelect($stmt->select, $params) as $r) {
+                $rowsData[] = $r;
+            }
+        } else {
+            foreach ($stmt->rows as $exprRow) {
+                $vals = [];
+                foreach ($exprRow as $expr) {
+                    $vals[] = $eval->evaluate($expr, null);
+                }
+                $rowsData[] = $vals;
+            }
+        }
+
+        $count = 0;
+        foreach ($rowsData as $data) {
+            $newVec = \array_fill(0, $info->columnCount(), null);
+            foreach ($targetCols as $k => $colName) {
+                $pos = $info->columnPos($colName);
+                if ($pos !== null) {
+                    $newVec[$pos] = $data[$k] ?? null;
+                }
+            }
+            $this->fireTriggers($info, CreateTriggerStatement::INSERT, CreateTriggerStatement::INSTEAD_OF, null, $newVec, 0, 0);
+            $count++;
+        }
+        return Result::affected($count);
+    }
+
+    /** INSTEAD OF UPDATE/DELETE on a view: fire its triggers per matching view row. */
+    private function execModifyView(string $view, string $event, ?Expr $where, ?array $set, array $params): Result
+    {
+        $triggers = $this->db->schema()->triggersFor($view, $event, CreateTriggerStatement::INSTEAD_OF);
+        if ($triggers === []) {
+            throw new SqlException("cannot modify $view because it is a view");
+        }
+        $info = $this->viewTableInfo($view);
+        $eval = new Evaluator($this, $params);
+        $rows = $this->execSelect($this->db->schema()->getView($view)['select'], $params)->materializeRows();
+
+        $count = 0;
+        foreach ($rows as $row) {
+            $env = new RowEnv();
+            $env->addFrame($view, $info, $row, 0);
+            if ($where !== null && !Value::isTrue((int) ($eval->evaluate($where, $env) ?? 0))) {
+                continue;
+            }
+            $newVec = $row;
+            if ($event === CreateTriggerStatement::UPDATE && $set !== null) {
+                foreach ($set as [$colName, $expr]) {
+                    $pos = $info->columnPos($colName);
+                    if ($pos !== null) {
+                        $newVec[$pos] = $eval->evaluate($expr, $env);
+                    }
+                }
+            }
+            $newValues = $event === CreateTriggerStatement::UPDATE ? $newVec : null;
+            $this->fireTriggers($info, $event, CreateTriggerStatement::INSTEAD_OF, $row, $newValues, 0, 0);
+            $count++;
+        }
+        return Result::affected($count);
+    }
+
+    /** @param ?array<int,true> $changedCols */
+    private function updateTouchesColumns(TableInfo $info, array $ofColumns, ?array $changedCols): bool
+    {
+        if ($changedCols === null) {
+            return true;
+        }
+        foreach ($ofColumns as $name) {
+            $pos = $info->columnPos($name);
+            if ($pos !== null && isset($changedCols[$pos])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private function execAlter(AlterTableStatement $stmt): Result
@@ -3696,6 +3923,14 @@ final class Executor
                 throw new SqlException("no such index: {$stmt->name}");
             }
             $schema->dropIndex($stmt->name);
+        } elseif ($stmt->kind === DropStatement::TRIGGER) {
+            if (!$schema->hasTrigger($stmt->name)) {
+                if ($stmt->ifExists) {
+                    return Result::affected(0);
+                }
+                throw new SqlException("no such trigger: {$stmt->name}");
+            }
+            $schema->dropTrigger($stmt->name);
         }
         return Result::affected(0);
     }

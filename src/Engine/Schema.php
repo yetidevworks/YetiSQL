@@ -7,6 +7,7 @@ namespace YetiDevWorks\YetiSQL\Engine;
 use YetiDevWorks\YetiSQL\Exception\SqlException;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateIndexStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateTableStatement;
+use YetiDevWorks\YetiSQL\Sql\Ast\CreateTriggerStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\CreateViewStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\SelectStatement;
 use YetiDevWorks\YetiSQL\Sql\Parser;
@@ -26,6 +27,8 @@ final class Schema
     private array $indexes = [];
     /** @var array<string,array{name:string,columns:list<string>,select:SelectStatement,sql:string}> */
     private array $views = [];
+    /** @var array<string,CreateTriggerStatement> lower-cased trigger name => AST */
+    private array $triggers = [];
 
     private TableBTree $master;
 
@@ -40,6 +43,7 @@ final class Schema
         $this->tables = [];
         $this->indexes = [];
         $this->views = [];
+        $this->triggers = [];
         foreach ($this->master->scan() as [$rowid, $payload]) {
             $r = RecordCodec::decode($payload);
             [$type, $name, $tblName, $rootPage, $sql] = [$r[0], $r[1], $r[2], $r[3], $r[4]];
@@ -48,6 +52,11 @@ final class Schema
                     (string) $sql,
                     (int) $rootPage,
                 );
+            } elseif ($type === 'trigger') {
+                $parser = new Parser((string) $sql);
+                /** @var CreateTriggerStatement $ast */
+                $ast = $parser->parseStatement();
+                $this->triggers[\strtolower((string) $name)] = $ast;
             } elseif ($type === 'view') {
                 $parser = new Parser((string) $sql);
                 /** @var CreateViewStatement $ast */
@@ -252,6 +261,64 @@ final class Schema
         unset($this->views[\strtolower($name)]);
     }
 
+    public function hasTrigger(string $name): bool
+    {
+        return isset($this->triggers[\strtolower($name)]);
+    }
+
+    public function hasTriggersOn(string $table): bool
+    {
+        foreach ($this->triggers as $trg) {
+            if (\strcasecmp($trg->table, $table) === 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Triggers on a table for a given event/timing, in creation order.
+     *
+     * @return list<CreateTriggerStatement>
+     */
+    public function triggersFor(string $table, string $event, string $timing): array
+    {
+        $out = [];
+        foreach ($this->triggers as $trg) {
+            if (\strcasecmp($trg->table, $table) === 0 && $trg->event === $event && $trg->timing === $timing) {
+                $out[] = $trg;
+            }
+        }
+        return $out;
+    }
+
+    public function createTrigger(CreateTriggerStatement $stmt): void
+    {
+        if ($this->hasTrigger($stmt->name)) {
+            if ($stmt->ifNotExists) {
+                return;
+            }
+            throw SqlException::constraint("trigger {$stmt->name} already exists");
+        }
+        if ($this->hasTable($stmt->name) || $this->hasView($stmt->name)) {
+            throw SqlException::constraint("there is already an object named {$stmt->name}");
+        }
+        $rowid = $this->master->maxRowid() + 1;
+        $this->master->put($rowid, RecordCodec::encode([
+            'trigger', $stmt->name, $stmt->table, 0, $stmt->sql,
+        ]));
+        $this->pager->bumpSchemaCookie();
+        $this->triggers[\strtolower($stmt->name)] = $stmt;
+    }
+
+    public function dropTrigger(string $name): void
+    {
+        $this->deleteMasterRows(static fn (array $r): bool =>
+            $r[0] === 'trigger' && \strtolower((string) $r[1]) === \strtolower($name));
+        $this->pager->bumpSchemaCookie();
+        unset($this->triggers[\strtolower($name)]);
+    }
+
     public function recordIndex(CreateIndexStatement $stmt, int $rootPage): void
     {
         $rowid = $this->master->maxRowid() + 1;
@@ -272,12 +339,18 @@ final class Schema
     {
         $this->deleteMasterRows(static fn (array $r): bool =>
             ($r[0] === 'table' && \strtolower((string) $r[1]) === \strtolower($name))
-            || ($r[0] === 'index' && \strtolower((string) $r[2]) === \strtolower($name)));
+            || ($r[0] === 'index' && \strtolower((string) $r[2]) === \strtolower($name))
+            || ($r[0] === 'trigger' && \strtolower((string) $r[2]) === \strtolower($name)));
         $this->pager->bumpSchemaCookie();
         unset($this->tables[\strtolower($name)]);
         foreach (\array_keys($this->indexes) as $k) {
             if (\strtolower($this->indexes[$k]['table']) === \strtolower($name)) {
                 unset($this->indexes[$k]);
+            }
+        }
+        foreach (\array_keys($this->triggers) as $k) {
+            if (\strcasecmp($this->triggers[$k]->table, $name) === 0) {
+                unset($this->triggers[$k]);
             }
         }
     }
