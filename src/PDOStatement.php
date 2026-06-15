@@ -24,6 +24,14 @@ class PDOStatement implements IteratorAggregate
 {
     /** @var array<string,null|int|float|string|Blob> */
     private array $bound = [];
+    /**
+     * By-reference bindings from bindParam(): the variable is read at execute()
+     * time (PDO semantics), not snapshotted at bind time. Each entry holds a
+     * live reference plus the bind type.
+     *
+     * @var array<string,array{ref:mixed,type:int}>
+     */
+    private array $boundRefs = [];
     private ?Result $result = null;
     private int $cursor = 0;
     private int $fetchMode;
@@ -44,14 +52,20 @@ class PDOStatement implements IteratorAggregate
 
     public function bindValue(string|int $param, mixed $value, int $type = PDO::PARAM_STR): bool
     {
-        $this->bound[$this->normalizeKey($param)] = $this->coerce($value, $type);
+        $key = $this->normalizeKey($param);
+        unset($this->boundRefs[$key]);
+        $this->bound[$key] = $this->coerce($value, $type);
         return true;
     }
 
     public function bindParam(string|int $param, mixed &$variable, int $type = PDO::PARAM_STR, int $maxLength = 0, mixed $driverOptions = null): bool
     {
-        // We snapshot at execute() time via bindValue semantics for simplicity.
-        $this->bound[$this->normalizeKey($param)] = $this->coerce($variable, $type);
+        // PDO binds by reference: the variable is read at execute() time, not
+        // snapshotted here. Hold a live reference and resolve it in execute().
+        $key = $this->normalizeKey($param);
+        unset($this->bound[$key]);
+        $this->boundRefs[$key] = ['type' => $type, 'ref' => null];
+        $this->boundRefs[$key]['ref'] = &$variable;
         return true;
     }
 
@@ -59,6 +73,10 @@ class PDOStatement implements IteratorAggregate
     public function execute(?array $params = null): bool
     {
         $bindings = $this->bound;
+        // Resolve by-reference bindings now, reading each variable's current value.
+        foreach ($this->boundRefs as $key => $r) {
+            $bindings[$key] = $this->coerce($r['ref'], $r['type']);
+        }
         if ($params !== null) {
             if (\array_is_list($params)) {
                 foreach ($params as $i => $v) {

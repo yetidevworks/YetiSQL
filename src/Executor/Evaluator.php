@@ -1133,6 +1133,9 @@ final class Evaluator
         $matched = match ($e->op) {
             'GLOB' => $this->globMatch((string) Value::toText($pattern), $subject),
             'REGEXP' => @\preg_match('/' . \str_replace('/', '\/', (string) Value::toText($pattern)) . '/u', (string) Value::toText($subject)) === 1,
+            // MATCH has no meaning without an FTS table (FTS5 is unimplemented).
+            // SQLite raises here rather than silently treating it as LIKE.
+            'MATCH' => throw new SqlException('unable to use function MATCH in the requested context'),
             default => $this->likeMatch((string) Value::toText($subject), $pattern, $escape),
         };
         return ($matched !== $e->not) ? 1 : 0;

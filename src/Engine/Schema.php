@@ -188,6 +188,7 @@ final class Schema
                     $positions,
                     $collations,
                     $idx['ast']->unique,
+                    $idx['ast']->where,
                 );
             }
         }
@@ -694,6 +695,7 @@ final class Schema
             withoutRowid: $ast->withoutRowid,
             sql: $ast->sql,
             foreignKeys: $ast->foreignKeys,
+            checks: $ast->checks,
         );
     }
 

@@ -63,6 +63,16 @@ final class Pager
     private array $dirty = [];
     /** @var array<int,?string> undo images captured this txn; null = page newly allocated */
     private array $undo = [];
+    /**
+     * Open savepoints (sub-transactions), innermost last. Each snapshots the
+     * bytes of every page dirtied so far this transaction plus the allocator /
+     * header fields, so ROLLBACK TO can restore exactly the state at that point.
+     * (Pages are mutated in place before writePage(), so a lazy pre-image log
+     * cannot capture the right bytes — an eager snapshot is the correct model.)
+     *
+     * @var list<array{name:string,pages:array<int,?string>,dirty:array<int,true>,pageCount:int,freelistHead:int,freelistCount:int,schemaCookie:int,changeCounter:int}>
+     */
+    private array $savepoints = [];
 
     private bool $inTxn = false;
     private int $pageSize = self::DEFAULT_PAGE_SIZE;
@@ -438,6 +448,7 @@ final class Pager
         }
 
         $this->undo = [];
+        $this->savepoints = [];
         $this->committedPageCount = -1;
         $this->inTxn = false;
     }
@@ -461,12 +472,105 @@ final class Pager
         // file- and memory-backed pagers; the main file was never touched).
         $this->parseHeaderFrom($this->cache[1]);
         $this->undo = [];
+        $this->savepoints = [];
         $this->dirty = [];
         $this->committedPageCount = -1;
         $this->inTxn = false;
         if (!$this->memory) {
             $this->unlock();
         }
+    }
+
+    /** Whether at least one savepoint is currently open. */
+    public function hasSavepoints(): bool
+    {
+        return $this->savepoints !== [];
+    }
+
+    /**
+     * Open a savepoint, snapshotting the bytes of every page dirtied so far this
+     * transaction plus the allocator/header fields. Requires a transaction.
+     */
+    public function savepoint(string $name): void
+    {
+        if (!$this->inTxn) {
+            return; // Database opens a transaction before the first savepoint
+        }
+        $pages = [];
+        foreach (\array_keys($this->dirty) as $pageNo) {
+            // read() materializes a deferred page, so this captures current bytes.
+            $pages[$pageNo] = $this->read($pageNo);
+        }
+        $this->savepoints[] = [
+            'name' => $name,
+            'pages' => $pages,
+            'dirty' => $this->dirty,
+            'pageCount' => $this->pageCount,
+            'freelistHead' => $this->freelistHead,
+            'freelistCount' => $this->freelistCount,
+            'schemaCookie' => $this->schemaCookie,
+            'changeCounter' => $this->changeCounter,
+        ];
+    }
+
+    /**
+     * Release (commit) a savepoint and any nested inside it: the markers are
+     * discarded but their changes fold into the enclosing scope (nothing undone).
+     */
+    public function releaseSavepoint(string $name): void
+    {
+        $i = $this->findSavepoint($name);
+        if ($i === null) {
+            throw new YetiSQLException("no such savepoint: $name");
+        }
+        $this->savepoints = \array_slice($this->savepoints, 0, $i);
+    }
+
+    /**
+     * Roll back to a savepoint without ending the transaction: restore every
+     * page to its content at that savepoint, revert the allocator/header
+     * snapshot, and discard nested savepoints. The savepoint stays open so it
+     * can be rolled back to again.
+     */
+    public function rollbackToSavepoint(string $name): void
+    {
+        $i = $this->findSavepoint($name);
+        if ($i === null) {
+            throw new YetiSQLException("no such savepoint: $name");
+        }
+        $sp = $this->savepoints[$i];
+        foreach (\array_keys($this->dirty) as $pageNo) {
+            unset($this->decoded[$pageNo], $this->pendingEncode[$pageNo]);
+            if (\array_key_exists($pageNo, $sp['pages'])) {
+                // Dirty at the savepoint: restore its snapshot bytes.
+                $this->cache[$pageNo] = $sp['pages'][$pageNo];
+            } elseif (\array_key_exists($pageNo, $this->undo) && $this->undo[$pageNo] !== null) {
+                // First dirtied after the savepoint: revert to the committed image.
+                $this->cache[$pageNo] = $this->undo[$pageNo];
+            } else {
+                // Allocated after the savepoint: drop it.
+                unset($this->cache[$pageNo]);
+            }
+        }
+        $this->dirty = $sp['dirty'];
+        $this->pageCount = $sp['pageCount'];
+        $this->freelistHead = $sp['freelistHead'];
+        $this->freelistCount = $sp['freelistCount'];
+        $this->schemaCookie = $sp['schemaCookie'];
+        $this->changeCounter = $sp['changeCounter'];
+        // Keep the target savepoint open; drop any nested inside it.
+        $this->savepoints = \array_slice($this->savepoints, 0, $i + 1);
+    }
+
+    /** Index of the most recent savepoint with this name (case-insensitive), or null. */
+    private function findSavepoint(string $name): ?int
+    {
+        for ($i = \count($this->savepoints) - 1; $i >= 0; $i--) {
+            if (\strcasecmp($this->savepoints[$i]['name'], $name) === 0) {
+                return $i;
+            }
+        }
+        return null;
     }
 
     public function inTransaction(): bool

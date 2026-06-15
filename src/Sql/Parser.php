@@ -6,6 +6,7 @@ namespace YetiDevWorks\YetiSQL\Sql;
 
 use YetiDevWorks\YetiSQL\Engine\Blob;
 use YetiDevWorks\YetiSQL\Exception\SqlException;
+use YetiDevWorks\YetiSQL\Sql\Ast\CheckConstraint;
 use YetiDevWorks\YetiSQL\Sql\Ast\ColumnDef;
 use YetiDevWorks\YetiSQL\Sql\Ast\ForeignKey;
 use YetiDevWorks\YetiSQL\Sql\Ast\AlterTableStatement;
@@ -535,6 +536,9 @@ final class Parser
             if ($cd->reference !== null) {
                 $stmt->foreignKeys[] = $cd->reference;
             }
+            foreach ($cd->checks as $check) {
+                $stmt->checks[] = $check;
+            }
         }
 
         if ($this->accept(Token::KEYWORD, 'WITHOUT')) {
@@ -555,8 +559,9 @@ final class Parser
 
     private function tableConstraint(CreateTableStatement $stmt): void
     {
+        $constraintName = null;
         if ($this->accept(Token::KEYWORD, 'CONSTRAINT')) {
-            $this->name(); // constraint name, ignored
+            $constraintName = $this->name();
         }
         if ($this->accept(Token::KEYWORD, 'PRIMARY')) {
             $this->expect(Token::KEYWORD, 'KEY');
@@ -566,15 +571,24 @@ final class Parser
             $stmt->uniqueConstraints[] = $this->parenColumnList();
             $this->consumeConflictClause();
         } elseif ($this->accept(Token::KEYWORD, 'CHECK')) {
-            $this->expect(Token::PUNCT, '(');
-            $this->expression();
-            $this->expect(Token::PUNCT, ')');
+            $stmt->checks[] = $this->checkConstraint($constraintName);
         } elseif ($this->accept(Token::KEYWORD, 'FOREIGN')) {
             $this->expect(Token::KEYWORD, 'KEY');
             $childCols = $this->parenColumnList();
             $this->expect(Token::KEYWORD, 'REFERENCES');
             $stmt->foreignKeys[] = $this->referencesClause($childCols);
         }
+    }
+
+    /** Parse `( <expr> )` after a CHECK keyword, capturing the expr's SQL text. */
+    private function checkConstraint(?string $name): CheckConstraint
+    {
+        $this->expect(Token::PUNCT, '(');
+        $start = $this->peek()->pos;
+        $expr = $this->expression();
+        $sql = \rtrim(\substr($this->sql, $start, $this->peek()->pos - $start));
+        $this->expect(Token::PUNCT, ')');
+        return new CheckConstraint($expr, $sql, $name);
     }
 
     /** @return list<string> */
@@ -628,9 +642,7 @@ final class Parser
             } elseif ($this->accept(Token::KEYWORD, 'COLLATE')) {
                 $col->collation = $this->name();
             } elseif ($this->accept(Token::KEYWORD, 'CHECK')) {
-                $this->expect(Token::PUNCT, '(');
-                $this->expression();
-                $this->expect(Token::PUNCT, ')');
+                $col->checks[] = $this->checkConstraint(null);
             } elseif ($this->accept(Token::KEYWORD, 'REFERENCES')) {
                 $col->reference = $this->referencesClause([$name]);
             } elseif ($this->accept(Token::KEYWORD, 'GENERATED')) {

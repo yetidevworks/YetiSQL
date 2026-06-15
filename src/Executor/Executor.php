@@ -22,6 +22,7 @@ use YetiDevWorks\YetiSQL\Sql\Ast\CreateViewStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DeleteStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\DropStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\Expr;
+use YetiDevWorks\YetiSQL\Sql\Ast\CheckConstraint;
 use YetiDevWorks\YetiSQL\Sql\Ast\ForeignKey;
 use YetiDevWorks\YetiSQL\Sql\Ast\InsertStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\JoinClause;
@@ -52,6 +53,13 @@ final class Executor
      */
     private array $selectMeta = [];
     private const SELECT_META_MAX = 1024;
+    /**
+     * Inner-table row-count ceiling under which a covered-count map (for indexed
+     * joins / correlated COUNT(*)) is built eagerly: the one-time build is cheap,
+     * cached, and reused, so it beats per-probe seeks. Above it, the map is only
+     * built once enough outer rows have probed to amortize the full walk.
+     */
+    private const COUNT_MAP_EAGER_MAX = 10000;
     /** @var array<string,int> */
     private array $coveredCountCache = [];
     private const COVERED_COUNT_CACHE_MAX = 1024;
@@ -59,6 +67,12 @@ final class Executor
     private array $groupedAggregateCache = [];
     /** @var array<int,array{cookie:int,changes:int,root:int,pos:int,sig:string,map:array<string,int>}> */
     private array $correlatedCountCache = [];
+    /** @var array<int,array{cookie:int,changes:int,map:array<string,int>}> */
+    private array $indexCountMapCache = [];
+    /** @var array<int,int> per-subquery probe counter, gates count-map materialization */
+    private array $correlatedProbeCounts = [];
+    /** @var array<int,int> per-subquery cached inner row count (measured once, not per probe) */
+    private array $correlatedMapRows = [];
     /** @var array<string,array<string,list<array{rowid:int,values:list<null|int|float|string|Blob>}>>> */
     private array $fkCascadeChildCache = [];
     /** @var \WeakMap<SelectStatement,string> */
@@ -418,6 +432,10 @@ final class Executor
         // COUNT(*) case never even reads a column.
         $keys = [];
         if ($isAggregate && $select->groupBy === []) {
+            $joinCount = $this->tryJoinCoveredCount($select, $outputCols, $aggregateNodes, $eval);
+            if ($joinCount !== null) {
+                return [$colNames, $joinCount, []];
+            }
             $coveredCount = $this->tryCoveredCount($select, $outputCols, $aggregateNodes, $eval);
             if ($coveredCount !== null) {
                 return [$colNames, $coveredCount, []];
@@ -715,7 +733,30 @@ final class Executor
             $indexes = $this->db->schema()->resolvedIndexes($src['info']->name);
             $key = $this->joinAccessKey($join, $src['alias'], $src['info'], $indexes);
             if ($key !== null) {
-                $sources[$j + 1]['joinAccess'] = $key + ['indexes' => $indexes];
+                // Resolve the inner access path ONCE here, not per outer row: the
+                // column, the rowid-vs-index decision, the chosen index and a
+                // single reusable IndexBTree are all invariant across outer rows
+                // — only the probe value changes (see joinSeek()).
+                $access = $key + ['indexes' => $indexes];
+                $pos = $key['pos'];
+                if ($pos === $src['info']->rowidAlias) {
+                    $access['seek'] = 'rowid';
+                } else {
+                    $index = $this->indexLeading($indexes, $pos);
+                    if ($index !== null) {
+                        $access['seek'] = 'index';
+                        $access['index'] = $index;
+                        $access['idx'] = new \YetiDevWorks\YetiSQL\Engine\IndexBTree(
+                            $this->db->pager(),
+                            $index->rootPage,
+                            $index->collations,
+                        );
+                        $access['coll'] = $index->collations[0] ?? 'BINARY';
+                    } else {
+                        $access['seek'] = 'scan';
+                    }
+                }
+                $sources[$j + 1]['joinAccess'] = $access;
                 continue;
             }
             $hashKey = $this->joinHashKey($join, $src['alias'], $src['info']);
@@ -798,10 +839,12 @@ final class Executor
             if ($key === null) {
                 $scan = [];
             } else {
-                $plan = $this->makeComparisonPlan($acc['pos'], '=', $key, $src['info'], $acc['indexes']);
-                $scan = $plan !== null
-                    ? $this->joinSeekRows($src['tree'], $plan)
-                    : $src['tree']->scan();
+                $scan = $this->joinSeek($acc, $key, $src['info'], $src['tree']);
+                if ($scan === null) {
+                    // No usable seek for this value (e.g. a non-integral value
+                    // against a rowid key): full-scan and let joinMatches decide.
+                    $scan = $src['tree']->scan();
+                }
             }
         } elseif (isset($src['hashAccess'])) {
             $acc = $src['hashAccess'];
@@ -2292,8 +2335,18 @@ final class Executor
         if ($plan['kind'] === 'index_eq') {
             /** @var \YetiDevWorks\YetiSQL\Engine\IndexInfo $index */
             $index = $plan['index'];
-            $idx = new \YetiDevWorks\YetiSQL\Engine\IndexBTree($this->db->pager(), $index->rootPage, $index->collations);
             $coll = $index->collations[0] ?? 'BINARY';
+            // Correlated single-value probe: once the same subquery has been run
+            // enough times to amortize it, materialize the inner table grouped by
+            // the indexed column into a persistent hash map and serve O(1)
+            // lookups, instead of re-descending the index b-tree per outer row.
+            if ($eval->outerEnv !== null && \count($plan['values']) === 1) {
+                $mapped = $this->tryCorrelatedCountMap($select, $info, $index->leadingColumn(), $plan['values'][0], $index);
+                if ($mapped !== null) {
+                    return [[$mapped]];
+                }
+            }
+            $idx = new \YetiDevWorks\YetiSQL\Engine\IndexBTree($this->db->pager(), $index->rootPage, $index->collations);
             $probes = $this->uniqueValues($plan['values'], $coll);
             $key = $this->coveredCountCacheKey($index->rootPage, 'index_eq', \array_map([$this, 'valueKey'], $probes));
             $cached = $this->coveredCountCache[$key] ?? null;
@@ -2364,6 +2417,234 @@ final class Executor
         $count = $tree->countRange($low, $lowInc, $high, $highInc);
         $this->rememberCoveredCount($key, $count);
         return [[$count]];
+    }
+
+    /**
+     * Fast path for COUNT(*) over a single inner equi-join:
+     *
+     *   SELECT COUNT(*) FROM outer o JOIN inner i ON i.k = <outer expr>
+     *   WHERE <outer-only predicate>
+     *
+     * The generic join path materializes every matching inner row and builds a
+     * joined RowEnv just to increment COUNT(*). Here we scan only the qualifying
+     * outer rows, then use the inner rowid/index subtree counts to add the number
+     * of matching inner rows without fetching their payloads.
+     *
+     * @param list<array{name:string,expr:?Expr,star:bool,tableStar:?string}> $outputCols
+     * @param array<int,Expr> $aggregateNodes
+     * @return list<list<int>>|null
+     */
+    private function tryJoinCoveredCount(SelectStatement $select, array $outputCols, array $aggregateNodes, Evaluator $eval): ?array
+    {
+        if ($select->having !== null
+            || $select->distinct
+            || $select->from === null
+            || \count($select->joins) !== 1
+            || \count($outputCols) !== 1
+            || \count($aggregateNodes) !== 1) {
+            return null;
+        }
+
+        $expr = $outputCols[0]['expr'];
+        if ($expr === null || $expr->kind !== Expr::FUNC || \strtolower((string) $expr->name) !== 'count' || !$expr->star || $expr->distinct) {
+            return null;
+        }
+        $node = \reset($aggregateNodes);
+        if (!$node instanceof Expr || $node !== $expr) {
+            return null;
+        }
+
+        $join = $select->joins[0];
+        if ($join->type !== JoinClause::INNER
+            || $join->natural
+            || $join->using !== []
+            || $join->on === null
+            || \count($this->splitAnd($join->on)) !== 1
+            || $select->from->subquery !== null
+            || $select->from->func !== null
+            || $join->table->subquery !== null
+            || $join->table->func !== null
+            || $select->from->name === null
+            || $join->table->name === null) {
+            return null;
+        }
+
+        $outerInfo = $this->db->schema()->getTable($select->from->name);
+        $innerInfo = $this->db->schema()->getTable($join->table->name);
+        if ($outerInfo === null || $innerInfo === null) {
+            return null;
+        }
+        $outerAlias = $select->from->effectiveName();
+        $innerAlias = $join->table->effectiveName();
+        if ($select->where !== null && $this->exprReferencesTable($select->where, $innerAlias, $innerInfo)) {
+            return null;
+        }
+
+        $cacheKey = $this->coveredCountCacheKey($outerInfo->rootPage, 'join_count', [
+            (string) $innerInfo->rootPage,
+            $this->selectSignature($select),
+        ]);
+        $cached = $this->coveredCountCache[$cacheKey] ?? null;
+        if ($cached !== null) {
+            return [[$cached]];
+        }
+
+        $innerIndexes = $this->db->schema()->resolvedIndexes($innerInfo->name);
+        $access = $this->joinAccessKey($join, $innerAlias, $innerInfo, $innerIndexes);
+        if ($access === null) {
+            return null;
+        }
+
+        $innerPos = $access['pos'];
+        $innerIndex = $innerPos === $innerInfo->rowidAlias ? null : $this->indexLeading($innerIndexes, $innerPos);
+        if ($innerPos !== $innerInfo->rowidAlias && $innerIndex === null) {
+            return null;
+        }
+
+        $outerTree = new TableBTree($this->db->pager(), $outerInfo->rootPage);
+        $innerTree = new TableBTree($this->db->pager(), $innerInfo->rootPage);
+        $innerIdx = $innerIndex !== null
+            ? new \YetiDevWorks\YetiSQL\Engine\IndexBTree($this->db->pager(), $innerIndex->rootPage, $innerIndex->collations)
+            : null;
+        $innerColl = $innerIndex?->collations[0] ?? 'BINARY';
+        // Use the inner index count-map only when it's already cached (free), or
+        // lazily build it once the outer side has driven enough probes to
+        // amortize the full inner-index walk. With few outer rows over a large
+        // inner table (e.g. 100 outer × 20k inner), per-outer countLeadingRange
+        // seeks are far cheaper than walking the whole index to build the map.
+        $mapEligible = $innerIndex !== null && \strcasecmp($innerColl, 'BINARY') === 0;
+        $innerCountMap = $mapEligible ? $this->cachedIndexLeadingCountMap($innerIndex) : null;
+        $innerRows = $innerTree->countRange();
+        // Small inner: build the shared count-map eagerly (cheap, cached, and
+        // reused by correlated subqueries / re-runs). Large inner: leave it null
+        // and seek per outer row, building only if enough rows probe (below).
+        if ($mapEligible && $innerCountMap === null && $innerRows <= self::COUNT_MAP_EAGER_MAX) {
+            $innerCountMap = $this->indexLeadingCountMap($innerIndex);
+        }
+        $seeks = 0;
+        $mapThreshold = \max(16, \intdiv($innerRows, 8));
+
+        $plan = $select->where !== null ? $this->bestPlan($select->where, $outerAlias, $outerInfo, $eval) : null;
+        $whereCovered = $plan !== null && ($plan['coveredAll'] ?? false);
+        $cWhere = $eval->compiledWhere;
+        $count = 0;
+        $countMatches = function (mixed $key) use ($innerInfo, $innerPos, $innerTree, $innerIdx, &$innerCountMap, $innerColl, $innerIndex, $mapEligible, $mapThreshold, &$seeks): int {
+            $key = $this->affine($innerInfo, $innerPos, $key);
+            if ($key === null) {
+                return 0;
+            }
+            if ($innerPos === $innerInfo->rowidAlias) {
+                if (!\is_int($key) && !(\is_float($key) && (float) (int) $key === $key)) {
+                    return 0;
+                }
+                return $innerTree->countRange((int) $key, true, (int) $key, true);
+            }
+            if ($innerCountMap !== null) {
+                return $innerCountMap[$this->comparisonKey($key)] ?? 0;
+            }
+            // Past the threshold, materialize the map once and switch to it;
+            // below it, a per-outer index seek is cheaper than the full walk.
+            if ($mapEligible && ++$seeks > $mapThreshold) {
+                $innerCountMap = $this->indexLeadingCountMap($innerIndex);
+                return $innerCountMap[$this->comparisonKey($key)] ?? 0;
+            }
+            return $innerIdx->countLeadingRange($key, true, $key, true, $innerColl);
+        };
+
+        $outerKeyPos = $this->colPositionOf($access['keyExpr'], $outerAlias, $outerInfo);
+        if (($select->where === null || $whereCovered)
+            && $outerKeyPos === $outerInfo->rowidAlias
+            && ($plan === null || \in_array($plan['kind'], ['rowid_eq', 'rowid_range'], true))) {
+            foreach ($this->coveredOuterRowids($outerTree, $plan) as $rowid) {
+                $count += $countMatches($rowid);
+            }
+            $this->rememberCoveredCount($cacheKey, $count);
+            return [[$count]];
+        }
+
+        foreach ($this->scanByPlan($outerTree, $plan) as [$rowid, $payload, $covered]) {
+            $env = null;
+            if ($select->where !== null && !$whereCovered) {
+                $payload ??= $outerTree->get($rowid);
+                if ($payload === null) {
+                    continue;
+                }
+                $env = new RowEnv();
+                $env->addLazyFrame($outerAlias, $outerInfo, $payload, $rowid);
+                $v = $cWhere !== null ? $cWhere($env, $eval) : $eval->evaluate($select->where, $env);
+                if ($v === null || !Value::isTrue($v)) {
+                    continue;
+                }
+            }
+
+            $key = $this->fastJoinOuterKey($access['keyExpr'], $outerAlias, $outerInfo, $outerTree, $rowid, $payload, $covered, $env, $eval);
+            $count += $countMatches($key);
+        }
+
+        $this->rememberCoveredCount($cacheKey, $count);
+        return [[$count]];
+    }
+
+    /** @param array<string,mixed>|null $plan */
+    private function coveredOuterRowids(TableBTree $tree, ?array $plan): \Generator
+    {
+        if ($plan === null) {
+            yield from $tree->scanRowids();
+            return;
+        }
+        if ($plan['kind'] === 'rowid_eq') {
+            $seen = [];
+            foreach ($plan['values'] as $v) {
+                $rid = (int) Value::toNumber($v);
+                if (isset($seen[$rid])) {
+                    continue;
+                }
+                $seen[$rid] = true;
+                if ($tree->countRange($rid, true, $rid, true) !== 0) {
+                    yield $rid;
+                }
+            }
+            return;
+        }
+
+        $low = $plan['low'] !== null ? (int) Value::toNumber($plan['low']) : null;
+        $high = $plan['high'] !== null ? (int) Value::toNumber($plan['high']) : null;
+        foreach ($tree->scanRowids($low) as $rid) {
+            if ($low !== null && !$plan['lowInc'] && $rid <= $low) {
+                continue;
+            }
+            if ($high !== null && ($rid > $high || (!$plan['highInc'] && $rid === $high))) {
+                break;
+            }
+            yield $rid;
+        }
+    }
+
+    /**
+     * @param array<int,null|int|float|string|Blob> $covered
+     */
+    private function fastJoinOuterKey(Expr $expr, string $outerAlias, TableInfo $outerInfo, TableBTree $outerTree, int $rowid, ?string $payload, array $covered, ?RowEnv $env, Evaluator $eval): null|int|float|string|Blob
+    {
+        $pos = $this->colPositionOf($expr, $outerAlias, $outerInfo);
+        if ($pos !== null) {
+            if ($pos === $outerInfo->rowidAlias) {
+                return $rowid;
+            }
+            if (\array_key_exists($pos, $covered)) {
+                return $covered[$pos];
+            }
+            $payload ??= $outerTree->get($rowid);
+            return $payload !== null ? RecordCodec::decodeColumn($payload, $pos) : null;
+        }
+        $env ??= new RowEnv();
+        if ($env->frames === []) {
+            $payload ??= $outerTree->get($rowid);
+            if ($payload === null) {
+                return null;
+            }
+            $env->addLazyFrame($outerAlias, $outerInfo, $payload, $rowid);
+        }
+        return $eval->evaluate($expr, $env);
     }
 
     /** @param array<string,mixed> $plan */
@@ -2559,6 +2840,57 @@ final class Executor
         return $parts;
     }
 
+    /**
+     * Indexed correlated COUNT(*): serve from a persistent inner-table count map
+     * instead of an index descent per outer row — but only once the same
+     * subquery has been probed often enough to amortize building the map (~one
+     * full inner scan). Below that threshold we return null and the caller keeps
+     * the cheap per-probe covered-index count, so a query with only a handful of
+     * outer rows never pays to materialize the whole inner table.
+     */
+    private function tryCorrelatedCountMap(SelectStatement $select, TableInfo $info, int $pos, null|int|float|string|Blob $value, ?\YetiDevWorks\YetiSQL\Engine\IndexInfo $index = null): ?int
+    {
+        $indexMapEligible = $index !== null && \strcasecmp($index->collations[0] ?? 'BINARY', 'BINARY') === 0;
+
+        // If the index count-map is already built (e.g. a high-cardinality run or
+        // a join primed it), reuse it for free regardless of this query's probe count.
+        if ($indexMapEligible) {
+            $cachedMap = $this->cachedIndexLeadingCountMap($index);
+            if ($cachedMap !== null) {
+                $value = $this->joinHashValue($info, $pos, $value);
+                return $value === null ? 0 : ($cachedMap[$this->comparisonKey($value)] ?? 0);
+            }
+        }
+
+        $id = \spl_object_id($select);
+        if (!isset($this->correlatedCountCache[$id])) {
+            // Row count measured ONCE per subquery and cached (never per probe).
+            $rows = $this->correlatedMapRows[$id]
+                ??= (new TableBTree($this->db->pager(), $info->rootPage))->countRange();
+            // Building the map costs ~one full inner walk; a per-probe index/rowid
+            // count costs ~O(depth). For a small inner table the one-time build is
+            // cheap and the map is cached + shared (across joins and re-runs), so
+            // build eagerly. For a large inner table, only materialize once enough
+            // outer rows have probed to justify walking the whole table — until
+            // then a per-probe count is far cheaper than the full build.
+            if ($rows > self::COUNT_MAP_EAGER_MAX) {
+                $probes = ($this->correlatedProbeCounts[$id] ?? 0) + 1;
+                $this->correlatedProbeCounts[$id] = $probes;
+                if ($probes < \max(16, \intdiv($rows, 8))) {
+                    return null;
+                }
+            }
+        }
+        if ($indexMapEligible) {
+            $value = $this->joinHashValue($info, $pos, $value);
+            if ($value === null) {
+                return 0;
+            }
+            return $this->indexLeadingCountMap($index)[$this->comparisonKey($value)] ?? 0;
+        }
+        return $this->tryCachedCorrelatedCount($select, $info, $pos, $value);
+    }
+
     private function tryCachedCorrelatedCount(SelectStatement $select, TableInfo $info, int $pos, null|int|float|string|Blob $value): ?int
     {
         if ($this->db->inTransaction()) {
@@ -2593,6 +2925,8 @@ final class Executor
             ];
             if (\count($this->correlatedCountCache) >= self::SELECT_META_MAX) {
                 $this->correlatedCountCache = [];
+                $this->correlatedProbeCounts = [];
+                $this->correlatedMapRows = [];
             }
             $this->correlatedCountCache[$cacheId] = $cached;
         }
@@ -2618,6 +2952,52 @@ final class Executor
             $counts[$key] = ($counts[$key] ?? 0) + 1;
         }
         return $counts;
+    }
+
+    /**
+     * Return the index leading-value count map only if it is already cached and
+     * still valid — never builds it. Lets a caller prefer a cheap per-row seek
+     * when materializing the whole map would not pay off.
+     *
+     * @return array<string,int>|null
+     */
+    private function cachedIndexLeadingCountMap(\YetiDevWorks\YetiSQL\Engine\IndexInfo $index): ?array
+    {
+        $cached = $this->indexCountMapCache[$index->rootPage] ?? null;
+        if ($cached !== null
+            && $cached['cookie'] === $this->db->pager()->schemaCookie()
+            && $cached['changes'] === $this->db->totalChanges()) {
+            return $cached['map'];
+        }
+        return null;
+    }
+
+    /** @return array<string,int> */
+    private function indexLeadingCountMap(\YetiDevWorks\YetiSQL\Engine\IndexInfo $index): array
+    {
+        $cached = $this->cachedIndexLeadingCountMap($index);
+        if ($cached !== null) {
+            return $cached;
+        }
+
+        $map = [];
+        $idx = new \YetiDevWorks\YetiSQL\Engine\IndexBTree($this->db->pager(), $index->rootPage, $index->collations);
+        foreach ($idx->leadingValues() as $value) {
+            if ($value === null) {
+                continue;
+            }
+            $k = $this->comparisonKey($value);
+            $map[$k] = ($map[$k] ?? 0) + 1;
+        }
+        if (\count($this->indexCountMapCache) >= self::SELECT_META_MAX) {
+            $this->indexCountMapCache = [];
+        }
+        $this->indexCountMapCache[$index->rootPage] = [
+            'cookie' => $this->db->pager()->schemaCookie(),
+            'changes' => $this->db->totalChanges(),
+            'map' => $map,
+        ];
+        return $map;
     }
 
     /** @return array<string,mixed>|null */
@@ -3472,6 +3852,9 @@ final class Executor
         $best = null;
         $bestUsed = 1; // require strictly more than a single leading column
         foreach ($indexes as $index) {
+            if ($index->partialWhere !== null) {
+                continue; // partial indexes are not used for query planning
+            }
             $cols = $index->columnPositions;
             $prefix = [];
             $i = 0;
@@ -3808,22 +4191,58 @@ final class Executor
     }
 
     /**
-     * Yield [rowid, payload] for an index/rowid equality plan, materializing the
-     * row payload for index-located rows (joins read inner columns immediately).
+     * Seek the inner rows whose join column equals $value for one outer row,
+     * using the access path resolved once in iterateJoined() ($acc['seek']).
+     * Returns an iterable of [rowid, payload], or null when there is no usable
+     * seek for this value (the caller then full-scans + filters via joinMatches).
      *
-     * @param array<string,mixed> $plan
+     * @param array<string,mixed> $acc
+     * @return iterable<array{0:int,1:string}>|null
+     */
+    private function joinSeek(array $acc, mixed $value, TableInfo $info, TableBTree $tree): ?iterable
+    {
+        $value = $this->affine($info, $acc['pos'], $value);
+        if ($value === null) {
+            return null; // NULL never equi-joins; scan yields nothing matching
+        }
+
+        if ($acc['seek'] === 'rowid') {
+            if (!\is_int($value) && !(\is_float($value) && (float) (int) $value === $value)) {
+                return null; // non-integral rowid value: let the caller scan
+            }
+            $rid = (int) $value;
+            $payload = $tree->get($rid);
+            return $payload === null ? [] : [[$rid, $payload]];
+        }
+
+        if ($acc['seek'] === 'index') {
+            return $this->joinSeekIndex($acc, $value, $tree);
+        }
+
+        return null;
+    }
+
+    /**
+     * Index equality seek for one probe value, reusing the IndexBTree built once
+     * per query in iterateJoined(). Index keys are [col, …, rowid] and unique,
+     * so a single leading value yields each matching rowid exactly once.
+     *
+     * @param array<string,mixed> $acc
      * @return \Generator<int,array{0:int,1:string}>
      */
-    private function joinSeekRows(TableBTree $tree, array $plan): \Generator
+    private function joinSeekIndex(array $acc, null|int|float|string|Blob $value, TableBTree $tree): \Generator
     {
-        foreach ($this->scanByPlan($tree, $plan) as [$rid, $payload]) {
-            if ($payload === null) {
-                $payload = $tree->get($rid);
-                if ($payload === null) {
-                    continue;
-                }
+        $idx = $acc['idx'];
+        $coll = $acc['coll'];
+        foreach ($idx->scanFrom([$value]) as $key) {
+            if (Value::compare($key[0], $value, $coll) !== 0) {
+                break;
             }
-            yield [$rid, $payload];
+            $rid = (int) $key[\count($key) - 1];
+            $payload = $tree->get($rid);
+            if ($payload !== null) {
+                yield [$rid, $payload];
+            }
         }
     }
 
@@ -3955,6 +4374,12 @@ final class Executor
     private function indexLeading(array $indexes, int $pos): ?\YetiDevWorks\YetiSQL\Engine\IndexInfo
     {
         foreach ($indexes as $index) {
+            // Partial indexes only contain rows matching their predicate, so the
+            // planner must not use them to answer a query that could match rows
+            // outside it (correctness over speed — they stay for enforcement).
+            if ($index->partialWhere !== null) {
+                continue;
+            }
             if ($index->leadingColumn() === $pos) {
                 return $index;
             }
@@ -4060,6 +4485,9 @@ final class Executor
     private function insertIndexEntries(TableInfo $info, int $rowid, array $logicalValues): void
     {
         foreach ($this->db->schema()->resolvedIndexes($info->name) as $index) {
+            if (!$this->rowMatchesPartial($info, $index, $logicalValues, $rowid)) {
+                continue; // row outside a partial index's predicate is not stored
+            }
             $this->indexTree($index)->put($this->indexKey($index, $logicalValues, $rowid));
         }
     }
@@ -4068,6 +4496,9 @@ final class Executor
     private function deleteIndexEntries(TableInfo $info, int $rowid, array $logicalValues): void
     {
         foreach ($this->db->schema()->resolvedIndexes($info->name) as $index) {
+            if (!$this->rowMatchesPartial($info, $index, $logicalValues, $rowid)) {
+                continue; // never stored, nothing to remove
+            }
             $this->indexTree($index)->delete($this->indexKey($index, $logicalValues, $rowid));
         }
     }
@@ -4083,6 +4514,18 @@ final class Executor
     {
         $rowidChanged = $oldRowid !== $newRowid;
         foreach ($this->db->schema()->resolvedIndexes($info->name) as $index) {
+            if ($index->partialWhere !== null) {
+                // The row may cross the predicate boundary, so always re-evaluate
+                // membership on both sides rather than relying on key-column change.
+                $tree = $this->indexTree($index);
+                if ($this->rowMatchesPartial($info, $index, $oldValues, $oldRowid)) {
+                    $tree->delete($this->indexKey($index, $oldValues, $oldRowid));
+                }
+                if ($this->rowMatchesPartial($info, $index, $newValues, $newRowid)) {
+                    $tree->put($this->indexKey($index, $newValues, $newRowid));
+                }
+                continue;
+            }
             $touched = $rowidChanged;
             if (!$touched) {
                 foreach ($index->columnPositions as $p) {
@@ -4104,6 +4547,24 @@ final class Executor
     private function indexTree(\YetiDevWorks\YetiSQL\Engine\IndexInfo $index): \YetiDevWorks\YetiSQL\Engine\IndexBTree
     {
         return new \YetiDevWorks\YetiSQL\Engine\IndexBTree($this->db->pager(), $index->rootPage, $index->collations);
+    }
+
+    /**
+     * Whether a row belongs in a (possibly partial) index: always true for a
+     * full index; for a partial index, true only when its WHERE predicate holds
+     * for the row. NULL/false predicate results mean the row is excluded.
+     *
+     * @param list<null|int|float|string|Blob> $logical
+     */
+    private function rowMatchesPartial(TableInfo $info, \YetiDevWorks\YetiSQL\Engine\IndexInfo $index, array $logical, int $rowid): bool
+    {
+        if ($index->partialWhere === null) {
+            return true;
+        }
+        $env = new RowEnv();
+        $env->addFrame($info->name, $info, $logical, $rowid);
+        $v = (new Evaluator($this, []))->evaluate($index->partialWhere, $env);
+        return $v !== null && Value::isTrue($v);
     }
 
     /**
@@ -4359,6 +4820,16 @@ final class Executor
             $this->fireTriggers($info, CreateTriggerStatement::INSERT, CreateTriggerStatement::BEFORE, null, $logical, $rowid, $rowid);
         }
 
+        if ($info->checks !== []) {
+            $violation = $this->checkRowViolation($info, $logical, $rowid, $eval);
+            if ($violation !== null) {
+                if ($stmt->orIgnore) {
+                    return $this->db->lastInsertId();
+                }
+                throw SqlException::constraint($this->checkFailureMessage($violation));
+            }
+        }
+
         $uniqueIndexes = [];
         foreach ($this->db->schema()->resolvedIndexes($info->name) as $index) {
             if ($index->unique) {
@@ -4391,6 +4862,11 @@ final class Executor
                 $conflicts[] = ['rowid' => $rowid, 'label' => $this->rowidConflictLabel($info)];
             }
             foreach ($uniqueIndexes as $index) {
+                // A partial unique index only constrains rows matching its
+                // predicate; a new row outside it is never stored, so no conflict.
+                if (!$this->rowMatchesPartial($info, $index, $logical, $rowid)) {
+                    continue;
+                }
                 $rid = $this->uniqueConflictRowid($index, $logical, null);
                 if ($rid !== null) {
                     $conflicts[] = ['rowid' => $rid, 'label' => $this->uniqueIndexLabel($info, $index)];
@@ -4505,6 +4981,16 @@ final class Executor
                 $this->fireTriggers($info, CreateTriggerStatement::UPDATE, CreateTriggerStatement::BEFORE, $values, $newValues, $rowid, $newRowid, $changed);
             }
 
+            if ($info->checks !== []) {
+                $violation = $this->checkRowViolation($info, $newValues, $newRowid, $eval);
+                if ($violation !== null) {
+                    if ($stmt->orIgnore) {
+                        continue; // leave this row unchanged
+                    }
+                    throw SqlException::constraint($this->checkFailureMessage($violation));
+                }
+            }
+
             // Enforce UNIQUE / PRIMARY KEY against other rows (the row's own old
             // key is excluded). Honour UPDATE OR REPLACE / OR IGNORE.
             $conflicts = [];
@@ -4513,6 +4999,17 @@ final class Executor
             }
             foreach ($this->db->schema()->resolvedIndexes($info->name) as $index) {
                 if (!$index->unique) {
+                    continue;
+                }
+                if ($index->partialWhere !== null) {
+                    // Only a new row inside the predicate is stored, hence can conflict.
+                    if (!$this->rowMatchesPartial($info, $index, $newValues, $newRowid)) {
+                        continue;
+                    }
+                    $rid = $this->uniqueConflictRowid($index, $newValues, $rowid);
+                    if ($rid !== null) {
+                        $conflicts[] = ['rowid' => $rid, 'label' => $this->uniqueIndexLabel($info, $index)];
+                    }
                     continue;
                 }
                 $touched = $newRowid !== $rowid;
@@ -4873,6 +5370,34 @@ final class Executor
      *
      * @param list<null|int|float|string|Blob> $logical full child row vector
      */
+    /**
+     * Evaluate the table's CHECK constraints against a row's logical values.
+     * Returns the first violated constraint, or null when all pass — NULL and
+     * true both satisfy a CHECK (only an explicit false fails), per SQLite.
+     *
+     * @param list<null|int|float|string|Blob> $logical
+     */
+    private function checkRowViolation(TableInfo $info, array $logical, int $rowid, Evaluator $eval): ?CheckConstraint
+    {
+        if ($info->checks === []) {
+            return null;
+        }
+        $env = new RowEnv();
+        $env->addFrame($info->name, $info, $logical, $rowid);
+        foreach ($info->checks as $check) {
+            $v = $eval->evaluate($check->expr, $env);
+            if ($v !== null && !Value::isTrue($v)) {
+                return $check;
+            }
+        }
+        return null;
+    }
+
+    private function checkFailureMessage(CheckConstraint $check): string
+    {
+        return 'CHECK constraint failed: ' . ($check->name ?? $check->sql);
+    }
+
     private function fkCheckChildRow(TableInfo $childInfo, array $logical): void
     {
         foreach ($this->fkChildCheckPlan($childInfo) as $plan) {
@@ -5314,12 +5839,16 @@ final class Executor
         $keys = [];
         foreach ($tree->scan() as [$rowid, $payload]) {
             $logical = $this->decodeRow($info, $rowid, $payload);
+            if (!$this->rowMatchesPartial($info, $index, $logical, $rowid)) {
+                continue; // partial index: skip rows outside the predicate
+            }
             $keys[] = $this->indexKey($index, $logical, $rowid);
         }
         \usort($keys, fn (array $a, array $b): int => $this->compareIndexKeys($a, $b, $index->collations));
-        foreach ($keys as $key) {
-            $idx->put($key);
-        }
+        // Bulk bottom-up build from the sorted keys: one linear pass instead of
+        // a per-key descent+split (compareIndexKeys matches IndexBTree's own key
+        // order, so the input is already in the order bulkLoad expects).
+        $idx->bulkLoad($keys);
     }
 
     private function execCreateView(CreateViewStatement $stmt): Result
@@ -5634,6 +6163,14 @@ final class Executor
             throw SqlException::constraint("index {$stmt->name} already exists");
         }
         $info = $this->requireTable($stmt->table);
+        // Expression indexes (e.g. CREATE INDEX i ON t(lower(x))) are parsed but
+        // never planned or maintained, so reject them rather than create a dead
+        // index that silently accelerates nothing.
+        foreach ($stmt->columns as $term) {
+            if ($term->expr->kind !== Expr::COL) {
+                throw new SqlException('expression indexes are not supported');
+            }
+        }
         $this->createIndexFromStatement($stmt, $info);
         return Result::affected(0);
     }
@@ -5812,7 +6349,8 @@ final class Executor
         $rows = [];
         $seq = 0;
         foreach ($this->db->schema()->indexesForTable($tableName) as $idx) {
-            $rows[] = [$seq++, $idx['name'], $idx['ast']->unique ? 1 : 0, 'c', 0];
+            $partial = $idx['ast']->where !== null ? 1 : 0;
+            $rows[] = [$seq++, $idx['name'], $idx['ast']->unique ? 1 : 0, 'c', $partial];
         }
         return new Result(['seq', 'name', 'unique', 'origin', 'partial'], $rows, \count($rows));
     }

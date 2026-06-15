@@ -36,12 +36,59 @@ final class BTreePage
     public int $type;
     public int $rightChild = 0;
     public int $subtreeCount = 0;
-    /** @var list<string> raw cell byte-strings, in key order */
+    /**
+     * Raw cell byte-strings, in key order.
+     *
+     * READ this freely; do NOT mutate it directly. All inserts/removes/replaces
+     * must go through appendCell()/insertCell()/removeCell()/replaceCell()/
+     * setCells() so $contentBytes (the running cell-byte sum behind the O(1)
+     * spaceUsed()/fits() hot path) stays in sync.
+     *
+     * @var list<string>
+     */
     public array $cells = [];
+
+    /** Running sum of strlen() over $cells, maintained by the mutators. */
+    private int $contentBytes = 0;
 
     public function __construct(int $type)
     {
         $this->type = $type;
+    }
+
+    public function appendCell(string $cell): void
+    {
+        $this->cells[] = $cell;
+        $this->contentBytes += \strlen($cell);
+    }
+
+    public function insertCell(int $index, string $cell): void
+    {
+        \array_splice($this->cells, $index, 0, [$cell]);
+        $this->contentBytes += \strlen($cell);
+    }
+
+    public function removeCell(int $index): void
+    {
+        $this->contentBytes -= \strlen($this->cells[$index]);
+        \array_splice($this->cells, $index, 1);
+    }
+
+    public function replaceCell(int $index, string $cell): void
+    {
+        $this->contentBytes += \strlen($cell) - \strlen($this->cells[$index]);
+        $this->cells[$index] = $cell;
+    }
+
+    /** Replace the whole cell list, recomputing the byte sum once. */
+    public function setCells(array $cells): void
+    {
+        $this->cells = $cells;
+        $bytes = 0;
+        foreach ($cells as $c) {
+            $bytes += \strlen($c);
+        }
+        $this->contentBytes = $bytes;
     }
 
     public function isLeaf(): bool
@@ -76,7 +123,9 @@ final class BTreePage
             $ptr = \unpack('n', \substr($buf, self::HEADER + $i * 2, 2));
             $off = $ptr[1];
             $len = self::cellLength($buf, $off, $type, $pageSize);
-            $page->cells[] = \substr($buf, $off, $len);
+            $cell = \substr($buf, $off, $len);
+            $page->cells[] = $cell;
+            $page->contentBytes += $len;
         }
         return $page;
     }
@@ -119,14 +168,16 @@ final class BTreePage
         return $pageSize - self::HEADER;
     }
 
-    /** Total space this page's contents would occupy (pointer array + cells). */
+    /**
+     * Total space this page's contents would occupy (pointer array + cells).
+     *
+     * O(1): $contentBytes is the running cell-byte sum kept current by the
+     * mutators, and \count() is constant-time, so this stays cheap to call once
+     * per insert (it used to re-scan every cell, making leaf fills O(n^2)).
+     */
     public function spaceUsed(): int
     {
-        $total = \count($this->cells) * 2;
-        foreach ($this->cells as $c) {
-            $total += \strlen($c);
-        }
-        return $total;
+        return $this->contentBytes + \count($this->cells) * 2;
     }
 
     public function fits(int $pageSize): bool

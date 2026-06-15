@@ -25,6 +25,8 @@ final class ColumnDef
         public bool $generatedStored = false,
         /** Column-level REFERENCES clause captured as a single-column ForeignKey, or null. */
         public ?ForeignKey $reference = null,
+        /** @var list<CheckConstraint> column-level CHECK constraints */
+        public array $checks = [],
     ) {
     }
 }

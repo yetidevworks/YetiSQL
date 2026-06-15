@@ -247,6 +247,41 @@ WAL replaces two fsyncs + journal create/delete per commit with one fsync and a
 sequential append, so the win scales with the number of commits (a single big
 transaction commits once and sees no difference; in-memory never touches disk).
 
+**vs MySQL / MariaDB** (`benchmarks/bench_mysql.php`, both durable: YetiSQL
+file-backed with a rollback journal, MariaDB 12.2 over the local socket with
+InnoDB's default per-commit fsync; 5000 rows, PHP 8.3):
+
+```
+workload                          MariaDB  YetiSQL(file)  Yeti/MySQL
+------------------------------------------------------------------------------
+bulk insert (1 txn)               94.2 ms       124.8 ms        1.3x
+create 3 indexes                 149.6 ms       232.8 ms        1.6x
+PK lookups (×2000)                38.8 ms        52.0 ms        1.3x
+city COUNT (×200, ~20% rows)      18.1 ms        12.3 ms        0.7x
+range query (×200)                13.7 ms         5.2 ms        0.4x
+group-by aggregate (×50)          52.9 ms        24.9 ms        0.5x
+PK updates (×1000, 1 txn)         16.7 ms        43.3 ms        2.6x
+join users⋈posts (×3, ≤100)       0.3 ms        12.7 ms       38.5x
+correlated subquery (≤100)         0.1 ms         2.3 ms       18.1x
+```
+
+```bash
+php benchmarks/bench_mysql.php [rows]    # default 5000
+```
+
+This is apples-to-oranges by design, and that's the point: YetiSQL runs
+**in-process** while MariaDB is a **client-server** engine, so every statement
+crosses a socket to a separate process. That round-trip is exactly what an
+embedded database exists to avoid, so for repeated scans and aggregates YetiSQL
+is *faster* here (`Yeti/MySQL < 1`) despite being pure PHP — those columns fire
+hundreds of separate queries and MariaDB pays IPC on each, while YetiSQL's
+covered counts answer them without leaving the process. Bulk insert and point
+lookups land close (~1.3×). The real gaps are per-row `UPDATE` (~2.6×) and tiny
+joins / correlated subqueries — but those are 0.1–0.3 ms on MariaDB, so the
+large *ratio* is sub-millisecond *absolute* time. The takeaway isn't "faster
+than MySQL"; it's that a zero-dependency pure-PHP engine stays in the same league
+on real workloads where avoiding the client-server boundary counts.
+
 Hot-path optimisations already in place: an LRU page cache, a parsed-page cache
 (so repeated reads skip re-decoding), single-pass page encoding, binary-search
 rowid lookups, lazy/early-stop index scans, multi-column index prefix seeks,

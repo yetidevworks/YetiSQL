@@ -19,6 +19,8 @@ final class CreateTableStatement implements Statement
         public array $uniqueConstraints = [],
         /** @var list<ForeignKey> FOREIGN KEY constraints (column- and table-level) */
         public array $foreignKeys = [],
+        /** @var list<CheckConstraint> CHECK constraints (column- and table-level) */
+        public array $checks = [],
         /** The original CREATE SQL text, stored verbatim in the schema. */
         public string $sql = '',
     ) {

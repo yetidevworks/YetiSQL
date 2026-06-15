@@ -131,6 +131,12 @@ final class TableBTree
         yield from $this->scanPage($this->rootPage, $from);
     }
 
+    /** @return Generator<int,int> */
+    public function scanRowids(?int $from = null): Generator
+    {
+        yield from $this->scanRowidPage($this->rootPage, $from);
+    }
+
     public function countRange(?int $low = null, bool $lowInc = true, ?int $high = null, bool $highInc = true): int
     {
         return $this->countPage($this->rootPage, $low, $lowInc, $high, $highInc);
@@ -159,6 +165,28 @@ final class TableBTree
             }
         }
         yield from $this->scanPage($page->rightChild, $from);
+    }
+
+    /** @return Generator<int,int> */
+    private function scanRowidPage(int $pageNo, ?int $from): Generator
+    {
+        $page = $this->pager->readPage($pageNo);
+        if ($page->isLeaf()) {
+            foreach ($page->cells as $cell) {
+                $rid = $this->parseLeafCell($cell)[0];
+                if ($from === null || $rid >= $from) {
+                    yield $rid;
+                }
+            }
+            return;
+        }
+        foreach ($page->cells as $cell) {
+            [$child, $sep] = $this->parseInteriorCell($cell);
+            if ($from === null || $from <= $sep) {
+                yield from $this->scanRowidPage($child, $from);
+            }
+        }
+        yield from $this->scanRowidPage($page->rightChild, $from);
     }
 
     private function countPage(?int $pageNo, ?int $low, bool $lowInc, ?int $high, bool $highInc): int
@@ -339,11 +367,11 @@ final class TableBTree
         // The descended child now holds the lower half; $newRight the upper.
         $newCell = $this->makeInteriorCell($childPage, $sepKey);
         if ($childIndex === -1) {
-            $page->cells[] = $newCell;
+            $page->appendCell($newCell);
             $page->rightChild = $newRight;
         } else {
-            \array_splice($page->cells, $childIndex, 0, [$newCell]);
-            $page->cells[$childIndex + 1] = $this->makeInteriorCell($newRight, $this->parseInteriorCell($page->cells[$childIndex + 1])[1]);
+            $page->insertCell($childIndex, $newCell);
+            $page->replaceCell($childIndex + 1, $this->makeInteriorCell($newRight, $this->parseInteriorCell($page->cells[$childIndex + 1])[1]));
         }
 
         if ($page->fits($this->pager->pageSize())) {
@@ -362,10 +390,10 @@ final class TableBTree
         $rightCells = \array_slice($page->cells, $mid);
 
         $left = new BTreePage(BTreePage::TABLE_LEAF);
-        $left->cells = $leftCells;
+        $left->setCells($leftCells);
         $this->refreshSubtreeCount($left);
         $right = new BTreePage(BTreePage::TABLE_LEAF);
-        $right->cells = $rightCells;
+        $right->setCells($rightCells);
         $this->refreshSubtreeCount($right);
 
         $newRight = $this->pager->allocatePage();
@@ -389,12 +417,12 @@ final class TableBTree
         $rightCells = \array_slice($page->cells, $mid + 1);
 
         $left = new BTreePage(BTreePage::TABLE_INTERIOR);
-        $left->cells = $leftCells;
+        $left->setCells($leftCells);
         $left->rightChild = $midChild;
         $this->refreshSubtreeCount($left);
 
         $right = new BTreePage(BTreePage::TABLE_INTERIOR);
-        $right->cells = $rightCells;
+        $right->setCells($rightCells);
         $right->rightChild = $page->rightChild;
         $this->refreshSubtreeCount($right);
 
@@ -413,7 +441,7 @@ final class TableBTree
         $this->pager->write($leftNew, $this->pager->read($this->rootPage));
 
         $root = new BTreePage(BTreePage::TABLE_INTERIOR);
-        $root->cells = [$this->makeInteriorCell($leftNew, $sepKey)];
+        $root->setCells([$this->makeInteriorCell($leftNew, $sepKey)]);
         $root->rightChild = $newRight;
         $this->refreshSubtreeCount($root);
         $this->pager->write($this->rootPage, $root->encode($this->pager->pageSize()));
@@ -429,7 +457,7 @@ final class TableBTree
                     if ($plen > BTreePage::maxLocal($this->pager->pageSize())) {
                         $this->freeOverflow($cell, $n1 + $n2);
                     }
-                    \array_splice($page->cells, $i, 1);
+                    $page->removeCell($i);
                     $this->refreshSubtreeCount($page);
                     $this->pager->writePage($pageNo, $page);
                     return true;
@@ -570,7 +598,7 @@ final class TableBTree
     {
         $n = \count($page->cells);
         if ($n === 0) {
-            $page->cells[] = $cell;
+            $page->appendCell($cell);
             return true;
         }
 
@@ -579,11 +607,11 @@ final class TableBTree
         // and avoids scanning the whole page (which made bulk insert O(n^2)).
         $lastRid = $this->parseLeafCell($page->cells[$n - 1])[0];
         if ($rowid > $lastRid) {
-            $page->cells[] = $cell;
+            $page->appendCell($cell);
             return true;
         }
         if ($rowid === $lastRid) {
-            $page->cells[$n - 1] = $cell;
+            $page->replaceCell($n - 1, $cell);
             return false;
         }
 
@@ -594,7 +622,7 @@ final class TableBTree
             $mid = ($lo + $hi) >> 1;
             $rid = $this->parseLeafCell($page->cells[$mid])[0];
             if ($rid === $rowid) {
-                $page->cells[$mid] = $cell; // replace
+                $page->replaceCell($mid, $cell); // replace
                 return false;
             }
             if ($rid < $rowid) {
@@ -604,7 +632,7 @@ final class TableBTree
             }
         }
         // $lo is the first cell with rowid >= $rowid (and != since tail handled).
-        \array_splice($page->cells, $lo, 0, [$cell]);
+        $page->insertCell($lo, $cell);
         return true;
     }
 

@@ -47,6 +47,87 @@ final class IndexBTree
         }
     }
 
+    /**
+     * Build the whole index bottom-up from key records already sorted in
+     * compareKeys() order, writing the finished root into $this->rootPage
+     * (which must currently be the empty leaf created by self::create()).
+     *
+     * This replaces N single-key descents+splits (each re-reading and possibly
+     * splitting a page) with one linear pass that packs leaves near-full and
+     * then assembles interior levels, so CREATE INDEX scales linearly instead
+     * of paying per-row tree maintenance.
+     *
+     * @param list<array<int,null|int|float|string|Blob>> $sortedKeys
+     */
+    public function bulkLoad(array $sortedKeys): void
+    {
+        if ($sortedKeys === []) {
+            return; // root stays the empty leaf
+        }
+
+        $pageSize = $this->pager->pageSize();
+        $usable = BTreePage::usable($pageSize);
+
+        // --- pack the leaf level -----------------------------------------
+        /** @var list<array{0:BTreePage,1:array<int,mixed>}> $level [page, highKey] */
+        $level = [];
+        $leaf = new BTreePage(BTreePage::INDEX_LEAF);
+        $highKey = null;
+        foreach ($sortedKeys as $key) {
+            $cell = $this->makeLeafCell($key);
+            if ($leaf->cells !== [] && $leaf->spaceUsed() + \strlen($cell) + 2 > $usable) {
+                $level[] = [$leaf, $highKey];
+                $leaf = new BTreePage(BTreePage::INDEX_LEAF);
+            }
+            $leaf->appendCell($cell);
+            $highKey = $key;
+        }
+        $level[] = [$leaf, $highKey];
+
+        // --- assemble interior levels until a single root remains --------
+        while (\count($level) > 1) {
+            // Persist this level's pages so the parents can point at them.
+            /** @var list<array{0:int,1:array<int,mixed>}> $children [pageNo, highKey] */
+            $children = [];
+            foreach ($level as [$node, $hk]) {
+                $pageNo = $this->pager->allocatePage();
+                $this->pager->write($pageNo, $node->encode($pageSize));
+                $children[] = [$pageNo, $hk];
+            }
+
+            /** @var list<array{0:BTreePage,1:array<int,mixed>}> $parents */
+            $parents = [];
+            $parent = new BTreePage(BTreePage::INDEX_INTERIOR);
+            $group = []; // children gathered into the current parent
+            foreach ($children as $child) {
+                if ($group !== []) {
+                    // Adding $child turns the previous last child into a
+                    // separator cell; close the parent if that won't fit.
+                    $prev = $group[\count($group) - 1];
+                    $cell = $this->makeInteriorCell($prev[0], $prev[1]);
+                    if ($parent->spaceUsed() + \strlen($cell) + 2 > $usable) {
+                        $last = $group[\count($group) - 1];
+                        $parent->rightChild = $last[0];
+                        $parents[] = [$parent, $last[1]];
+                        $parent = new BTreePage(BTreePage::INDEX_INTERIOR);
+                        $group = [];
+                    } else {
+                        $parent->appendCell($cell);
+                    }
+                }
+                $group[] = $child;
+            }
+            $last = $group[\count($group) - 1];
+            $parent->rightChild = $last[0];
+            $parents[] = [$parent, $last[1]];
+
+            $level = $parents;
+        }
+
+        // The surviving node is the root; write it into the stable root page.
+        $this->pager->write($this->rootPage, $level[0][0]->encode($pageSize));
+    }
+
     /** Remove the entry exactly matching the key record. */
     public function delete(array $key): bool
     {
@@ -54,7 +135,7 @@ final class IndexBTree
         $page = $this->pager->readPage($pageNo);
         foreach ($page->cells as $i => $cell) {
             if ($this->compareKeys($this->cellKey($cell), $key) === 0) {
-                \array_splice($page->cells, $i, 1);
+                $page->removeCell($i);
                 $this->pager->writePage($pageNo, $page);
                 return true;
             }
@@ -71,6 +152,12 @@ final class IndexBTree
     public function scanFrom(?array $lowKey = null): Generator
     {
         yield from $this->scanPageFrom($this->rootPage, $lowKey);
+    }
+
+    /** @return Generator<int,null|int|float|string|Blob> */
+    public function leadingValues(): Generator
+    {
+        yield from $this->leadingValuesFromPage($this->rootPage);
     }
 
     /**
@@ -133,6 +220,23 @@ final class IndexBTree
             $lowKey = null; // everything after the first qualifying subtree is in range
         }
         yield from $this->scanPageFrom($page->rightChild, $lowKey);
+    }
+
+    /** @return Generator<int,null|int|float|string|Blob> */
+    private function leadingValuesFromPage(int $pageNo): Generator
+    {
+        $page = $this->pager->readPage($pageNo);
+        if ($page->isLeaf()) {
+            foreach ($page->cells as $cell) {
+                yield $this->cellLeading($cell, 0);
+            }
+            return;
+        }
+        foreach ($page->cells as $cell) {
+            [$child] = $this->parseInteriorCellLeading($cell);
+            yield from $this->leadingValuesFromPage($child);
+        }
+        yield from $this->leadingValuesFromPage($page->rightChild);
     }
 
     /** @param list<null|int|float|string|Blob> $lowKey */
@@ -323,12 +427,12 @@ final class IndexBTree
         [$sepKey, $newRight] = $split;
         $newCell = $this->makeInteriorCell($childPage, $sepKey);
         if ($childIndex === -1) {
-            $page->cells[] = $newCell;
+            $page->appendCell($newCell);
             $page->rightChild = $newRight;
         } else {
             $existingSep = $this->parseInteriorCell($page->cells[$childIndex])[1];
-            \array_splice($page->cells, $childIndex, 0, [$newCell]);
-            $page->cells[$childIndex + 1] = $this->makeInteriorCell($newRight, $existingSep);
+            $page->insertCell($childIndex, $newCell);
+            $page->replaceCell($childIndex + 1, $this->makeInteriorCell($newRight, $existingSep));
         }
 
         if ($page->fits($this->pager->pageSize())) {
@@ -344,7 +448,7 @@ final class IndexBTree
         $cells = $page->cells;
         $n = \count($cells);
         if ($n === 0 || $this->compareKeys($key, $this->cellKey($cells[$n - 1])) > 0) {
-            $page->cells[] = $cell;
+            $page->appendCell($cell);
             return;
         }
         // Binary-search the first cell whose key is >= the new key.
@@ -358,7 +462,7 @@ final class IndexBTree
                 $hi = $mid;
             }
         }
-        \array_splice($page->cells, $lo, 0, [$cell]);
+        $page->insertCell($lo, $cell);
     }
 
     /** @return array{0:array<int,mixed>,1:int} */
@@ -369,9 +473,9 @@ final class IndexBTree
         $rightCells = \array_slice($page->cells, $mid);
 
         $left = new BTreePage(BTreePage::INDEX_LEAF);
-        $left->cells = $leftCells;
+        $left->setCells($leftCells);
         $right = new BTreePage(BTreePage::INDEX_LEAF);
-        $right->cells = $rightCells;
+        $right->setCells($rightCells);
 
         $newRight = $this->pager->allocatePage();
         $this->pager->write($pageNo, $left->encode($this->pager->pageSize()));
@@ -390,11 +494,11 @@ final class IndexBTree
         $rightCells = \array_slice($page->cells, $mid + 1);
 
         $left = new BTreePage(BTreePage::INDEX_INTERIOR);
-        $left->cells = $leftCells;
+        $left->setCells($leftCells);
         $left->rightChild = $midChild;
 
         $right = new BTreePage(BTreePage::INDEX_INTERIOR);
-        $right->cells = $rightCells;
+        $right->setCells($rightCells);
         $right->rightChild = $page->rightChild;
 
         $newRight = $this->pager->allocatePage();
@@ -410,7 +514,7 @@ final class IndexBTree
         $this->pager->write($leftNew, $this->pager->read($this->rootPage));
 
         $root = new BTreePage(BTreePage::INDEX_INTERIOR);
-        $root->cells = [$this->makeInteriorCell($leftNew, $sepKey)];
+        $root->setCells([$this->makeInteriorCell($leftNew, $sepKey)]);
         $root->rightChild = $newRight;
         $this->pager->write($this->rootPage, $root->encode($this->pager->pageSize()));
     }

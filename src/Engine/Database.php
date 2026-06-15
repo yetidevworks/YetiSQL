@@ -24,6 +24,8 @@ final class Database
     private readonly Executor $executor;
 
     private bool $autocommit = true;
+    /** True when the open transaction was started implicitly by a SAVEPOINT (not BEGIN). */
+    private bool $savepointInitiated = false;
     private int $lastInsertId = 0;
     private int $changes = 0;
     private int $totalChanges = 0;
@@ -182,22 +184,47 @@ final class Database
                 if ($this->autocommit) {
                     $this->pager->beginTransaction();
                     $this->autocommit = false;
+                    $this->savepointInitiated = false;
                 }
                 break;
             case TransactionStatement::COMMIT:
                 if (!$this->autocommit) {
                     $this->pager->commit();
                     $this->autocommit = true;
+                    $this->savepointInitiated = false;
                 }
                 break;
             case TransactionStatement::ROLLBACK:
-                if (!$this->autocommit) {
+                if ($stmt->savepoint !== null) {
+                    // ROLLBACK TO SAVEPOINT: undo to the savepoint, keep the txn open.
+                    $this->pager->rollbackToSavepoint($stmt->savepoint);
+                    $this->schema->reload();
+                } elseif (!$this->autocommit) {
                     $this->pager->rollback();
                     $this->schema->reload();
                     $this->autocommit = true;
+                    $this->savepointInitiated = false;
                 }
                 break;
-            // SAVEPOINT/RELEASE: accepted, treated as no-ops for now.
+            case TransactionStatement::SAVEPOINT:
+                // A SAVEPOINT outside a transaction starts one implicitly.
+                if ($this->autocommit) {
+                    $this->pager->beginTransaction();
+                    $this->autocommit = false;
+                    $this->savepointInitiated = true;
+                }
+                $this->pager->savepoint((string) $stmt->savepoint);
+                break;
+            case TransactionStatement::RELEASE:
+                $this->pager->releaseSavepoint((string) $stmt->savepoint);
+                // Releasing the outermost savepoint of an implicitly-started
+                // transaction commits it (SQLite semantics).
+                if ($this->savepointInitiated && !$this->pager->hasSavepoints()) {
+                    $this->pager->commit();
+                    $this->autocommit = true;
+                    $this->savepointInitiated = false;
+                }
+                break;
         }
         return Result::affected(0);
     }
@@ -207,6 +234,7 @@ final class Database
         if ($this->autocommit) {
             $this->pager->beginTransaction();
             $this->autocommit = false;
+            $this->savepointInitiated = false;
         }
     }
 
@@ -215,6 +243,7 @@ final class Database
         if (!$this->autocommit) {
             $this->pager->commit();
             $this->autocommit = true;
+            $this->savepointInitiated = false;
         }
     }
 
@@ -224,6 +253,7 @@ final class Database
             $this->pager->rollback();
             $this->schema->reload();
             $this->autocommit = true;
+            $this->savepointInitiated = false;
         }
     }
 

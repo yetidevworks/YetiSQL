@@ -19,6 +19,8 @@ final class IndexInfo
         /** @var list<string> collation per indexed column */
         public array $collations,
         public bool $unique = false,
+        /** Partial-index WHERE predicate, or null for a full index. */
+        public ?\YetiDevWorks\YetiSQL\Sql\Ast\Expr $partialWhere = null,
     ) {
     }
 
