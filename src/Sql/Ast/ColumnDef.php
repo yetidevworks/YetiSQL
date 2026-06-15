@@ -23,6 +23,8 @@ final class ColumnDef
         public ?Expr $generated = null,
         /** Whether the generated column is STORED (vs VIRTUAL); informational. */
         public bool $generatedStored = false,
+        /** Verbatim "(expr)" source text of the generation expression, or null. */
+        public ?string $generatedSql = null,
         /** Column-level REFERENCES clause captured as a single-column ForeignKey, or null. */
         public ?ForeignKey $reference = null,
         /** @var list<CheckConstraint> column-level CHECK constraints */

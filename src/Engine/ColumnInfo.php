@@ -25,6 +25,12 @@ final class ColumnInfo
         public null|int|float|string|Blob $defaultValue = null,
         /** GENERATED ALWAYS AS (expr): recomputed and stored on every write. */
         public ?Expr $generated = null,
+        /**
+         * Verbatim DEFAULT source text as written in the CREATE TABLE statement
+         * (e.g. "''", "5", "CURRENT_TIMESTAMP"), used to report `dflt_value` from
+         * PRAGMA table_info exactly as SQLite does, rather than the evaluated value.
+         */
+        public ?string $defaultSql = null,
     ) {
     }
 }

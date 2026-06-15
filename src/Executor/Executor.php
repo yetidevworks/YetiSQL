@@ -1571,6 +1571,50 @@ final class Executor
         Expr::UNARY => 'unary',
     ];
 
+    /**
+     * Reproduce SQLite's PRAGMA table_info `dflt_value`: the verbatim DEFAULT
+     * source text from the CREATE TABLE statement (e.g. "''", "5",
+     * "CURRENT_TIMESTAMP"), with the outer parentheses of a parenthesised
+     * expression default stripped exactly as SQLite stores it ("(1+2)" -> "1+2").
+     * Falls back to NULL when the column has no default.
+     */
+    private function defaultValueText(ColumnInfo $col): ?string
+    {
+        if ($col->defaultSql !== null) {
+            return self::stripOuterParens($col->defaultSql);
+        }
+        // No captured source text (e.g. an internally-synthesised default): fall
+        // back to a literal rendering of the resolved expression.
+        return $col->default !== null ? $this->exprLabel($col->default) : null;
+    }
+
+    /**
+     * If $text is fully wrapped in one balanced pair of parentheses, return its
+     * contents; otherwise return it unchanged. "(1+2)" -> "1+2", but "(a)+(b)"
+     * and "(a)" embedded in more text are left alone.
+     */
+    private static function stripOuterParens(string $text): string
+    {
+        $t = \trim($text);
+        if ($t === '' || $t[0] !== '(' || $t[-1] !== ')') {
+            return $text;
+        }
+        $depth = 0;
+        $len = \strlen($t);
+        foreach (\str_split($t) as $i => $ch) {
+            if ($ch === '(') {
+                $depth++;
+            } elseif ($ch === ')') {
+                $depth--;
+                // Outer pair closes before the end -> not a single wrapping pair.
+                if ($depth === 0 && $i !== $len - 1) {
+                    return $text;
+                }
+            }
+        }
+        return \trim(\substr($t, 1, -1));
+    }
+
     private function exprLabel(?Expr $e): string
     {
         if ($e === null) {
@@ -3626,7 +3670,17 @@ final class Executor
     /** @return \Generator<int,array{0:int,1:string}> */
     private function indexScan(TableBTree $tree, array $plan): \Generator
     {
-        foreach ($this->indexRowids($plan) as $rid) {
+        // A composite (multi-column) plan locates rows by an equality prefix and
+        // carries 'eqPrefix' instead of the single-column 'values'; route it to
+        // the prefix seek, mirroring scanByPlan().
+        $rowids = isset($plan['eqPrefix'])
+            ? (function () use ($plan): \Generator {
+                foreach ($this->indexPrefixEntries($plan) as [$rid]) {
+                    yield $rid;
+                }
+            })()
+            : $this->indexRowids($plan);
+        foreach ($rowids as $rid) {
             $payload = $tree->get($rid);
             if ($payload !== null) {
                 yield [$rid, $payload];
@@ -4816,6 +4870,19 @@ final class Executor
         $payload = RecordCodec::encode($this->buildRecord($info, $logical));
         $logical = \array_values($logical);
 
+        // ON CONFLICT upsert: if the proposed row collides with the targeted
+        // uniqueness constraint, resolve it here — DO NOTHING skips the insert,
+        // DO UPDATE rewrites the existing row — instead of attempting the insert.
+        if ($stmt->upsert !== null) {
+            $conflictRowid = $this->findUpsertConflict($info, $tree, $logical, $rowid, $stmt->upsert);
+            if ($conflictRowid !== null) {
+                if ($stmt->upsert->doNothing) {
+                    return $this->db->lastInsertId(); // logicalOut stays null -> 0 rows affected
+                }
+                return $this->applyUpsertUpdate($info, $tree, $conflictRowid, $logical, $rowid, $stmt->upsert, $eval, $fireTrig, $logicalOut);
+            }
+        }
+
         if ($fireTrig) {
             $this->fireTriggers($info, CreateTriggerStatement::INSERT, CreateTriggerStatement::BEFORE, null, $logical, $rowid, $rowid);
         }
@@ -4906,6 +4973,170 @@ final class Executor
         }
         $logicalOut = $logical;
         return $rowid;
+    }
+
+    /**
+     * Locate the existing row a proposed INSERT collides with for an ON CONFLICT
+     * clause, honouring the conflict target when one is given. Returns the
+     * conflicting rowid, or null when the row can be inserted normally.
+     *
+     * @param list<null|int|float|string|Blob> $logical
+     */
+    private function findUpsertConflict(TableInfo $info, TableBTree $tree, array $logical, int $rowid, \YetiDevWorks\YetiSQL\Sql\Ast\UpsertClause $upsert): ?int
+    {
+        $target = $upsert->target !== null ? \array_map('strtolower', $upsert->target) : null;
+
+        // The integer-primary-key (rowid) constraint: it satisfies an untargeted
+        // conflict, or a target naming exactly the rowid-alias column.
+        $pkIsTarget = $target !== null
+            && $info->hasRowidAlias()
+            && \count($target) === 1
+            && $target[0] === \strtolower($info->columns[$info->rowidAlias]->name);
+        if (($target === null || $pkIsTarget) && $tree->exists($rowid)) {
+            return $rowid;
+        }
+
+        foreach ($this->db->schema()->resolvedIndexes($info->name) as $index) {
+            if (!$index->unique) {
+                continue;
+            }
+            if ($target !== null && !$this->indexMatchesTarget($index, $target, $info)) {
+                continue;
+            }
+            if (!$this->rowMatchesPartial($info, $index, $logical, $rowid)) {
+                continue;
+            }
+            $rid = $this->uniqueConflictRowid($index, $logical, null);
+            if ($rid !== null) {
+                return $rid;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * True when a unique index covers exactly the conflict-target columns (order
+     * independent, as SQLite matches the target to an index by its column set).
+     *
+     * @param list<string> $target lower-cased target column names
+     */
+    private function indexMatchesTarget(\YetiDevWorks\YetiSQL\Engine\IndexInfo $index, array $target, TableInfo $info): bool
+    {
+        $cols = \array_map(static fn (int $p): string => \strtolower($info->columns[$p]->name), $index->columnPositions);
+        \sort($cols);
+        $want = $target;
+        \sort($want);
+        return $cols === $want;
+    }
+
+    /**
+     * Run an ON CONFLICT ... DO UPDATE against the conflicting row $conflictRowid.
+     * The SET assignments and optional WHERE see the existing row by the table's
+     * name and the would-be-inserted row through the "excluded" pseudo-table.
+     * Mirrors execUpdate()'s per-row write path (checks, uniqueness, index/FK
+     * maintenance, UPDATE triggers).
+     *
+     * @param list<null|int|float|string|Blob> $proposed
+     */
+    private function applyUpsertUpdate(TableInfo $info, TableBTree $tree, int $conflictRowid, array $proposed, int $proposedRowid, \YetiDevWorks\YetiSQL\Sql\Ast\UpsertClause $upsert, Evaluator $eval, bool $fireTrig, ?array &$logicalOut): int
+    {
+        $existing = $this->decodeRow($info, $conflictRowid, (string) $tree->get($conflictRowid));
+
+        $env = new RowEnv();
+        $env->addFrame($info->name, $info, $existing, $conflictRowid);
+        $env->addAliasFrame('excluded', $info, $proposed, $proposedRowid);
+
+        // DO UPDATE ... WHERE <predicate>: when false, the row is left untouched
+        // (no error, no rows affected), as in SQLite.
+        if ($upsert->updateWhere !== null && !Value::isTrue((int) ($eval->evaluate($upsert->updateWhere, $env) ?? 0))) {
+            $logicalOut = null;
+            return $this->db->lastInsertId();
+        }
+
+        $newValues = $existing;
+        $newRowid = $conflictRowid;
+        $changed = [];
+        foreach ($upsert->set as [$colName, $expr]) {
+            $pos = $info->columnPos($colName);
+            if ($pos === null) {
+                throw new SqlException("no such column: $colName");
+            }
+            if ($info->columns[$pos]->generated !== null) {
+                throw SqlException::constraint("cannot UPDATE generated column \"{$colName}\"");
+            }
+            $v = $eval->evaluate($expr, $env);
+            if ($pos === $info->rowidAlias) {
+                $newRowid = (int) Value::toNumber($v);
+                $newValues[$pos] = $newRowid;
+            } else {
+                $newValues[$pos] = $info->columns[$pos]->affinity->apply($v);
+                if ($newValues[$pos] === null && $info->columns[$pos]->notNull) {
+                    throw SqlException::constraint("NOT NULL constraint failed: {$info->name}.{$colName}");
+                }
+            }
+            $changed[$pos] = true;
+        }
+
+        if ($info->generatedPositions !== []) {
+            $this->applyGeneratedColumns($info, $newValues, $newRowid, $eval);
+            foreach ($info->generatedPositions as $gp) {
+                $changed[$gp] = true;
+            }
+        }
+
+        if ($fireTrig) {
+            $this->fireTriggers($info, CreateTriggerStatement::UPDATE, CreateTriggerStatement::BEFORE, $existing, $newValues, $conflictRowid, $newRowid, $changed);
+        }
+
+        if ($info->checks !== []) {
+            $violation = $this->checkRowViolation($info, $newValues, $newRowid, $eval);
+            if ($violation !== null) {
+                throw SqlException::constraint($this->checkFailureMessage($violation));
+            }
+        }
+
+        // Enforce UNIQUE / PRIMARY KEY against other rows (the conflicting row's
+        // own key is excluded).
+        $conflicts = [];
+        if ($newRowid !== $conflictRowid && $tree->exists($newRowid)) {
+            $conflicts[] = $this->rowidConflictLabel($info);
+        }
+        foreach ($this->db->schema()->resolvedIndexes($info->name) as $index) {
+            if (!$index->unique) {
+                continue;
+            }
+            if ($index->partialWhere !== null && !$this->rowMatchesPartial($info, $index, $newValues, $newRowid)) {
+                continue;
+            }
+            $rid = $this->uniqueConflictRowid($index, $newValues, $conflictRowid);
+            if ($rid !== null) {
+                $conflicts[] = $this->uniqueIndexLabel($info, $index);
+            }
+        }
+        if ($conflicts !== []) {
+            throw SqlException::constraint('UNIQUE constraint failed: ' . $conflicts[0]);
+        }
+
+        $record = $this->buildRecord($info, $newValues);
+        if ($newRowid !== $conflictRowid) {
+            $tree->delete($conflictRowid);
+        }
+        $tree->put($newRowid, RecordCodec::encode($record));
+        $this->maintainIndexesForUpdate($info, $conflictRowid, $existing, $newRowid, $newValues, $changed);
+
+        if ($this->db->foreignKeysEnabled()) {
+            $this->fkBeforeParentChange($info, $existing, $conflictRowid, $newValues, $newRowid);
+            if ($info->foreignKeys !== []) {
+                $this->fkCheckChildRow($info, $newValues);
+            }
+        }
+
+        if ($fireTrig) {
+            $this->fireTriggers($info, CreateTriggerStatement::UPDATE, CreateTriggerStatement::AFTER, $existing, $newValues, $conflictRowid, $newRowid, $changed);
+        }
+
+        $logicalOut = $newValues;
+        return $newRowid;
     }
 
     // === UPDATE ==========================================================
@@ -6304,7 +6535,7 @@ final class Executor
                 $col->name,
                 $col->declaredType ?? '',
                 $col->notNull ? 1 : 0,
-                $col->default !== null ? $this->exprLabel($col->default) : null,
+                $this->defaultValueText($col),
                 $pk,
             ];
             if ($extended) {

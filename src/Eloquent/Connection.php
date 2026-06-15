@@ -49,4 +49,16 @@ final class Connection extends SQLiteConnection
     {
         return '3.45.0';
     }
+
+    /**
+     * Identify as the SQLite driver. The connection is registered under the
+     * `yetisql` resolver key, but at runtime it *is* the SQLite dialect (same
+     * grammar, schema builder, and processor), so application and framework
+     * code that branches on `DB::getDriverName() === 'sqlite'` — e.g. migrations
+     * guarding SQLite-only schema limitations — must treat YetiSQL as SQLite.
+     */
+    public function getDriverName()
+    {
+        return 'sqlite';
+    }
 }

@@ -544,6 +544,16 @@ final class Schema
         foreach ($ast->uniqueConstraints as $grp) {
             $parts[] = 'UNIQUE (' . \implode(', ', \array_map([$this, 'quoteIdent'], $grp)) . ')';
         }
+        // FOREIGN KEY and CHECK constraints (the parser merges column-level
+        // REFERENCES / CHECK into these statement-level lists, so they are
+        // emitted once here as table constraints — never inline per column).
+        foreach ($ast->foreignKeys as $fk) {
+            $parts[] = $this->serializeForeignKey($fk);
+        }
+        foreach ($ast->checks as $chk) {
+            $c = $chk->name !== null ? 'CONSTRAINT ' . $this->quoteIdent($chk->name) . ' ' : '';
+            $parts[] = $c . 'CHECK (' . $chk->sql . ')';
+        }
         $sql = 'CREATE TABLE ' . $this->quoteIdent($ast->name) . ' (' . \implode(', ', $parts) . ')';
         if ($ast->withoutRowid) {
             $sql .= ' WITHOUT ROWID';
@@ -577,6 +587,25 @@ final class Schema
         }
         if ($col->collation !== null) {
             $s .= ' COLLATE ' . $col->collation;
+        }
+        if ($col->generated !== null && $col->generatedSql !== null) {
+            $s .= ' GENERATED ALWAYS AS ' . $col->generatedSql . ($col->generatedStored ? ' STORED' : ' VIRTUAL');
+        }
+        return $s;
+    }
+
+    private function serializeForeignKey(\YetiDevWorks\YetiSQL\Sql\Ast\ForeignKey $fk): string
+    {
+        $s = 'FOREIGN KEY (' . \implode(', ', \array_map([$this, 'quoteIdent'], $fk->columns)) . ')'
+            . ' REFERENCES ' . $this->quoteIdent($fk->refTable);
+        if ($fk->refColumns !== []) {
+            $s .= ' (' . \implode(', ', \array_map([$this, 'quoteIdent'], $fk->refColumns)) . ')';
+        }
+        if ($fk->onDelete !== \YetiDevWorks\YetiSQL\Sql\Ast\ForeignKey::NO_ACTION) {
+            $s .= ' ON DELETE ' . $fk->onDelete;
+        }
+        if ($fk->onUpdate !== \YetiDevWorks\YetiSQL\Sql\Ast\ForeignKey::NO_ACTION) {
+            $s .= ' ON UPDATE ' . $fk->onUpdate;
         }
         return $s;
     }
@@ -663,6 +692,7 @@ final class Schema
                 collation: $cd->collation ?? 'BINARY',
                 defaultValue: $affinity->apply(self::constDefault($cd->default)),
                 generated: $cd->generated,
+                defaultSql: $cd->defaultSql,
             );
         }
 
@@ -684,6 +714,17 @@ final class Schema
 
         if ($rowidAlias >= 0) {
             $columns[$rowidAlias]->notNull = true; // rowid is never null
+        }
+
+        // Flag columns named in a table-level PRIMARY KEY(...) so PRAGMA
+        // table_info reports their `pk` ordinal (SQLite marks these too; the
+        // inline integer-PK case is already covered via the rowid alias above).
+        // Laravel relies on this when rebuilding a table to preserve its key.
+        foreach ($ast->primaryKeyColumns as $pkName) {
+            $pos = self::findColumn($ast, $pkName);
+            if ($pos !== null) {
+                $columns[$pos]->primaryKey = true;
+            }
         }
 
         return new TableInfo(

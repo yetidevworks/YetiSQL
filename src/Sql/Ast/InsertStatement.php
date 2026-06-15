@@ -18,6 +18,8 @@ final class InsertStatement implements Statement
         public bool $defaultValues = false,
         /** @var list<ResultColumn>|null RETURNING result columns, or null */
         public ?array $returning = null,
+        /** ON CONFLICT upsert clause, or null. */
+        public ?UpsertClause $upsert = null,
     ) {
     }
 }

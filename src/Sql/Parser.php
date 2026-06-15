@@ -28,6 +28,7 @@ use YetiDevWorks\YetiSQL\Sql\Ast\Statement;
 use YetiDevWorks\YetiSQL\Sql\Ast\TableRef;
 use YetiDevWorks\YetiSQL\Sql\Ast\TransactionStatement;
 use YetiDevWorks\YetiSQL\Sql\Ast\UpdateStatement;
+use YetiDevWorks\YetiSQL\Sql\Ast\UpsertClause;
 
 /**
  * Recursive-descent parser for the SQLite SQL dialect, producing the AST in
@@ -648,15 +649,19 @@ final class Parser
             } elseif ($this->accept(Token::KEYWORD, 'GENERATED')) {
                 $this->expect(Token::KEYWORD, 'ALWAYS');
                 $this->expect(Token::KEYWORD, 'AS');
+                $gstart = $this->peek()->pos;
                 $this->expect(Token::PUNCT, '(');
                 $col->generated = $this->expression();
                 $this->expect(Token::PUNCT, ')');
+                $col->generatedSql = \rtrim(\substr($this->sql, $gstart, $this->peek()->pos - $gstart));
                 $col->generatedStored = $this->accept(Token::IDENT, 'STORED');
                 $this->accept(Token::IDENT, 'VIRTUAL');
             } elseif ($this->accept(Token::KEYWORD, 'AS')) {
+                $gstart = $this->peek()->pos;
                 $this->expect(Token::PUNCT, '(');
                 $col->generated = $this->expression();
                 $this->expect(Token::PUNCT, ')');
+                $col->generatedSql = \rtrim(\substr($this->sql, $gstart, $this->peek()->pos - $gstart));
                 $col->generatedStored = $this->accept(Token::IDENT, 'STORED');
                 $this->accept(Token::IDENT, 'VIRTUAL');
             } else {
@@ -878,12 +883,47 @@ final class Parser
         } else {
             $stmt->select = $this->selectStatement();
         }
-        // ON CONFLICT upsert clause is not yet supported; reject explicitly.
-        if ($this->peek()->isKeyword('ON')) {
-            throw SqlException::parse('UPSERT (ON CONFLICT) is not supported in this version');
+        if ($this->accept(Token::KEYWORD, 'ON')) {
+            $stmt->upsert = $this->upsertClause();
         }
         $stmt->returning = $this->returningClause();
         return $stmt;
+    }
+
+    /**
+     * Parse the ON CONFLICT upsert tail (the leading ON keyword is already
+     * consumed): CONFLICT [(cols) [WHERE expr]] DO (NOTHING | UPDATE SET ... [WHERE expr]).
+     * DO, NOTHING and EXCLUDED are non-reserved words, matched by value.
+     */
+    private function upsertClause(): UpsertClause
+    {
+        $this->expect(Token::KEYWORD, 'CONFLICT');
+
+        $target = null;
+        $targetWhere = null;
+        if ($this->peek()->is(Token::PUNCT, '(')) {
+            $target = $this->parenColumnList();
+            if ($this->accept(Token::KEYWORD, 'WHERE')) {
+                $targetWhere = $this->expression();
+            }
+        }
+
+        $this->expectIdent('DO');
+        if ($this->acceptIdent('NOTHING')) {
+            return new UpsertClause(target: $target, targetWhere: $targetWhere, doNothing: true);
+        }
+
+        $this->expect(Token::KEYWORD, 'UPDATE');
+        $this->expect(Token::KEYWORD, 'SET');
+        $set = [];
+        do {
+            $col = $this->name();
+            $this->expectOp('=');
+            $set[] = [$col, $this->expression()];
+        } while ($this->accept(Token::PUNCT, ','));
+        $updateWhere = $this->accept(Token::KEYWORD, 'WHERE') ? $this->expression() : null;
+
+        return new UpsertClause(target: $target, targetWhere: $targetWhere, set: $set, updateWhere: $updateWhere);
     }
 
     private function updateStatement(): UpdateStatement
@@ -1359,6 +1399,16 @@ final class Parser
                 }
                 return Expr::col($name, $col);
             }
+            // Bare TRUE / FALSE are the integer literals 1 / 0, as in SQLite. (A
+            // real column of that name would take precedence in SQLite, but such
+            // a schema is pathological and not worth a runtime resolution.)
+            $lower = \strtolower($name);
+            if ($lower === 'true') {
+                return Expr::lit(1);
+            }
+            if ($lower === 'false') {
+                return Expr::lit(0);
+            }
             return Expr::col(null, $name);
         }
 
@@ -1604,6 +1654,25 @@ final class Parser
     {
         if (!$this->accept(Token::OP, $op)) {
             throw SqlException::parse("expected operator '$op'");
+        }
+    }
+
+    /** Match a non-reserved word (an identifier) by its upper-cased value. */
+    private function acceptIdent(string $upper): bool
+    {
+        $t = $this->peek();
+        if ($t->is(Token::IDENT) && \strtoupper($t->value) === $upper) {
+            $this->i++;
+            return true;
+        }
+        return false;
+    }
+
+    private function expectIdent(string $upper): void
+    {
+        if (!$this->acceptIdent($upper)) {
+            $t = $this->peek();
+            throw SqlException::parse("expected '$upper', got '" . ($t->value === '' ? $t->type : $t->value) . "'");
         }
     }
 }

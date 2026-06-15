@@ -24,6 +24,13 @@ tagged release, so everything lives under *Unreleased*.
 - **MySQL/MariaDB benchmark** (`benchmarks/bench_mysql.php`) comparing file-backed
   durable YetiSQL against a local MySQL/MariaDB server; see *Performance* in the
   README.
+- **UPSERT.** `INSERT ... ON CONFLICT [(target)] DO NOTHING` and
+  `... DO UPDATE SET ... [WHERE ...]` are now supported, including the `excluded`
+  pseudo-table holding the would-be-inserted row and a conflict target that
+  selects a specific unique constraint. This is what Laravel's `upsert()` /
+  `updateOrCreate` emit on SQLite.
+- **Boolean literals.** Bare `TRUE` and `FALSE` evaluate to `1` and `0`, as in
+  SQLite (used by query builders in generated `CASE` expressions).
 
 ### Changed
 
@@ -39,6 +46,10 @@ tagged release, so everything lives under *Unreleased*.
   `ERRMODE_EXCEPTION` rather than a raw engine exception.
 - Expression indexes (`CREATE INDEX ... ON t(expr)`) are now rejected explicitly
   rather than silently created and never used.
+- The Eloquent connection now reports `getDriverName()` as `sqlite` (it extends
+  `SQLiteConnection` and speaks the SQLite dialect), so application code and
+  migrations that branch on the driver name treat YetiSQL as SQLite. The
+  `illuminate/database` dev dependency now also allows `^13.0`.
 
 ### Performance
 
@@ -62,3 +73,17 @@ tagged release, so everything lives under *Unreleased*.
 - Several covered-count and hash/count-map keying correctness issues surfaced while
   extending the join and correlated-subquery fast paths, each verified against the
   `pdo_sqlite` differential oracle.
+- **`ALTER TABLE ADD/DROP COLUMN` no longer drops constraints.** The table's
+  CREATE statement was re-serialized without its FOREIGN KEY, CHECK, or
+  generated-column definitions, silently losing them (and any cascade behaviour)
+  whenever a column was added or dropped. The serializer now reproduces them.
+- **`PRAGMA table_info` reports the real `dflt_value` and `pk`.** `dflt_value` is
+  now the verbatim DEFAULT source text (e.g. `''`, `CURRENT_TIMESTAMP`) rather
+  than the evaluated value, and a column named in a table-level `PRIMARY KEY(...)`
+  now reports `pk=1`. Both are read back by ORMs when rebuilding a table; getting
+  them wrong dropped primary keys and corrupted regenerated defaults.
+- A multi-column index equality plan (`WHERE a = ? AND b = ?`) raised
+  "Undefined array key values" when reached through the `DELETE` / `UPDATE` /
+  uniqueness-probe path; the composite prefix seek is now used there too.
+- The above were all found and fixed by running the Koel application's full test
+  suite (unit, integration, feature) against YetiSQL as its Eloquent database.

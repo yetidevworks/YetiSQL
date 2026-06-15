@@ -72,6 +72,46 @@ final class RowEnv
     }
 
     /**
+     * Add a frame addressable ONLY by its qualifier (never by the underlying
+     * table name, and never by an unqualified column reference). Used for the
+     * UPSERT "excluded" pseudo-table, which shares the target's TableInfo but
+     * must not collide with the target's own columns: in DO UPDATE an unqualified
+     * column means the target row, and "excluded" requires the explicit prefix.
+     */
+    public function addAliasFrame(string $alias, TableInfo $info, array $values, int $rowid): void
+    {
+        $this->frames[] = [
+            'alias' => \strtolower($alias),
+            'info' => $info,
+            'values' => $values,
+            'rowid' => $rowid,
+            'payload' => null,
+            'offsets' => null,
+            'tree' => null,
+            'aliasOnly' => true,
+        ];
+    }
+
+    /**
+     * Whether a frame should be ignored when resolving a (possibly qualified)
+     * column reference: alias-only frames are reachable solely via their exact
+     * qualifier, all others by alias or underlying table name.
+     *
+     * @param array<string,mixed> $frame
+     */
+    private function frameSkipped(array $frame, ?string $tableLc): bool
+    {
+        $aliasOnly = $frame['aliasOnly'] ?? false;
+        if ($tableLc === null) {
+            return $aliasOnly;
+        }
+        if ($frame['alias'] === $tableLc) {
+            return false;
+        }
+        return $aliasOnly || \strtolower($frame['info']->name) !== $tableLc;
+    }
+
+    /**
      * Read the value of frame $fi's column $pos, decoding from the raw record on
      * demand for lazy frames and caching the result.
      */
@@ -120,7 +160,7 @@ final class RowEnv
         $found = null;
         $matches = 0;
         foreach ($this->frames as $fi => $frame) {
-            if ($tableLc !== null && $frame['alias'] !== $tableLc && \strtolower($frame['info']->name) !== $tableLc) {
+            if ($this->frameSkipped($frame, $tableLc)) {
                 continue;
             }
             $pos = $frame['info']->columnPos($name);
@@ -163,7 +203,7 @@ final class RowEnv
         $foundPos = -1;
         $matches = 0;
         foreach ($this->frames as $fi => $frame) {
-            if ($tableLc !== null && $frame['alias'] !== $tableLc && \strtolower($frame['info']->name) !== $tableLc) {
+            if ($this->frameSkipped($frame, $tableLc)) {
                 continue;
             }
             $pos = $frame['info']->columnPos($name);
@@ -192,7 +232,7 @@ final class RowEnv
     {
         $tableLc = $table !== null ? \strtolower($table) : null;
         foreach ($this->frames as $frame) {
-            if ($tableLc !== null && $frame['alias'] !== $tableLc && \strtolower($frame['info']->name) !== $tableLc) {
+            if ($this->frameSkipped($frame, $tableLc)) {
                 continue;
             }
             $pos = $frame['info']->columnPos($name);
@@ -216,7 +256,7 @@ final class RowEnv
     private function anyHasColumn(string $lname): bool
     {
         foreach ($this->frames as $frame) {
-            if ($frame['info']->columnPos($lname) !== null) {
+            if (($frame['aliasOnly'] ?? false) === false && $frame['info']->columnPos($lname) !== null) {
                 return true;
             }
         }
