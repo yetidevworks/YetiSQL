@@ -30,9 +30,13 @@ tagged release, so everything lives under *Unreleased*.
 - `PDOStatement::bindParam()` now binds **by reference** and reads the variable at
   `execute()` time, matching PDO semantics (it previously snapshotted the value at
   bind time, like `bindValue()`).
-- `MATCH` now raises a clear "unable to use function MATCH in the requested
-  context" error instead of silently behaving like `LIKE` (FTS5 is not yet
-  implemented).
+- `MATCH` now raises "unable to use function MATCH in the requested context"
+  instead of silently behaving like `LIKE` (FTS5 is not yet implemented). As in
+  SQLite this is a runtime error raised when a row is evaluated, so a query over
+  an empty table still returns no rows.
+- Engine errors raised during lazy row evaluation (`fetch()` / `fetchAll()`) now
+  follow the connection's error mode, surfacing as a `PDOException` under
+  `ERRMODE_EXCEPTION` rather than a raw engine exception.
 - Expression indexes (`CREATE INDEX ... ON t(expr)`) are now rejected explicitly
   rather than silently created and never used.
 

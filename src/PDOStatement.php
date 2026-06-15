@@ -112,7 +112,7 @@ class PDOStatement implements IteratorAggregate
         if ($this->result === null || !$this->result->isQuery()) {
             return false;
         }
-        $row = $this->result->fetchRow($this->cursor);
+        $row = $this->pullRow();
         if ($row === null) {
             return false;
         }
@@ -128,7 +128,7 @@ class PDOStatement implements IteratorAggregate
             return [];
         }
         $out = [];
-        $rows = $this->result->materializeRows();
+        $rows = $this->pullAllRows();
         if ($mode === PDO::FETCH_COLUMN) {
             $col = (int) ($args[0] ?? 0);
             foreach ($rows as $row) {
@@ -149,12 +149,49 @@ class PDOStatement implements IteratorAggregate
         return $out;
     }
 
+    /**
+     * Pull the next row from the result cursor, routing any engine error raised
+     * by lazy per-row evaluation (e.g. an unsupported MATCH) through PDO's error
+     * mode — so it surfaces as a PDOException under ERRMODE_EXCEPTION rather than
+     * a raw engine exception, matching pdo_sqlite's runtime-error behaviour.
+     *
+     * @return list<null|int|float|string|Blob>|null
+     */
+    private function pullRow(): ?array
+    {
+        try {
+            return $this->result?->fetchRow($this->cursor);
+        } catch (YetiSQLException $e) {
+            $this->failFetch($e);
+            return null;
+        }
+    }
+
+    /** @return list<list<null|int|float|string|Blob>> */
+    private function pullAllRows(): array
+    {
+        try {
+            return $this->result?->materializeRows() ?? [];
+        } catch (YetiSQLException $e) {
+            $this->failFetch($e);
+            return [];
+        }
+    }
+
+    private function failFetch(YetiSQLException $e): void
+    {
+        $this->pdo->recordError($e);
+        if ($this->pdo->errorMode() === PDO::ERRMODE_EXCEPTION) {
+            throw $this->pdo->makeException($e);
+        }
+    }
+
     public function fetchColumn(int $column = 0): mixed
     {
         if ($this->result === null || !$this->result->isQuery()) {
             return false;
         }
-        $row = $this->result->fetchRow($this->cursor);
+        $row = $this->pullRow();
         if ($row === null) {
             return false;
         }

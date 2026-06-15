@@ -80,14 +80,22 @@ final class ErrorMessageTest extends TestCase
     {
         $db = $this->db();
         $db->exec('CREATE TABLE t(x TEXT)');
-        $db->exec("INSERT INTO t VALUES ('hello')"); // a row must exist for the predicate to evaluate
+        $db->exec("INSERT INTO t VALUES ('hello')");
 
-        // MATCH is rejected while the row is evaluated (during fetch), so the
-        // engine's SqlException surfaces directly rather than wrapped as a
-        // PDOException; assert on the message, which is the contract here.
-        $this->expectException(\Throwable::class);
+        // Like pdo_sqlite, MATCH fails as a runtime error when a row is evaluated,
+        // surfaced as a PDOException under ERRMODE_EXCEPTION.
+        $this->expectException(PDOException::class);
         $this->expectExceptionMessage('unable to use function MATCH in the requested context');
         $db->query("SELECT x FROM t WHERE x MATCH 'hello'")->fetchAll();
+    }
+
+    public function testMatchOnEmptyTableDoesNotError(): void
+    {
+        $db = $this->db();
+        $db->exec('CREATE TABLE t(x TEXT)'); // no rows
+
+        // No row is evaluated, so (as in SQLite) the unsupported MATCH never fires.
+        self::assertSame([], $db->query("SELECT x FROM t WHERE x MATCH 'hello'")->fetchAll(PDO::FETCH_NUM));
     }
 
     public function testUnknownSavepointRollbackMessage(): void
