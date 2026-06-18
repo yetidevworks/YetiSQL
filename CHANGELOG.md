@@ -1,10 +1,13 @@
 # Changelog
 
 All notable changes to YetiSQL are documented here. The format is based on
-[Keep a Changelog](https://keepachangelog.com/); this project has not yet cut a
-tagged release, so everything lives under *Unreleased*.
+[Keep a Changelog](https://keepachangelog.com/), and this project adheres to
+[Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.0] - 2026-06-18
+
+First tagged release.
+
 
 ### Added
 

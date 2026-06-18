@@ -18,6 +18,10 @@
         "illuminate/database": "^11.0 || ^12.0 || ^13.0",
         "phpunit/phpunit": "^11.0"
     },
+    "suggest": {
+        "illuminate/database": "Use the Eloquent/Laravel adapter (YetiDevWorks\\YetiSQL\\Eloquent) to back Eloquent with YetiSQL (^11.0 || ^12.0 || ^13.0)",
+        "doctrine/dbal": "Use the Doctrine DBAL driver (YetiDevWorks\\YetiSQL\\Doctrine) to back Doctrine with YetiSQL (^4.4)"
+    },
     "autoload": {
         "psr-4": {
             "YetiDevWorks\\YetiSQL\\": "src/"

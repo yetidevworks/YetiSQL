@@ -1,0 +1,7 @@
+# Keep the published package lean: exclude development-only paths from the
+# Composer dist tarball (`composer require` installs).
+/tests          export-ignore
+/benchmarks     export-ignore
+/phpunit.xml    export-ignore
+/.gitattributes export-ignore
+/.github        export-ignore
